@@ -1,22 +1,7 @@
 import jwt from "jsonwebtoken";
 import { z } from "zod";
 
-export interface OuterStatePayload {
-  clientId: string;
-  redirectUri: string;
-  clientState: string;
-  codeChallenge: string;
-  codeChallengeMethod: string;
-  resource: string;
-  nonce: string;
-}
-
-export interface VerifiedOuterState extends OuterStatePayload {
-  iat: number;
-  exp: number;
-}
-
-const verifiedOuterStateSchema = z.object({
+const outerStatePayloadSchema = z.object({
   clientId: z.string(),
   redirectUri: z.string(),
   clientState: z.string(),
@@ -24,9 +9,15 @@ const verifiedOuterStateSchema = z.object({
   codeChallengeMethod: z.string(),
   resource: z.string(),
   nonce: z.string(),
+});
+
+const verifiedOuterStateSchema = outerStatePayloadSchema.extend({
   iat: z.number(),
   exp: z.number(),
 });
+
+export type OuterStatePayload = z.infer<typeof outerStatePayloadSchema>;
+export type VerifiedOuterState = z.infer<typeof verifiedOuterStateSchema>;
 
 export function signOuterState(payload: OuterStatePayload, secret: string, ttlSeconds: number): string {
   return jwt.sign(payload, secret, { algorithm: "HS256", expiresIn: ttlSeconds });
