@@ -6,8 +6,6 @@ function isLoopbackHost(hostname: string): boolean {
   return /^127(?:\.\d{1,3}){3}$/.test(hostname);
 }
 
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
-
 // RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
 const SCHEME_SHAPE = /^[a-z][a-z0-9+\-.]*$/;
 
@@ -43,6 +41,9 @@ export function validateRedirectUri(uri: string): string | null {
   } catch {
     return "redirect_uri must be a valid URL";
   }
+  if (url.username !== "" || url.password !== "") {
+    return "redirect_uri must not contain userinfo";
+  }
   const scheme = url.protocol.replace(/:$/, "").toLowerCase();
   if (DANGEROUS_SCHEMES.has(scheme)) {
     return `${url.protocol} redirect_uris are not allowed`;
@@ -74,6 +75,7 @@ export function redirectUriMatches(registered: string, requested: string): boole
   if (left.hostname !== right.hostname) return false;
   if (left.pathname !== right.pathname) return false;
   if (left.search !== right.search) return false;
-  if (!LOOPBACK_HOSTS.has(left.hostname)) return left.port === right.port;
+  if (left.username !== right.username || left.password !== right.password) return false;
+  if (!isLoopbackHost(left.hostname)) return left.port === right.port;
   return true;
 }
