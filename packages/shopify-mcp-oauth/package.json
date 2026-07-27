@@ -4,7 +4,9 @@
   "description": "OAuth 2.1 authorization + resource server for a Shopify app's MCP endpoint",
   "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -20,7 +22,9 @@
       "require": "./dist/testing.cjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
@@ -45,5 +49,7 @@
     "vitest": "^2.1.0",
     "zod": "^3.23.8"
   },
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }
