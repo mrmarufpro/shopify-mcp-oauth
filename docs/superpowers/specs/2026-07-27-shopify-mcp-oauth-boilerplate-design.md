@@ -194,6 +194,7 @@ server-to-server Shopify call is the token exchange in step 7.
 interface OAuthStorage {
   findClient(clientId: string): Promise<OAuthClient | null>;
   createClient(client: NewOAuthClient): Promise<OAuthClient>;
+  upsertClient(client: NewOAuthClient): Promise<OAuthClient>;
 
   createToken(token: NewToken): Promise<StoredToken>;
   findTokenByAccessHash(hash: string): Promise<StoredToken | null>;
@@ -216,6 +217,7 @@ interface OAuthClient {
 interface StoredToken {
   id: string;
   shopId: string | number;
+  shopDomain: string; // denormalized: the resource server names the shop without a reverse lookup
   clientId: string;
   accessTokenHash: string;
   refreshTokenHash: string | null;
@@ -431,7 +433,8 @@ model McpOAuthClient {
 
 model McpOAuthToken {
   id                    String    @id @default(cuid())
-  shopId                String    // the shop domain, as returned by findShopByDomain
+  shopId                String    // whatever findShopByDomain returned as the shop's id
+  shopDomain            String    // denormalized so the resource server can name the shop
   clientId              String
   accessTokenHash       String    @unique
   refreshTokenHash      String?   @unique

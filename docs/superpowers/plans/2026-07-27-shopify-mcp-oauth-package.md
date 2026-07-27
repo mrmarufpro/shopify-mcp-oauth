@@ -1,0 +1,5259 @@
+# shopify-mcp-oauth Package Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the publishable `shopify-mcp-oauth` package — an OAuth 2.1 Authorization Server and Resource Server for a Shopify app's MCP endpoint, with storage behind an interface.
+
+**Architecture:** An Express `Router` carrying discovery, `/authorize`, `/token`, `/register`, `/revoke`, and the Shopify callback, plus a `requireAuth` middleware for the protected `/mcp` route. Merchant identity comes from Shopify: `/authorize` bounces the browser through Shopify's shop picker, and the callback's server-to-server token exchange proves the merchant controls that shop. All persistence goes through an `OAuthStorage` interface; short-lived authorization codes and fetched CIMD documents go through a `CacheStore`.
+
+**Tech Stack:** TypeScript (strict), Express 4/5 (peer), Zod (peer), `jsonwebtoken`, Node `node:crypto`, Vitest, tsup.
+
+This is **plan 1 of 3**. Plan 2 builds `examples/basic-server`; plan 3 builds `create-shopify-mcp` plus the docs and CI polish. Nothing here depends on the later plans.
+
+Spec: `docs/superpowers/specs/2026-07-27-shopify-mcp-oauth-boilerplate-design.md`
+
+## Global Constraints
+
+- Node ≥ 20. `package.json` sets `"engines": { "node": ">=20" }`.
+- TypeScript `strict: true`. No `any` in exported signatures.
+- Build with tsup to **ESM + CJS + .d.ts**. `express` and `zod` are **peer** dependencies so the adopter's versions win.
+- Test runner is **Vitest**. Never invoke Jest.
+- Formatting: double quotes, 120 print width, 2-space indent, trailing comma `es5`.
+- Every secret-bearing value (tokens, codes) is stored **hashed with SHA-256**, never in plaintext.
+- Comments are minimal: only where the *why* is non-obvious (a spec citation, a security invariant). Never narrate what the code does.
+- Test data uses readable named constants (`const DEMO_SHOP = "demo.myshopify.com"`) referenced from both setup and assertion. Never assert on a factory default.
+- No app-specific names, domains, vendor names, or real credentials anywhere in the tree.
+- License: MIT.
+
+---
+
+## File Structure
+
+```
+packages/shopify-mcp-oauth/
+  src/
+    types.ts                        OAuthStorage, CacheStore, domain types
+    config.ts                       config Zod schema + resolveConfig()
+    crypto.ts                       randomBase64Url, sha256Hex, safeEqual
+    errors.ts                       OAuthError + the RFC error codes
+    services/
+      pkce.ts                       verifyS256
+      redirectUri.ts                validateRedirectUri, redirectUriMatches
+      stateJwt.ts                   signOuterState, verifyOuterState
+      clients.ts                    createDcrClient, findClientById, upsertCimdClient
+      cimd.ts                       isCimdClientId, resolveCimdClient
+      codes.ts                      issueCode, consumeCode
+      tokens.ts                     issueTokens, rotateRefresh, revokeBy*, findActiveToken
+    adapters/
+      memoryStorage.ts              memoryStorage()
+      memoryCache.ts                memoryCache()
+      redisCache.ts                 redisCache(client)
+      prismaStorage.ts              prismaStorage(prisma, opts?)
+      shopifySessionStorage.ts      shopifySessionStorage(sessionStorage)
+      allowAnyShop.ts               allowAnyShop()
+    schemas/
+      authorize.ts  token.ts  register.ts  revoke.ts  shopifyCallback.ts  cimd.ts
+    serializers/
+      metadata.ts  register.ts  token.ts
+    controllers/
+      metadata.ts  register.ts  authorize.ts  shopifyCallback.ts  token.ts  revoke.ts
+      openaiAppsChallenge.ts
+    middlewares/
+      requireAuth.ts  verifyShopifyHmac.ts  rateLimit.ts
+    router.ts                       buildRouter(resolved)
+    index.ts                        createShopifyMcpOAuth + public exports
+    testing/
+      storageContract.ts            runStorageContractTests
+  package.json  tsconfig.json  tsup.config.ts  vitest.config.ts
+```
+
+Tests are co-located: `src/services/pkce.test.ts` next to `src/services/pkce.ts`.
+
+---
+
+## Locked Interfaces
+
+Every task below consumes or produces from this set. Names here are authoritative — a later task using a different spelling is a bug.
+
+```ts
+// types.ts
+export interface ShopRef {
+  id: string | number;
+  domain: string;
+}
+
+export interface OAuthClient {
+  clientId: string;
+  clientName: string | null;
+  redirectUris: string[];
+  grantTypes: string[] | null;
+  responseTypes: string[] | null;
+  logoUri: string | null;
+  clientUri: string | null;
+  tokenEndpointAuthMethod: string;
+  revokedAt: Date | null;
+}
+export type NewOAuthClient = Omit<OAuthClient, "revokedAt">;
+
+export interface StoredToken {
+  id: string;
+  shopId: string | number;
+  /** Denormalized so the resource server can name the shop without a reverse lookup by id. */
+  shopDomain: string;
+  clientId: string;
+  accessTokenHash: string;
+  refreshTokenHash: string | null;
+  accessTokenExpiresAt: Date;
+  refreshTokenExpiresAt: Date | null;
+  scope: string | null;
+  resource: string | null;
+  revokedAt: Date | null;
+  rotatedFromId: string | null;
+}
+export type NewToken = Omit<StoredToken, "id" | "revokedAt">;
+
+export interface OAuthStorage {
+  findClient(clientId: string): Promise<OAuthClient | null>;
+  createClient(client: NewOAuthClient): Promise<OAuthClient>;
+  upsertClient(client: NewOAuthClient): Promise<OAuthClient>;
+  createToken(token: NewToken): Promise<StoredToken>;
+  findTokenByAccessHash(hash: string): Promise<StoredToken | null>;
+  findTokenByRefreshHash(hash: string): Promise<StoredToken | null>;
+  /** Returns false when the row was already revoked. Rotation relies on this for one-time use. */
+  revokeToken(id: string): Promise<boolean>;
+  touchToken(id: string, lastUsedAt: Date): Promise<void>;
+  findShopByDomain(domain: string): Promise<ShopRef | null>;
+}
+
+export interface CacheStore {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, ttlSeconds: number): Promise<void>;
+  del(key: string): Promise<void>;
+  /** Atomic read-and-delete when the backend supports it. Falls back to get+del. */
+  getdel?(key: string): Promise<string | null>;
+}
+
+export interface Logger {
+  info(msg: string, meta?: unknown): void;
+  warn(msg: string, meta?: unknown): void;
+  error(msg: string, meta?: unknown): void;
+}
+
+export interface McpAuthContext {
+  shopId: string | number;
+  shopDomain: string;
+  tokenId: string;
+}
+```
+
+```ts
+// config.ts
+export interface ShopifyMcpOAuthConfig {
+  host: string;
+  shopify: { apiKey: string; apiSecret: string; scopes: string };
+  stateSecret: string;
+  storage: OAuthStorage;
+  cache?: CacheStore;
+  tokenTtl?: { access?: number; refresh?: number };
+  openaiAppsChallengeToken?: string | null;
+  registerRateLimit?: { limit: number; windowMs: number };
+  logger?: Logger;
+  fetchImpl?: typeof fetch;
+}
+
+export interface ResolvedConfig {
+  host: string;
+  resource: string; // `${host}/mcp`
+  shopify: { apiKey: string; apiSecret: string; scopes: string };
+  stateSecret: string;
+  storage: OAuthStorage;
+  cache: CacheStore;
+  tokenTtl: { access: number; refresh: number };
+  openaiAppsChallengeToken: string | null;
+  registerRateLimit: { limit: number; windowMs: number };
+  logger: Logger;
+  fetchImpl: typeof fetch;
+}
+
+export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig;
+```
+
+```ts
+// index.ts
+export interface ShopifyMcpOAuth {
+  router: Router;
+  requireAuth: RequestHandler;
+}
+export interface BuildRouterOptions {
+  /** Test-only escape hatch: skips the CIMD private-address guard. Never set this in production. */
+  allowPrivateCimdHosts?: boolean;
+}
+export function createShopifyMcpOAuth(
+  config: ShopifyMcpOAuthConfig,
+  options?: BuildRouterOptions
+): ShopifyMcpOAuth;
+```
+
+`requireAuth` sets `req.mcp: McpAuthContext` on success.
+
+---
+
+## Task 1: Workspace skeleton
+
+**Files:**
+- Create: `package.json`, `pnpm-workspace.yaml`, `tsconfig.base.json`, `.gitignore`, `.prettierrc`, `LICENSE`
+- Create: `packages/shopify-mcp-oauth/package.json`, `tsconfig.json`, `tsup.config.ts`, `vitest.config.ts`
+- Create: `packages/shopify-mcp-oauth/src/index.ts`, `src/index.test.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: a buildable, testable workspace. Later tasks add files under `packages/shopify-mcp-oauth/src/`.
+
+- [ ] **Step 1: Write the failing test**
+
+`packages/shopify-mcp-oauth/src/index.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { PACKAGE_NAME } from "./index";
+
+describe("package entry", () => {
+  it("exposes its own name", () => {
+    expect(PACKAGE_NAME).toBe("shopify-mcp-oauth");
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test`
+Expected: FAIL — the workspace does not exist yet, or `./index` has no `PACKAGE_NAME` export.
+
+- [ ] **Step 3: Create the root workspace files**
+
+`package.json`:
+
+```json
+{
+  "name": "shopify-mcp",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
+```
+
+`pnpm-workspace.yaml`:
+
+```yaml
+packages:
+  - "packages/*"
+  - "examples/*"
+```
+
+`tsconfig.base.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "types": ["node"]
+  }
+}
+```
+
+`.prettierrc`:
+
+```json
+{
+  "printWidth": 120,
+  "tabWidth": 2,
+  "semi": true,
+  "singleQuote": false,
+  "trailingComma": "es5"
+}
+```
+
+`.gitignore`:
+
+```
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.DS_Store
+packages/create-shopify-mcp/templates/
+```
+
+`LICENSE`: the standard MIT text, copyright the repository owner, year 2026.
+
+- [ ] **Step 4: Create the package files**
+
+`packages/shopify-mcp-oauth/package.json`:
+
+```json
+{
+  "name": "shopify-mcp-oauth",
+  "version": "0.1.0",
+  "description": "OAuth 2.1 authorization + resource server for a Shopify app's MCP endpoint",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js",
+      "require": "./dist/testing.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2"
+  },
+  "peerDependencies": {
+    "express": ">=4.18",
+    "zod": ">=3.23"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^22.0.0",
+    "express": "^5.0.0",
+    "supertest": "^7.0.0",
+    "@types/supertest": "^6.0.2",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "zod": "^3.23.8"
+  },
+  "publishConfig": { "access": "public" }
+}
+```
+
+`packages/shopify-mcp-oauth/tsconfig.json`:
+
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "outDir": "dist", "rootDir": "src" },
+  "include": ["src"]
+}
+```
+
+`packages/shopify-mcp-oauth/tsup.config.ts`:
+
+```ts
+import { defineConfig } from "tsup";
+
+export default defineConfig({
+  entry: { index: "src/index.ts", testing: "src/testing/storageContract.ts" },
+  format: ["esm", "cjs"],
+  dts: true,
+  clean: true,
+  sourcemap: true,
+  target: "node20",
+});
+```
+
+`packages/shopify-mcp-oauth/vitest.config.ts`:
+
+```ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    include: ["src/**/*.test.ts"],
+  },
+});
+```
+
+`packages/shopify-mcp-oauth/src/index.ts`:
+
+```ts
+export const PACKAGE_NAME = "shopify-mcp-oauth";
+```
+
+- [ ] **Step 5: Install and run the test to verify it passes**
+
+Run: `pnpm install && pnpm --filter shopify-mcp-oauth test`
+Expected: PASS, 1 test.
+
+- [ ] **Step 6: Verify typecheck and build both work**
+
+Run: `pnpm --filter shopify-mcp-oauth typecheck && pnpm --filter shopify-mcp-oauth build`
+Expected: no errors; `dist/index.js`, `dist/index.cjs`, `dist/index.d.ts` exist.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "chore: scaffold pnpm workspace and shopify-mcp-oauth package"
+```
+
+---
+
+## Task 2: Core types and errors
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/types.ts`
+- Create: `packages/shopify-mcp-oauth/src/errors.ts`
+- Test: `packages/shopify-mcp-oauth/src/errors.test.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: every type in the **Locked Interfaces** section above, plus:
+  - `class OAuthError extends Error` with `constructor(code: string, description: string, status?: number)`, fields `code`, `description`, `status`, and `toBody(): { error: string; error_description: string }`
+
+- [ ] **Step 1: Write the failing test**
+
+`src/errors.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { OAuthError } from "./errors";
+
+const INVALID_GRANT = "invalid_grant";
+
+describe("OAuthError", () => {
+  it("defaults to HTTP 400", () => {
+    const error = new OAuthError(INVALID_GRANT, "code already used");
+    expect(error.status).toBe(400);
+  });
+
+  it("serializes to the RFC 6749 error body", () => {
+    const error = new OAuthError(INVALID_GRANT, "code already used");
+    expect(error.toBody()).toEqual({ error: INVALID_GRANT, error_description: "code already used" });
+  });
+
+  it("carries an explicit status when given one", () => {
+    const error = new OAuthError("shop_not_installed", "Install the app first.", 403);
+    expect(error.status).toBe(403);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/errors.test.ts`
+Expected: FAIL — cannot resolve `./errors`.
+
+- [ ] **Step 3: Write `src/types.ts`**
+
+Copy the full contents of the **Locked Interfaces** `types.ts` block above verbatim into this file.
+
+- [ ] **Step 4: Write `src/errors.ts`**
+
+```ts
+export class OAuthError extends Error {
+  readonly code: string;
+  readonly description: string;
+  readonly status: number;
+
+  constructor(code: string, description: string, status = 400) {
+    super(`${code}: ${description}`);
+    this.name = "OAuthError";
+    this.code = code;
+    this.description = description;
+    this.status = status;
+  }
+
+  toBody(): { error: string; error_description: string } {
+    return { error: this.code, error_description: this.description };
+  }
+}
+```
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/errors.test.ts`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/types.ts packages/shopify-mcp-oauth/src/errors.ts packages/shopify-mcp-oauth/src/errors.test.ts
+git commit -m "feat: add core storage types and OAuthError"
+```
+
+---
+
+## Task 3: Crypto helpers and PKCE
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/crypto.ts`
+- Create: `packages/shopify-mcp-oauth/src/services/pkce.ts`
+- Test: `packages/shopify-mcp-oauth/src/crypto.test.ts`, `packages/shopify-mcp-oauth/src/services/pkce.test.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces:
+  - `randomBase64Url(bytes: number): string`
+  - `sha256Hex(input: string): string`
+  - `sha256Base64Url(input: string): string`
+  - `safeEqual(a: string, b: string): boolean`
+  - `verifyS256(verifier: string, expectedChallenge: string): boolean`
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/crypto.test.ts`:
+
+```ts
+import crypto from "node:crypto";
+import { describe, expect, it } from "vitest";
+import { randomBase64Url, safeEqual, sha256Base64Url, sha256Hex } from "./crypto";
+
+describe("randomBase64Url", () => {
+  it("emits URL-safe characters only", () => {
+    expect(randomBase64Url(32)).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it("does not repeat across calls", () => {
+    expect(randomBase64Url(32)).not.toBe(randomBase64Url(32));
+  });
+});
+
+describe("sha256Hex", () => {
+  it("matches node's own digest", () => {
+    const input = "hello";
+    expect(sha256Hex(input)).toBe(crypto.createHash("sha256").update(input).digest("hex"));
+  });
+});
+
+describe("sha256Base64Url", () => {
+  it("emits the RFC 7636 challenge encoding", () => {
+    expect(sha256Base64Url("verifier")).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+});
+
+describe("safeEqual", () => {
+  it("is true for identical strings", () => {
+    expect(safeEqual("abc", "abc")).toBe(true);
+  });
+
+  it("is false for different lengths", () => {
+    expect(safeEqual("abc", "abcd")).toBe(false);
+  });
+
+  it("is false for same-length differing strings", () => {
+    expect(safeEqual("abc", "abd")).toBe(false);
+  });
+});
+```
+
+`src/services/pkce.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { sha256Base64Url } from "../crypto";
+import { verifyS256 } from "./pkce";
+
+const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+describe("verifyS256", () => {
+  it("accepts the verifier that produced the challenge", () => {
+    expect(verifyS256(VERIFIER, sha256Base64Url(VERIFIER))).toBe(true);
+  });
+
+  it("rejects a different verifier", () => {
+    expect(verifyS256("not-the-verifier", sha256Base64Url(VERIFIER))).toBe(false);
+  });
+
+  it("rejects an empty verifier", () => {
+    expect(verifyS256("", sha256Base64Url(VERIFIER))).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/crypto.test.ts src/services/pkce.test.ts`
+Expected: FAIL — cannot resolve `./crypto` and `./pkce`.
+
+- [ ] **Step 3: Write `src/crypto.ts`**
+
+```ts
+import crypto from "node:crypto";
+
+function toBase64Url(buffer: Buffer): string {
+  return buffer.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+export function randomBase64Url(bytes: number): string {
+  return toBase64Url(crypto.randomBytes(bytes));
+}
+
+export function sha256Hex(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+export function sha256Base64Url(input: string): string {
+  return toBase64Url(crypto.createHash("sha256").update(input).digest());
+}
+
+export function safeEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+```
+
+- [ ] **Step 4: Write `src/services/pkce.ts`**
+
+```ts
+import { safeEqual, sha256Base64Url } from "../crypto";
+
+export function verifyS256(verifier: string, expectedChallenge: string): boolean {
+  if (!verifier) return false;
+  return safeEqual(sha256Base64Url(verifier), expectedChallenge);
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/crypto.test.ts src/services/pkce.test.ts`
+Expected: PASS, 9 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/crypto.ts packages/shopify-mcp-oauth/src/crypto.test.ts packages/shopify-mcp-oauth/src/services/pkce.ts packages/shopify-mcp-oauth/src/services/pkce.test.ts
+git commit -m "feat: add crypto helpers and S256 PKCE verification"
+```
+
+---
+
+## Task 4: Redirect URI validation and matching
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/services/redirectUri.ts`
+- Test: `packages/shopify-mcp-oauth/src/services/redirectUri.test.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces:
+  - `validateRedirectUri(uri: string): string | null` — returns an error message, or `null` when acceptable
+  - `redirectUriMatches(registered: string, requested: string): boolean`
+
+- [ ] **Step 1: Write the failing test**
+
+`src/services/redirectUri.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { redirectUriMatches, validateRedirectUri } from "./redirectUri";
+
+const HTTPS_CALLBACK = "https://client.example/callback";
+const LOOPBACK_CALLBACK = "http://127.0.0.1:8976/callback";
+const PRIVATE_SCHEME_CALLBACK = "com.example.app://oauth";
+
+describe("validateRedirectUri", () => {
+  it("accepts https", () => {
+    expect(validateRedirectUri(HTTPS_CALLBACK)).toBeNull();
+  });
+
+  it("accepts http on loopback", () => {
+    expect(validateRedirectUri(LOOPBACK_CALLBACK)).toBeNull();
+  });
+
+  it("accepts a private-use scheme", () => {
+    expect(validateRedirectUri(PRIVATE_SCHEME_CALLBACK)).toBeNull();
+  });
+
+  it("rejects http on a public host", () => {
+    expect(validateRedirectUri("http://client.example/callback")).toMatch(/loopback/);
+  });
+
+  it("rejects javascript: URIs", () => {
+    expect(validateRedirectUri("javascript:alert(1)")).toMatch(/not allowed/);
+  });
+
+  it("rejects unparseable input", () => {
+    expect(validateRedirectUri("not a url")).toMatch(/valid URL/);
+  });
+});
+
+describe("redirectUriMatches", () => {
+  it("matches an identical URI", () => {
+    expect(redirectUriMatches(HTTPS_CALLBACK, HTTPS_CALLBACK)).toBe(true);
+  });
+
+  it("ignores the port on loopback, per RFC 8252 section 7.3", () => {
+    expect(redirectUriMatches("http://127.0.0.1:1234/callback", "http://127.0.0.1:55555/callback")).toBe(true);
+  });
+
+  it("does not ignore the port on a public host", () => {
+    expect(redirectUriMatches("https://client.example:443/cb", "https://client.example:8443/cb")).toBe(false);
+  });
+
+  it("rejects a different path", () => {
+    expect(redirectUriMatches(HTTPS_CALLBACK, "https://client.example/other")).toBe(false);
+  });
+
+  it("rejects a different host", () => {
+    expect(redirectUriMatches(HTTPS_CALLBACK, "https://attacker.example/callback")).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/redirectUri.test.ts`
+Expected: FAIL — cannot resolve `./redirectUri`.
+
+- [ ] **Step 3: Write `src/services/redirectUri.ts`**
+
+```ts
+// RFC 8252 §3 lists 127.0.0.1 and [::1] as the canonical loopback redirect hosts. Node's
+// URL.hostname keeps the IPv6 brackets, so compare against "[::1]" literally. Clients in the
+// wild also use "localhost" and other 127.0.0.0/8 addresses.
+function isLoopbackHost(hostname: string): boolean {
+  if (hostname === "localhost" || hostname === "[::1]") return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(hostname);
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+// RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+const SCHEME_SHAPE = /^[a-z][a-z0-9+\-.]*$/;
+
+// Private-use schemes are allowed (RFC 8252 §7.1), but a 302 to any of these would be a
+// vulnerability: they execute script, expose local content, or hand off to arbitrary apps.
+const DANGEROUS_SCHEMES = new Set([
+  "javascript",
+  "vbscript",
+  "livescript",
+  "mocha",
+  "data",
+  "blob",
+  "file",
+  "about",
+  "view-source",
+  "chrome",
+  "chrome-extension",
+  "moz-extension",
+  "safari-extension",
+  "jar",
+  "ms-help",
+  "ms-its",
+  "ms-itss",
+  "mhtml",
+  "wyciwyg",
+  "intent",
+]);
+
+export function validateRedirectUri(uri: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return "redirect_uri must be a valid URL";
+  }
+  const scheme = url.protocol.replace(/:$/, "").toLowerCase();
+  if (DANGEROUS_SCHEMES.has(scheme)) {
+    return `${url.protocol} redirect_uris are not allowed`;
+  }
+  if (scheme === "https") return null;
+  if (scheme === "http") {
+    if (isLoopbackHost(url.hostname)) return null;
+    return "http:// redirect_uris are only allowed for loopback hosts (localhost, 127.0.0.0/8, ::1)";
+  }
+  if (!SCHEME_SHAPE.test(scheme)) {
+    return `${url.protocol} is not a valid URI scheme`;
+  }
+  return null;
+}
+
+// RFC 8252 §7.3: the AS MUST accept any port on a loopback redirect_uri, because native
+// clients bind an ephemeral one.
+export function redirectUriMatches(registered: string, requested: string): boolean {
+  if (registered === requested) return true;
+  let left: URL;
+  let right: URL;
+  try {
+    left = new URL(registered);
+    right = new URL(requested);
+  } catch {
+    return false;
+  }
+  if (left.protocol !== right.protocol) return false;
+  if (left.hostname !== right.hostname) return false;
+  if (left.pathname !== right.pathname) return false;
+  if (left.search !== right.search) return false;
+  if (!LOOPBACK_HOSTS.has(left.hostname)) return left.port === right.port;
+  return true;
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/redirectUri.test.ts`
+Expected: PASS, 11 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/services/redirectUri.ts packages/shopify-mcp-oauth/src/services/redirectUri.test.ts
+git commit -m "feat: add redirect_uri validation and RFC 8252 matching"
+```
+
+---
+
+## Task 5: State JWT
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/services/stateJwt.ts`
+- Test: `packages/shopify-mcp-oauth/src/services/stateJwt.test.ts`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces:
+  - `interface OuterStatePayload { clientId, redirectUri, clientState, codeChallenge, codeChallengeMethod, resource, nonce }` — all `string`
+  - `interface VerifiedOuterState extends OuterStatePayload { iat: number; exp: number }`
+  - `signOuterState(payload: OuterStatePayload, secret: string, ttlSeconds: number): string`
+  - `verifyOuterState(token: string, secret: string): VerifiedOuterState` — throws on tamper or expiry
+
+The state JWT is what survives the round trip through Shopify: `/authorize` signs the client's request into it, and the callback reads it back. It is the only thing preventing an attacker from swapping the `redirect_uri` mid-flow.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/services/stateJwt.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { signOuterState, verifyOuterState, type OuterStatePayload } from "./stateJwt";
+
+const SECRET = "test-state-secret-at-least-32-bytes-long";
+const CLIENT_ID = "https://client.example/metadata.json";
+const REDIRECT_URI = "https://client.example/callback";
+
+const payload: OuterStatePayload = {
+  clientId: CLIENT_ID,
+  redirectUri: REDIRECT_URI,
+  clientState: "client-state-value",
+  codeChallenge: "challenge-value",
+  codeChallengeMethod: "S256",
+  resource: "https://mcp.example.com/mcp",
+  nonce: "nonce-value",
+};
+
+describe("state JWT", () => {
+  it("round-trips the payload", () => {
+    const verified = verifyOuterState(signOuterState(payload, SECRET, 600), SECRET);
+    expect(verified.clientId).toBe(CLIENT_ID);
+    expect(verified.redirectUri).toBe(REDIRECT_URI);
+  });
+
+  it("rejects a token signed with a different secret", () => {
+    const token = signOuterState(payload, SECRET, 600);
+    expect(() => verifyOuterState(token, "a-different-secret-value-entirely")).toThrow();
+  });
+
+  it("rejects an expired token", () => {
+    const token = signOuterState(payload, SECRET, -1);
+    expect(() => verifyOuterState(token, SECRET)).toThrow();
+  });
+
+  it("rejects a tampered payload", () => {
+    const token = signOuterState(payload, SECRET, 600);
+    const [header, , signature] = token.split(".");
+    const forged = Buffer.from(JSON.stringify({ ...payload, redirectUri: "https://attacker.example/cb" }))
+      .toString("base64url");
+    expect(() => verifyOuterState(`${header}.${forged}.${signature}`, SECRET)).toThrow();
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/stateJwt.test.ts`
+Expected: FAIL — cannot resolve `./stateJwt`.
+
+- [ ] **Step 3: Write `src/services/stateJwt.ts`**
+
+```ts
+import jwt from "jsonwebtoken";
+
+export interface OuterStatePayload {
+  clientId: string;
+  redirectUri: string;
+  clientState: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+  resource: string;
+  nonce: string;
+}
+
+export interface VerifiedOuterState extends OuterStatePayload {
+  iat: number;
+  exp: number;
+}
+
+export function signOuterState(payload: OuterStatePayload, secret: string, ttlSeconds: number): string {
+  return jwt.sign(payload, secret, { algorithm: "HS256", expiresIn: ttlSeconds });
+}
+
+export function verifyOuterState(token: string, secret: string): VerifiedOuterState {
+  return jwt.verify(token, secret, { algorithms: ["HS256"] }) as VerifiedOuterState;
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/stateJwt.test.ts`
+Expected: PASS, 4 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/services/stateJwt.ts packages/shopify-mcp-oauth/src/services/stateJwt.test.ts
+git commit -m "feat: add HS256 state JWT for the Shopify round trip"
+```
+
+---
+
+## Task 6: Memory adapters and the storage contract suite
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/adapters/memoryStorage.ts`
+- Create: `packages/shopify-mcp-oauth/src/adapters/memoryCache.ts`
+- Create: `packages/shopify-mcp-oauth/src/testing/storageContract.ts`
+- Test: `packages/shopify-mcp-oauth/src/adapters/memoryStorage.test.ts`, `packages/shopify-mcp-oauth/src/adapters/memoryCache.test.ts`
+
+**Interfaces:**
+- Consumes: `OAuthStorage`, `CacheStore`, `NewOAuthClient`, `NewToken`, `StoredToken`, `ShopRef` from `../types`
+- Produces:
+  - `memoryStorage(seed?: { shops?: ShopRef[] }): OAuthStorage & { addShop(shop: ShopRef): void }`
+  - `memoryCache(): CacheStore`
+  - `runStorageContractTests(makeStorage: () => Promise<OAuthStorage> | OAuthStorage, opts: { seedShop: ShopRef }): void` — registers a `describe` block; callers invoke it inside their own test file. `seedShop` must already exist in the storage the factory returns.
+
+`runStorageContractTests` is exported from the package's `./testing` subpath so that Vitest never
+enters the main bundle.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/adapters/memoryStorage.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { runStorageContractTests } from "../testing/storageContract";
+import { memoryStorage } from "./memoryStorage";
+
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+
+runStorageContractTests(() => memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }), {
+  seedShop: { id: DEMO_SHOP_ID, domain: DEMO_SHOP },
+});
+
+describe("memoryStorage", () => {
+  it("starts with no shops when given no seed", async () => {
+    const storage = memoryStorage();
+    expect(await storage.findShopByDomain(DEMO_SHOP)).toBeNull();
+  });
+
+  it("accepts a shop added after construction", async () => {
+    const storage = memoryStorage();
+    storage.addShop({ id: DEMO_SHOP_ID, domain: DEMO_SHOP });
+    expect(await storage.findShopByDomain(DEMO_SHOP)).toEqual({ id: DEMO_SHOP_ID, domain: DEMO_SHOP });
+  });
+});
+```
+
+`src/adapters/memoryCache.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { memoryCache } from "./memoryCache";
+
+const KEY = "mcp:oauth:code:abc";
+
+describe("memoryCache", () => {
+  it("returns null for a key it never stored", async () => {
+    expect(await memoryCache().get(KEY)).toBeNull();
+  });
+
+  it("returns a stored value", async () => {
+    const cache = memoryCache();
+    await cache.set(KEY, "stored-value", 60);
+    expect(await cache.get(KEY)).toBe("stored-value");
+  });
+
+  it("expires a value once its TTL has passed", async () => {
+    const cache = memoryCache();
+    await cache.set(KEY, "stored-value", -1);
+    expect(await cache.get(KEY)).toBeNull();
+  });
+
+  it("deletes a value", async () => {
+    const cache = memoryCache();
+    await cache.set(KEY, "stored-value", 60);
+    await cache.del(KEY);
+    expect(await cache.get(KEY)).toBeNull();
+  });
+
+  it("reads and deletes atomically via getdel", async () => {
+    const cache = memoryCache();
+    await cache.set(KEY, "stored-value", 60);
+    expect(await cache.getdel?.(KEY)).toBe("stored-value");
+    expect(await cache.get(KEY)).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters`
+Expected: FAIL — cannot resolve `./memoryStorage`, `./memoryCache`, `../testing/storageContract`.
+
+- [ ] **Step 3: Write `src/testing/storageContract.ts`**
+
+```ts
+import { beforeEach, describe, expect, it } from "vitest";
+import type { NewOAuthClient, NewToken, OAuthStorage, ShopRef } from "../types";
+
+const CONTRACT_CLIENT_ID = "contract-client-id";
+const CONTRACT_REDIRECT_URI = "https://client.example/callback";
+
+function buildClient(overrides: Partial<NewOAuthClient> = {}): NewOAuthClient {
+  return {
+    clientId: CONTRACT_CLIENT_ID,
+    clientName: null,
+    redirectUris: [CONTRACT_REDIRECT_URI],
+    grantTypes: ["authorization_code", "refresh_token"],
+    responseTypes: ["code"],
+    logoUri: null,
+    clientUri: null,
+    tokenEndpointAuthMethod: "none",
+    ...overrides,
+  };
+}
+
+function buildToken(shop: ShopRef, overrides: Partial<NewToken> = {}): NewToken {
+  return {
+    shopId: shop.id,
+    shopDomain: shop.domain,
+    clientId: CONTRACT_CLIENT_ID,
+    accessTokenHash: "access-hash",
+    refreshTokenHash: "refresh-hash",
+    accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    refreshTokenExpiresAt: new Date(Date.now() + 86_400_000),
+    scope: "mcp:*",
+    resource: "https://mcp.example.com/mcp",
+    rotatedFromId: null,
+    ...overrides,
+  };
+}
+
+export function runStorageContractTests(
+  makeStorage: () => Promise<OAuthStorage> | OAuthStorage,
+  opts: { seedShop: ShopRef }
+): void {
+  describe("OAuthStorage contract", () => {
+    let storage: OAuthStorage;
+
+    beforeEach(async () => {
+      storage = await makeStorage();
+    });
+
+    it("returns null for an unknown client", async () => {
+      expect(await storage.findClient("no-such-client")).toBeNull();
+    });
+
+    it("round-trips a created client", async () => {
+      await storage.createClient(buildClient({ clientName: "Contract Client" }));
+      const found = await storage.findClient(CONTRACT_CLIENT_ID);
+      expect(found?.clientName).toBe("Contract Client");
+      expect(found?.redirectUris).toEqual([CONTRACT_REDIRECT_URI]);
+    });
+
+    it("upsertClient is idempotent on clientId", async () => {
+      await storage.upsertClient(buildClient({ clientName: "First Write" }));
+      await storage.upsertClient(buildClient({ clientName: "Second Write" }));
+      const found = await storage.findClient(CONTRACT_CLIENT_ID);
+      expect(found?.clientName).toBe("First Write");
+    });
+
+    it("finds a token by its access hash", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "lookup-me" }));
+      const found = await storage.findTokenByAccessHash("lookup-me");
+      expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
+    });
+
+    it("does not return an expired access token", async () => {
+      await storage.createToken(
+        buildToken(opts.seedShop, {
+          accessTokenHash: "expired-hash",
+          accessTokenExpiresAt: new Date(Date.now() - 1000),
+        })
+      );
+      expect(await storage.findTokenByAccessHash("expired-hash")).toBeNull();
+    });
+
+    it("does not return a revoked token", async () => {
+      const token = await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "revoke-me" }));
+      await storage.revokeToken(token.id);
+      expect(await storage.findTokenByAccessHash("revoke-me")).toBeNull();
+    });
+
+    it("finds a token by its refresh hash", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup" }));
+      const found = await storage.findTokenByRefreshHash("refresh-lookup");
+      expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
+    });
+
+    it("revokeToken returns false the second time, so rotation stays single-use", async () => {
+      const token = await storage.createToken(buildToken(opts.seedShop));
+      expect(await storage.revokeToken(token.id)).toBe(true);
+      expect(await storage.revokeToken(token.id)).toBe(false);
+    });
+
+    it("finds the seeded shop by domain", async () => {
+      const found = await storage.findShopByDomain(opts.seedShop.domain);
+      expect(found?.domain).toBe(opts.seedShop.domain);
+    });
+
+    it("returns null for an unknown shop domain", async () => {
+      expect(await storage.findShopByDomain("never-installed.myshopify.com")).toBeNull();
+    });
+  });
+}
+```
+
+- [ ] **Step 4: Write `src/adapters/memoryCache.ts`**
+
+```ts
+import type { CacheStore } from "../types";
+
+interface Entry {
+  value: string;
+  expiresAt: number;
+}
+
+export function memoryCache(): CacheStore {
+  const entries = new Map<string, Entry>();
+
+  function read(key: string): string | null {
+    const entry = entries.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      entries.delete(key);
+      return null;
+    }
+    return entry.value;
+  }
+
+  return {
+    async get(key) {
+      return read(key);
+    },
+    async set(key, value, ttlSeconds) {
+      entries.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
+    },
+    async del(key) {
+      entries.delete(key);
+    },
+    async getdel(key) {
+      const value = read(key);
+      entries.delete(key);
+      return value;
+    },
+  };
+}
+```
+
+- [ ] **Step 5: Write `src/adapters/memoryStorage.ts`**
+
+```ts
+import { randomBase64Url } from "../crypto";
+import type { NewOAuthClient, NewToken, OAuthClient, OAuthStorage, ShopRef, StoredToken } from "../types";
+
+export interface MemoryStorage extends OAuthStorage {
+  addShop(shop: ShopRef): void;
+}
+
+export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
+  const clients = new Map<string, OAuthClient>();
+  const tokens = new Map<string, StoredToken>();
+  const shops = new Map<string, ShopRef>();
+  for (const shop of seed.shops ?? []) shops.set(shop.domain, shop);
+
+  function isUsable(token: StoredToken): boolean {
+    return token.revokedAt === null && token.accessTokenExpiresAt.getTime() > Date.now();
+  }
+
+  return {
+    addShop(shop) {
+      shops.set(shop.domain, shop);
+    },
+
+    async findClient(clientId) {
+      return clients.get(clientId) ?? null;
+    },
+
+    async createClient(client) {
+      const row: OAuthClient = { ...client, revokedAt: null };
+      clients.set(row.clientId, row);
+      return row;
+    },
+
+    async upsertClient(client: NewOAuthClient) {
+      const existing = clients.get(client.clientId);
+      if (existing) return existing;
+      const row: OAuthClient = { ...client, revokedAt: null };
+      clients.set(row.clientId, row);
+      return row;
+    },
+
+    async createToken(token: NewToken) {
+      const row: StoredToken = { ...token, id: randomBase64Url(12), revokedAt: null };
+      tokens.set(row.id, row);
+      return row;
+    },
+
+    async findTokenByAccessHash(hash) {
+      for (const token of tokens.values()) {
+        if (token.accessTokenHash === hash && isUsable(token)) return token;
+      }
+      return null;
+    },
+
+    async findTokenByRefreshHash(hash) {
+      for (const token of tokens.values()) {
+        if (token.refreshTokenHash !== hash) continue;
+        if (token.revokedAt !== null) continue;
+        if (token.refreshTokenExpiresAt && token.refreshTokenExpiresAt.getTime() <= Date.now()) continue;
+        return token;
+      }
+      return null;
+    },
+
+    async revokeToken(id) {
+      const token = tokens.get(id);
+      if (!token || token.revokedAt !== null) return false;
+      tokens.set(id, { ...token, revokedAt: new Date() });
+      return true;
+    },
+
+    async touchToken() {
+      // last-used tracking is not useful in memory; the contract only requires it not to throw
+    },
+
+    async findShopByDomain(domain) {
+      return shops.get(domain) ?? null;
+    },
+  };
+}
+```
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters`
+Expected: PASS — 11 contract tests plus 2 memoryStorage tests plus 5 memoryCache tests.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/adapters packages/shopify-mcp-oauth/src/testing
+git commit -m "feat: add memory storage and cache adapters with a storage contract suite"
+```
+
+---
+
+## Task 7: Redis cache adapter
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/adapters/redisCache.ts`
+- Test: `packages/shopify-mcp-oauth/src/adapters/redisCache.test.ts`
+
+**Interfaces:**
+- Consumes: `CacheStore` from `../types`
+- Produces:
+  - `interface RedisLikeClient { get(key): Promise<string | null>; set(key, value, opts: { EX: number }): Promise<unknown>; del(key): Promise<unknown>; getDel?(key): Promise<string | null> }`
+  - `redisCache(client: RedisLikeClient): CacheStore`
+
+Typed against a minimal structural interface rather than a specific client, so `node-redis` and
+`ioredis` wrappers both satisfy it without the package depending on either.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/adapters/redisCache.test.ts`:
+
+```ts
+import { describe, expect, it, vi } from "vitest";
+import { redisCache, type RedisLikeClient } from "./redisCache";
+
+const KEY = "mcp:oauth:code:abc";
+
+function buildFakeRedis(overrides: Partial<RedisLikeClient> = {}): RedisLikeClient {
+  return {
+    get: vi.fn().mockResolvedValue(null),
+    set: vi.fn().mockResolvedValue("OK"),
+    del: vi.fn().mockResolvedValue(1),
+    ...overrides,
+  };
+}
+
+describe("redisCache", () => {
+  it("sets with an EX ttl", async () => {
+    const client = buildFakeRedis();
+    await redisCache(client).set(KEY, "stored-value", 60);
+    expect(client.set).toHaveBeenCalledWith(KEY, "stored-value", { EX: 60 });
+  });
+
+  it("reads a stored value", async () => {
+    const client = buildFakeRedis({ get: vi.fn().mockResolvedValue("stored-value") });
+    expect(await redisCache(client).get(KEY)).toBe("stored-value");
+  });
+
+  it("uses getDel when the client supports it", async () => {
+    const getDel = vi.fn().mockResolvedValue("stored-value");
+    const client = buildFakeRedis({ getDel });
+    expect(await redisCache(client).getdel?.(KEY)).toBe("stored-value");
+    expect(getDel).toHaveBeenCalledWith(KEY);
+  });
+
+  it("falls back to get then del when getDel is absent", async () => {
+    const client = buildFakeRedis({ get: vi.fn().mockResolvedValue("stored-value") });
+    expect(await redisCache(client).getdel?.(KEY)).toBe("stored-value");
+    expect(client.del).toHaveBeenCalledWith(KEY);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters/redisCache.test.ts`
+Expected: FAIL — cannot resolve `./redisCache`.
+
+- [ ] **Step 3: Write `src/adapters/redisCache.ts`**
+
+```ts
+import type { CacheStore } from "../types";
+
+export interface RedisLikeClient {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, opts: { EX: number }): Promise<unknown>;
+  del(key: string): Promise<unknown>;
+  getDel?(key: string): Promise<string | null>;
+}
+
+export function redisCache(client: RedisLikeClient): CacheStore {
+  return {
+    async get(key) {
+      return client.get(key);
+    },
+    async set(key, value, ttlSeconds) {
+      await client.set(key, value, { EX: ttlSeconds });
+    },
+    async del(key) {
+      await client.del(key);
+    },
+    async getdel(key) {
+      // GETDEL needs Redis 6.2+. Older servers fall back to GET then DEL, which is not atomic;
+      // a concurrent redemption of the same authorization code could read it twice.
+      if (client.getDel) return client.getDel(key);
+      const value = await client.get(key);
+      await client.del(key);
+      return value;
+    },
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters/redisCache.test.ts`
+Expected: PASS, 4 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/adapters/redisCache.ts packages/shopify-mcp-oauth/src/adapters/redisCache.test.ts
+git commit -m "feat: add redis cache adapter"
+```
+
+---
+
+## Task 8: Prisma storage adapter
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/adapters/prismaStorage.ts`
+- Test: `packages/shopify-mcp-oauth/src/adapters/prismaStorage.test.ts`
+
+**Interfaces:**
+- Consumes: `OAuthStorage`, `NewOAuthClient`, `NewToken`, `OAuthClient`, `StoredToken`, `ShopRef` from `../types`
+- Produces:
+  - `interface PrismaShopMapping { model: string; domainField: string; idField: string; where?: Record<string, unknown> }`
+  - `prismaStorage(prisma: PrismaLikeClient): Omit<OAuthStorage, "findShopByDomain">`
+  - `prismaStorage(prisma: PrismaLikeClient, opts: { shop: PrismaShopMapping }): OAuthStorage`
+
+The overload is the enforcement mechanism from the spec: omitting `shop` yields a type that is
+missing `findShopByDomain`, so a config without a shop lookup fails to compile rather than failing at
+runtime. The adopter supplies the lookup some other way — `shopifySessionStorage` or `allowAnyShop`.
+
+The adapter is typed against a minimal structural `PrismaLikeClient` so the package never depends on
+`@prisma/client`, and the tests can pass a plain object.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/adapters/prismaStorage.test.ts`:
+
+```ts
+import { describe, expect, it, vi } from "vitest";
+import { prismaStorage, type PrismaLikeClient } from "./prismaStorage";
+
+const DEMO_SHOP = "demo.myshopify.com";
+const CLIENT_ID = "prisma-client-id";
+
+function buildPrisma(overrides: Record<string, unknown> = {}): PrismaLikeClient {
+  return {
+    mcpOAuthClient: {
+      findFirst: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue(null),
+      upsert: vi.fn().mockResolvedValue(null),
+    },
+    mcpOAuthToken: {
+      findFirst: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue(null),
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    ...overrides,
+  } as unknown as PrismaLikeClient;
+}
+
+describe("prismaStorage", () => {
+  it("maps a client row into the OAuthClient shape", async () => {
+    const prisma = buildPrisma({
+      mcpOAuthClient: {
+        findFirst: vi.fn().mockResolvedValue({
+          clientId: CLIENT_ID,
+          clientName: "Prisma Client",
+          redirectUris: ["https://client.example/callback"],
+          grantTypes: ["authorization_code"],
+          responseTypes: ["code"],
+          logoUri: null,
+          clientUri: null,
+          tokenEndpointAuthMethod: "none",
+          revokedAt: null,
+        }),
+        create: vi.fn(),
+        upsert: vi.fn(),
+      },
+    });
+    const found = await prismaStorage(prisma).findClient(CLIENT_ID);
+    expect(found?.clientName).toBe("Prisma Client");
+  });
+
+  it("filters expired and revoked rows in the access-hash lookup", async () => {
+    const findFirst = vi.fn().mockResolvedValue(null);
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst, create: vi.fn(), updateMany: vi.fn() },
+    });
+    await prismaStorage(prisma).findTokenByAccessHash("some-hash");
+    const where = findFirst.mock.calls[0]?.[0]?.where;
+    expect(where.accessTokenHash).toBe("some-hash");
+    expect(where.revokedAt).toBeNull();
+    expect(where.accessTokenExpiresAt.gt).toBeInstanceOf(Date);
+  });
+
+  it("revokeToken reports false when no unrevoked row matched", async () => {
+    const prisma = buildPrisma({
+      mcpOAuthToken: {
+        findFirst: vi.fn(),
+        create: vi.fn(),
+        updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+      },
+    });
+    expect(await prismaStorage(prisma).revokeToken("token-1")).toBe(false);
+  });
+
+  it("revokeToken reports true when one row flipped", async () => {
+    const prisma = buildPrisma({
+      mcpOAuthToken: {
+        findFirst: vi.fn(),
+        create: vi.fn(),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+    });
+    expect(await prismaStorage(prisma).revokeToken("token-1")).toBe(true);
+  });
+
+  it("looks the shop up through the configured mapping", async () => {
+    const findFirst = vi.fn().mockResolvedValue({ id: "store_7", myshopifyDomain: DEMO_SHOP });
+    const prisma = buildPrisma({ store: { findFirst } });
+    const storage = prismaStorage(prisma, {
+      shop: { model: "store", domainField: "myshopifyDomain", idField: "id" },
+    });
+    expect(await storage.findShopByDomain(DEMO_SHOP)).toEqual({ id: "store_7", domain: DEMO_SHOP });
+    expect(findFirst).toHaveBeenCalledWith({ where: { myshopifyDomain: DEMO_SHOP } });
+  });
+
+  it("returns null when the mapped shop row is absent", async () => {
+    const prisma = buildPrisma({ store: { findFirst: vi.fn().mockResolvedValue(null) } });
+    const storage = prismaStorage(prisma, {
+      shop: { model: "store", domainField: "myshopifyDomain", idField: "id" },
+    });
+    expect(await storage.findShopByDomain(DEMO_SHOP)).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters/prismaStorage.test.ts`
+Expected: FAIL — cannot resolve `./prismaStorage`.
+
+- [ ] **Step 3: Write `src/adapters/prismaStorage.ts`**
+
+```ts
+import type { NewOAuthClient, NewToken, OAuthClient, OAuthStorage, ShopRef, StoredToken } from "../types";
+
+interface PrismaDelegate {
+  findFirst(args: { where: Record<string, unknown> }): Promise<Record<string, unknown> | null>;
+  create(args: { data: Record<string, unknown> }): Promise<Record<string, unknown>>;
+  upsert?(args: {
+    where: Record<string, unknown>;
+    create: Record<string, unknown>;
+    update: Record<string, unknown>;
+  }): Promise<Record<string, unknown>>;
+  updateMany?(args: {
+    where: Record<string, unknown>;
+    data: Record<string, unknown>;
+  }): Promise<{ count: number }>;
+}
+
+export type PrismaLikeClient = Record<string, PrismaDelegate> & {
+  mcpOAuthClient: PrismaDelegate;
+  mcpOAuthToken: PrismaDelegate;
+};
+
+export interface PrismaShopMapping {
+  model: string;
+  domainField: string;
+  idField: string;
+  where?: Record<string, unknown>;
+}
+
+function toClient(row: Record<string, unknown>): OAuthClient {
+  return {
+    clientId: row.clientId as string,
+    clientName: (row.clientName as string | null) ?? null,
+    redirectUris: row.redirectUris as string[],
+    grantTypes: (row.grantTypes as string[] | null) ?? null,
+    responseTypes: (row.responseTypes as string[] | null) ?? null,
+    logoUri: (row.logoUri as string | null) ?? null,
+    clientUri: (row.clientUri as string | null) ?? null,
+    tokenEndpointAuthMethod: (row.tokenEndpointAuthMethod as string) ?? "none",
+    revokedAt: (row.revokedAt as Date | null) ?? null,
+  };
+}
+
+function toToken(row: Record<string, unknown>): StoredToken {
+  return {
+    id: String(row.id),
+    shopId: row.shopId as string | number,
+    shopDomain: row.shopDomain as string,
+    clientId: row.clientId as string,
+    accessTokenHash: row.accessTokenHash as string,
+    refreshTokenHash: (row.refreshTokenHash as string | null) ?? null,
+    accessTokenExpiresAt: row.accessTokenExpiresAt as Date,
+    refreshTokenExpiresAt: (row.refreshTokenExpiresAt as Date | null) ?? null,
+    scope: (row.scope as string | null) ?? null,
+    resource: (row.resource as string | null) ?? null,
+    revokedAt: (row.revokedAt as Date | null) ?? null,
+    rotatedFromId: (row.rotatedFromId as string | null) ?? null,
+  };
+}
+
+function buildCore(prisma: PrismaLikeClient): Omit<OAuthStorage, "findShopByDomain"> {
+  return {
+    async findClient(clientId) {
+      const row = await prisma.mcpOAuthClient.findFirst({ where: { clientId, revokedAt: null } });
+      return row ? toClient(row) : null;
+    },
+
+    async createClient(client: NewOAuthClient) {
+      const row = await prisma.mcpOAuthClient.create({ data: { ...client } });
+      return toClient(row);
+    },
+
+    async upsertClient(client: NewOAuthClient) {
+      if (!prisma.mcpOAuthClient.upsert) {
+        throw new Error("prisma client delegate does not support upsert");
+      }
+      const row = await prisma.mcpOAuthClient.upsert({
+        where: { clientId: client.clientId },
+        create: { ...client },
+        update: {},
+      });
+      return toClient(row);
+    },
+
+    async createToken(token: NewToken) {
+      const row = await prisma.mcpOAuthToken.create({ data: { ...token } });
+      return toToken(row);
+    },
+
+    async findTokenByAccessHash(hash) {
+      const row = await prisma.mcpOAuthToken.findFirst({
+        where: { accessTokenHash: hash, revokedAt: null, accessTokenExpiresAt: { gt: new Date() } },
+      });
+      return row ? toToken(row) : null;
+    },
+
+    async findTokenByRefreshHash(hash) {
+      const row = await prisma.mcpOAuthToken.findFirst({
+        where: { refreshTokenHash: hash, revokedAt: null, refreshTokenExpiresAt: { gt: new Date() } },
+      });
+      return row ? toToken(row) : null;
+    },
+
+    async revokeToken(id) {
+      if (!prisma.mcpOAuthToken.updateMany) {
+        throw new Error("prisma token delegate does not support updateMany");
+      }
+      // Conditional update: only the request that flips revokedAt from null wins, so two
+      // concurrent refreshes cannot each mint a new pair.
+      const result = await prisma.mcpOAuthToken.updateMany({
+        where: { id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      return result.count > 0;
+    },
+
+    async touchToken(id, lastUsedAt) {
+      await prisma.mcpOAuthToken.updateMany?.({ where: { id }, data: { lastUsedAt } });
+    },
+  };
+}
+
+export function prismaStorage(prisma: PrismaLikeClient): Omit<OAuthStorage, "findShopByDomain">;
+export function prismaStorage(prisma: PrismaLikeClient, opts: { shop: PrismaShopMapping }): OAuthStorage;
+export function prismaStorage(
+  prisma: PrismaLikeClient,
+  opts?: { shop: PrismaShopMapping }
+): OAuthStorage | Omit<OAuthStorage, "findShopByDomain"> {
+  const core = buildCore(prisma);
+  if (!opts) return core;
+
+  const mapping = opts.shop;
+  return {
+    ...core,
+    async findShopByDomain(domain): Promise<ShopRef | null> {
+      const delegate = prisma[mapping.model];
+      if (!delegate) throw new Error(`prisma client has no "${mapping.model}" model`);
+      const row = await delegate.findFirst({
+        where: { ...(mapping.where ?? {}), [mapping.domainField]: domain },
+      });
+      if (!row) return null;
+      return { id: row[mapping.idField] as string | number, domain };
+    },
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters/prismaStorage.test.ts`
+Expected: PASS, 6 tests.
+
+- [ ] **Step 5: Verify the overload actually blocks the unmapped case**
+
+Create a scratch file `packages/shopify-mcp-oauth/src/adapters/overload-check.ts`:
+
+```ts
+import { prismaStorage, type PrismaLikeClient } from "./prismaStorage";
+import type { OAuthStorage } from "../types";
+
+declare const prisma: PrismaLikeClient;
+// @ts-expect-error prismaStorage without a shop mapping is missing findShopByDomain
+export const incomplete: OAuthStorage = prismaStorage(prisma);
+```
+
+Run: `pnpm --filter shopify-mcp-oauth typecheck`
+Expected: PASS. If it reports "Unused '@ts-expect-error' directive", the overload is not enforcing —
+fix `prismaStorage` before continuing.
+
+Then delete the scratch file:
+
+```bash
+rm packages/shopify-mcp-oauth/src/adapters/overload-check.ts
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/adapters/prismaStorage.ts packages/shopify-mcp-oauth/src/adapters/prismaStorage.test.ts
+git commit -m "feat: add prisma storage adapter with an optional shop mapping"
+```
+
+---
+
+## Task 9: Shop lookup adapters
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/adapters/shopifySessionStorage.ts`
+- Create: `packages/shopify-mcp-oauth/src/adapters/allowAnyShop.ts`
+- Test: `packages/shopify-mcp-oauth/src/adapters/shopifySessionStorage.test.ts`, `packages/shopify-mcp-oauth/src/adapters/allowAnyShop.test.ts`
+
+**Interfaces:**
+- Consumes: `ShopRef`, `OAuthStorage` from `../types`
+- Produces:
+  - `interface ShopifySessionLike { shop: string; isOnline: boolean; accessToken?: string }`
+  - `interface ShopifySessionStorageLike { findSessionsByShop(shop: string): Promise<ShopifySessionLike[]> }`
+  - `shopifySessionStorage(sessionStorage: ShopifySessionStorageLike): OAuthStorage["findShopByDomain"]`
+  - `allowAnyShop(): OAuthStorage["findShopByDomain"]`
+
+`findSessionsByShop` is a required method on `@shopify/shopify-app-session-storage`'s `SessionStorage`
+interface, so every official adapter implements it — Prisma, Redis, MongoDB, MySQL, PostgreSQL,
+SQLite, DynamoDB, Cloudflare KV. Binding here rather than to a table keeps the lookup independent of
+where the adopter's sessions live.
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/adapters/shopifySessionStorage.test.ts`:
+
+```ts
+import { describe, expect, it, vi } from "vitest";
+import { shopifySessionStorage, type ShopifySessionLike } from "./shopifySessionStorage";
+
+const DEMO_SHOP = "demo.myshopify.com";
+const OFFLINE_TOKEN = "shpua_offline_token";
+
+function buildSessionStorage(sessions: ShopifySessionLike[]) {
+  return { findSessionsByShop: vi.fn().mockResolvedValue(sessions) };
+}
+
+describe("shopifySessionStorage", () => {
+  it("resolves a shop that has an offline session with an access token", async () => {
+    const lookup = shopifySessionStorage(
+      buildSessionStorage([{ shop: DEMO_SHOP, isOnline: false, accessToken: OFFLINE_TOKEN }])
+    );
+    expect(await lookup(DEMO_SHOP)).toEqual({ id: DEMO_SHOP, domain: DEMO_SHOP });
+  });
+
+  it("returns null when the shop has no sessions", async () => {
+    const lookup = shopifySessionStorage(buildSessionStorage([]));
+    expect(await lookup(DEMO_SHOP)).toBeNull();
+  });
+
+  it("ignores online sessions, which do not carry an app-level grant", async () => {
+    const lookup = shopifySessionStorage(
+      buildSessionStorage([{ shop: DEMO_SHOP, isOnline: true, accessToken: OFFLINE_TOKEN }])
+    );
+    expect(await lookup(DEMO_SHOP)).toBeNull();
+  });
+
+  it("ignores an offline session with no access token", async () => {
+    const lookup = shopifySessionStorage(buildSessionStorage([{ shop: DEMO_SHOP, isOnline: false }]));
+    expect(await lookup(DEMO_SHOP)).toBeNull();
+  });
+
+  it("returns null when the session storage throws", async () => {
+    const lookup = shopifySessionStorage({
+      findSessionsByShop: vi.fn().mockRejectedValue(new Error("redis down")),
+    });
+    expect(await lookup(DEMO_SHOP)).toBeNull();
+  });
+});
+```
+
+`src/adapters/allowAnyShop.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { allowAnyShop } from "./allowAnyShop";
+
+const ANY_SHOP = "never-installed.myshopify.com";
+
+describe("allowAnyShop", () => {
+  it("resolves every domain, keyed by the domain itself", async () => {
+    expect(await allowAnyShop()(ANY_SHOP)).toEqual({ id: ANY_SHOP, domain: ANY_SHOP });
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters/shopifySessionStorage.test.ts src/adapters/allowAnyShop.test.ts`
+Expected: FAIL — cannot resolve either module.
+
+- [ ] **Step 3: Write `src/adapters/shopifySessionStorage.ts`**
+
+```ts
+import type { OAuthStorage, ShopRef } from "../types";
+
+export interface ShopifySessionLike {
+  shop: string;
+  isOnline: boolean;
+  accessToken?: string;
+}
+
+export interface ShopifySessionStorageLike {
+  findSessionsByShop(shop: string): Promise<ShopifySessionLike[]>;
+}
+
+export function shopifySessionStorage(
+  sessionStorage: ShopifySessionStorageLike
+): OAuthStorage["findShopByDomain"] {
+  return async (domain: string): Promise<ShopRef | null> => {
+    let sessions: ShopifySessionLike[];
+    try {
+      sessions = await sessionStorage.findSessionsByShop(domain);
+    } catch {
+      // A session-store outage must read as "not installed", never as "installed".
+      return null;
+    }
+    // Only an offline session proves an app-level grant; online sessions are per-staff-member.
+    const offline = sessions.find((session) => !session.isOnline && Boolean(session.accessToken));
+    return offline ? { id: domain, domain } : null;
+  };
+}
+```
+
+- [ ] **Step 4: Write `src/adapters/allowAnyShop.ts`**
+
+```ts
+import type { OAuthStorage, ShopRef } from "../types";
+
+/**
+ * Removes the install gate: any merchant who completes Shopify's flow receives a token.
+ * Shopify installs the app on approval, so finishing the flow does not prove prior install.
+ * Only use this when the app genuinely keeps no per-shop record.
+ */
+export function allowAnyShop(): OAuthStorage["findShopByDomain"] {
+  return async (domain: string): Promise<ShopRef | null> => ({ id: domain, domain });
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/adapters/shopifySessionStorage.test.ts src/adapters/allowAnyShop.test.ts`
+Expected: PASS, 6 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/adapters/shopifySessionStorage.ts packages/shopify-mcp-oauth/src/adapters/shopifySessionStorage.test.ts packages/shopify-mcp-oauth/src/adapters/allowAnyShop.ts packages/shopify-mcp-oauth/src/adapters/allowAnyShop.test.ts
+git commit -m "feat: resolve shops through Shopify's SessionStorage interface"
+```
+
+---
+
+## Task 10: Config resolution
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/config.ts`
+- Test: `packages/shopify-mcp-oauth/src/config.test.ts`
+
+**Interfaces:**
+- Consumes: `OAuthStorage`, `CacheStore`, `Logger` from `./types`; `memoryCache` from `./adapters/memoryCache`
+- Produces: `ShopifyMcpOAuthConfig`, `ResolvedConfig`, `resolveConfig(input): ResolvedConfig` — exactly as written in **Locked Interfaces**
+
+Config errors throw at construction, naming the field. A server that boots with a bad `host` and only
+fails during a merchant's login is far worse than one that refuses to start.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/config.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "./adapters/memoryStorage";
+import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
+
+const HOST = "https://mcp.example.com";
+const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
+
+function buildConfig(overrides: Partial<ShopifyMcpOAuthConfig> = {}): ShopifyMcpOAuthConfig {
+  return {
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: STATE_SECRET,
+    storage: memoryStorage(),
+    ...overrides,
+  };
+}
+
+describe("resolveConfig", () => {
+  it("derives the canonical resource identifier from the host", () => {
+    expect(resolveConfig(buildConfig()).resource).toBe(`${HOST}/mcp`);
+  });
+
+  it("strips a trailing slash from the host", () => {
+    expect(resolveConfig(buildConfig({ host: `${HOST}/` })).host).toBe(HOST);
+  });
+
+  it("defaults the access token TTL to one hour", () => {
+    expect(resolveConfig(buildConfig()).tokenTtl.access).toBe(3600);
+  });
+
+  it("defaults the refresh token TTL to thirty days", () => {
+    expect(resolveConfig(buildConfig()).tokenTtl.refresh).toBe(2_592_000);
+  });
+
+  it("keeps an explicit access TTL", () => {
+    expect(resolveConfig(buildConfig({ tokenTtl: { access: 900 } })).tokenTtl.access).toBe(900);
+  });
+
+  it("defaults the register rate limit to 20 per hour", () => {
+    expect(resolveConfig(buildConfig()).registerRateLimit).toEqual({ limit: 20, windowMs: 3_600_000 });
+  });
+
+  it("supplies a memory cache when none is given", () => {
+    expect(resolveConfig(buildConfig()).cache).toBeDefined();
+  });
+
+  it("rejects a host that is not an absolute URL", () => {
+    expect(() => resolveConfig(buildConfig({ host: "mcp.example.com" }))).toThrow(/host/);
+  });
+
+  it("rejects a state secret shorter than 32 characters", () => {
+    expect(() => resolveConfig(buildConfig({ stateSecret: "too-short" }))).toThrow(/stateSecret/);
+  });
+
+  it("rejects a missing Shopify api secret", () => {
+    const config = buildConfig({ shopify: { apiKey: "test-api-key", apiSecret: "", scopes: "read_products" } });
+    expect(() => resolveConfig(config)).toThrow(/apiSecret/);
+  });
+
+  it("defaults the openai challenge token to null", () => {
+    expect(resolveConfig(buildConfig()).openaiAppsChallengeToken).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/config.test.ts`
+Expected: FAIL — cannot resolve `./config`.
+
+- [ ] **Step 3: Write `src/config.ts`**
+
+```ts
+import { z } from "zod";
+import { memoryCache } from "./adapters/memoryCache";
+import type { CacheStore, Logger, OAuthStorage } from "./types";
+
+const DEFAULT_ACCESS_TTL_SECONDS = 3600;
+const DEFAULT_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30;
+const DEFAULT_REGISTER_RATE_LIMIT = { limit: 20, windowMs: 60 * 60 * 1000 };
+
+export interface ShopifyMcpOAuthConfig {
+  host: string;
+  shopify: { apiKey: string; apiSecret: string; scopes: string };
+  stateSecret: string;
+  storage: OAuthStorage;
+  cache?: CacheStore;
+  tokenTtl?: { access?: number; refresh?: number };
+  openaiAppsChallengeToken?: string | null;
+  registerRateLimit?: { limit: number; windowMs: number };
+  logger?: Logger;
+  fetchImpl?: typeof fetch;
+}
+
+export interface ResolvedConfig {
+  host: string;
+  resource: string;
+  shopify: { apiKey: string; apiSecret: string; scopes: string };
+  stateSecret: string;
+  storage: OAuthStorage;
+  cache: CacheStore;
+  tokenTtl: { access: number; refresh: number };
+  openaiAppsChallengeToken: string | null;
+  registerRateLimit: { limit: number; windowMs: number };
+  logger: Logger;
+  fetchImpl: typeof fetch;
+}
+
+const configSchema = z.object({
+  host: z
+    .string()
+    .min(1, "host is required")
+    .refine((value) => /^https?:\/\//.test(value), "host must be an absolute http(s) URL"),
+  shopify: z.object({
+    apiKey: z.string().min(1, "shopify.apiKey is required"),
+    apiSecret: z.string().min(1, "shopify.apiSecret is required"),
+    scopes: z.string().min(1, "shopify.scopes is required"),
+  }),
+  stateSecret: z.string().min(32, "stateSecret must be at least 32 characters"),
+  tokenTtl: z
+    .object({ access: z.number().int().positive().optional(), refresh: z.number().int().positive().optional() })
+    .optional(),
+  openaiAppsChallengeToken: z.string().min(1).nullish(),
+  registerRateLimit: z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() }).optional(),
+});
+
+export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
+  const parsed = configSchema.safeParse(input);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue?.path.join(".") ?? "config";
+    throw new Error(`shopify-mcp-oauth config invalid at "${path}": ${issue?.message ?? "unknown error"}`);
+  }
+  if (!input.storage) throw new Error('shopify-mcp-oauth config invalid at "storage": storage is required');
+
+  const host = parsed.data.host.replace(/\/+$/, "");
+
+  return {
+    host,
+    resource: `${host}/mcp`,
+    shopify: parsed.data.shopify,
+    stateSecret: parsed.data.stateSecret,
+    storage: input.storage,
+    cache: input.cache ?? memoryCache(),
+    tokenTtl: {
+      access: parsed.data.tokenTtl?.access ?? DEFAULT_ACCESS_TTL_SECONDS,
+      refresh: parsed.data.tokenTtl?.refresh ?? DEFAULT_REFRESH_TTL_SECONDS,
+    },
+    openaiAppsChallengeToken: parsed.data.openaiAppsChallengeToken ?? null,
+    registerRateLimit: parsed.data.registerRateLimit ?? DEFAULT_REGISTER_RATE_LIMIT,
+    logger: input.logger ?? console,
+    fetchImpl: input.fetchImpl ?? fetch,
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/config.test.ts`
+Expected: PASS, 11 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/config.ts packages/shopify-mcp-oauth/src/config.test.ts
+git commit -m "feat: validate and resolve package config at construction time"
+```
+
+---
+
+## Task 11: Request and document schemas
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/schemas/authorize.ts`, `token.ts`, `register.ts`, `revoke.ts`, `shopifyCallback.ts`, `cimd.ts`
+- Test: `packages/shopify-mcp-oauth/src/schemas/schemas.test.ts`
+
+**Interfaces:**
+- Consumes: `validateRedirectUri` from `../services/redirectUri`
+- Produces:
+  - `authorizeQuerySchema`, `type AuthorizeQuery`
+  - `tokenRequestSchema`, `type AuthorizationCodeGrant`, `type RefreshTokenGrant`
+  - `registerRequestSchema`, `type RegisterRequest`
+  - `revokeRequestSchema`
+  - `shopifyCallbackQuerySchema`
+  - `cimdDocumentSchema`, `type CimdDocument`
+
+- [ ] **Step 1: Write the failing test**
+
+`src/schemas/schemas.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { authorizeQuerySchema } from "./authorize";
+import { cimdDocumentSchema } from "./cimd";
+import { registerRequestSchema } from "./register";
+import { shopifyCallbackQuerySchema } from "./shopifyCallback";
+import { tokenRequestSchema } from "./token";
+
+const CLIENT_ID = "https://client.example/metadata.json";
+const REDIRECT_URI = "https://client.example/callback";
+const DEMO_SHOP = "demo.myshopify.com";
+
+const validAuthorizeQuery = {
+  response_type: "code",
+  client_id: CLIENT_ID,
+  redirect_uri: REDIRECT_URI,
+  state: "client-state",
+  code_challenge: "challenge",
+  code_challenge_method: "S256",
+};
+
+describe("authorizeQuerySchema", () => {
+  it("accepts a complete query", () => {
+    expect(authorizeQuerySchema.safeParse(validAuthorizeQuery).success).toBe(true);
+  });
+
+  it("rejects a plain code_challenge_method", () => {
+    const result = authorizeQuerySchema.safeParse({ ...validAuthorizeQuery, code_challenge_method: "plain" });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a missing code_challenge, so PKCE cannot be skipped", () => {
+    const { code_challenge, ...withoutChallenge } = validAuthorizeQuery;
+    expect(authorizeQuerySchema.safeParse(withoutChallenge).success).toBe(false);
+  });
+
+  it("treats resource as optional", () => {
+    const parsed = authorizeQuerySchema.parse(validAuthorizeQuery);
+    expect(parsed.resource).toBeUndefined();
+  });
+});
+
+describe("tokenRequestSchema", () => {
+  it("accepts an authorization_code grant", () => {
+    const result = tokenRequestSchema.safeParse({
+      grant_type: "authorization_code",
+      code: "the-code",
+      redirect_uri: REDIRECT_URI,
+      client_id: CLIENT_ID,
+      code_verifier: "the-verifier",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects an authorization_code grant with no code_verifier", () => {
+    const result = tokenRequestSchema.safeParse({
+      grant_type: "authorization_code",
+      code: "the-code",
+      redirect_uri: REDIRECT_URI,
+      client_id: CLIENT_ID,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts a refresh_token grant", () => {
+    const result = tokenRequestSchema.safeParse({
+      grant_type: "refresh_token",
+      refresh_token: "the-refresh-token",
+      client_id: CLIENT_ID,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects an unknown grant_type", () => {
+    expect(tokenRequestSchema.safeParse({ grant_type: "password" }).success).toBe(false);
+  });
+});
+
+describe("registerRequestSchema", () => {
+  it("accepts a minimal registration", () => {
+    expect(registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI] }).success).toBe(true);
+  });
+
+  it("rejects an empty redirect_uris array", () => {
+    expect(registerRequestSchema.safeParse({ redirect_uris: [] }).success).toBe(false);
+  });
+
+  it("rejects a javascript: redirect_uri", () => {
+    expect(registerRequestSchema.safeParse({ redirect_uris: ["javascript:alert(1)"] }).success).toBe(false);
+  });
+});
+
+describe("shopifyCallbackQuerySchema", () => {
+  it("accepts a well-formed callback", () => {
+    const result = shopifyCallbackQuerySchema.safeParse({
+      shop: DEMO_SHOP,
+      code: "shopify-code",
+      state: "state-jwt",
+      hmac: "hmac-value",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a shop domain outside myshopify.com", () => {
+    const result = shopifyCallbackQuerySchema.safeParse({
+      shop: "attacker.example.com",
+      code: "shopify-code",
+      state: "state-jwt",
+      hmac: "hmac-value",
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("cimdDocumentSchema", () => {
+  it("accepts a document with redirect_uris", () => {
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI] }).success).toBe(true);
+  });
+
+  it("rejects a document with no redirect_uris", () => {
+    expect(cimdDocumentSchema.safeParse({ client_name: "Client" }).success).toBe(false);
+  });
+
+  it("rejects grant_types that omit authorization_code", () => {
+    const result = cimdDocumentSchema.safeParse({
+      redirect_uris: [REDIRECT_URI],
+      grant_types: ["client_credentials"],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a token_endpoint_auth_method other than none", () => {
+    const result = cimdDocumentSchema.safeParse({
+      redirect_uris: [REDIRECT_URI],
+      token_endpoint_auth_method: "client_secret_post",
+    });
+    expect(result.success).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/schemas`
+Expected: FAIL — none of the schema modules resolve.
+
+- [ ] **Step 3: Write the schema files**
+
+`src/schemas/authorize.ts`:
+
+```ts
+import { z } from "zod";
+
+export const authorizeQuerySchema = z.object({
+  response_type: z.literal("code", { message: "response_type must be 'code'" }),
+  client_id: z.string().min(1, "client_id is required"),
+  redirect_uri: z.string().min(1, "redirect_uri is required"),
+  state: z.string().min(1, "state is required"),
+  code_challenge: z.string().min(1, "code_challenge is required"),
+  code_challenge_method: z.literal("S256", { message: "code_challenge_method must be S256" }),
+  // RFC 8707 says clients MUST send `resource`, but as an AS hosting a single resource we accept
+  // its absence and treat it as the canonical one. When present it is exact-matched downstream.
+  resource: z.string().optional(),
+  scope: z.string().optional(),
+});
+
+export type AuthorizeQuery = z.infer<typeof authorizeQuerySchema>;
+```
+
+`src/schemas/token.ts`:
+
+```ts
+import { z } from "zod";
+
+const authorizationCodeGrantSchema = z.object({
+  grant_type: z.literal("authorization_code"),
+  code: z.string().min(1, "code is required"),
+  redirect_uri: z.string().min(1, "redirect_uri is required"),
+  client_id: z.string().min(1, "client_id is required"),
+  code_verifier: z.string().min(1, "code_verifier is required"),
+});
+
+const refreshTokenGrantSchema = z.object({
+  grant_type: z.literal("refresh_token"),
+  refresh_token: z.string().min(1, "refresh_token is required"),
+  client_id: z.string().min(1, "client_id is required"),
+  scope: z.string().optional(),
+});
+
+export const tokenRequestSchema = z.discriminatedUnion("grant_type", [
+  authorizationCodeGrantSchema,
+  refreshTokenGrantSchema,
+]);
+
+export type AuthorizationCodeGrant = z.infer<typeof authorizationCodeGrantSchema>;
+export type RefreshTokenGrant = z.infer<typeof refreshTokenGrantSchema>;
+```
+
+`src/schemas/register.ts`:
+
+```ts
+import { z } from "zod";
+import { validateRedirectUri } from "../services/redirectUri";
+
+export const registerRequestSchema = z.object({
+  client_name: z.string().optional(),
+  redirect_uris: z
+    .array(z.string())
+    .min(1, "redirect_uris must contain at least one entry")
+    .refine((uris) => uris.every((uri) => validateRedirectUri(uri) === null), {
+      message: "redirect_uris contains an unacceptable URI",
+    }),
+  grant_types: z.array(z.string()).optional(),
+  response_types: z.array(z.string()).optional(),
+  logo_uri: z.string().optional(),
+  client_uri: z.string().optional(),
+});
+
+export type RegisterRequest = z.infer<typeof registerRequestSchema>;
+```
+
+`src/schemas/revoke.ts`:
+
+```ts
+import { z } from "zod";
+
+export const revokeRequestSchema = z.object({
+  token: z.string().min(1, "token is required"),
+  token_type_hint: z.enum(["access_token", "refresh_token"]).optional(),
+  client_id: z.string().optional(),
+});
+```
+
+`src/schemas/shopifyCallback.ts`:
+
+```ts
+import { z } from "zod";
+
+// Constrain the shop to Shopify's own domain so a forged `shop` cannot redirect the
+// server-to-server token exchange at an attacker-controlled host.
+const SHOP_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/;
+
+export const shopifyCallbackQuerySchema = z.object({
+  shop: z.string().regex(SHOP_DOMAIN, "shop must be a myshopify.com domain"),
+  code: z.string().min(1, "code is required"),
+  state: z.string().min(1, "state is required"),
+  hmac: z.string().min(1, "hmac is required"),
+  host: z.string().optional(),
+  timestamp: z.string().optional(),
+});
+```
+
+`src/schemas/cimd.ts`:
+
+```ts
+import { z } from "zod";
+
+export const cimdDocumentSchema = z
+  .object({
+    client_id: z.string().optional(),
+    client_name: z.string().optional(),
+    redirect_uris: z.array(z.string()).min(1, "CIMD document missing redirect_uris[]"),
+    // The document lists what the client supports; we only require the grant we drive.
+    grant_types: z
+      .array(z.string())
+      .refine((types) => types.includes("authorization_code"), {
+        message: "CIMD grant_types must include 'authorization_code'",
+      })
+      .optional(),
+    response_types: z.array(z.string()).optional(),
+    token_endpoint_auth_method: z
+      .literal("none", { message: "CIMD token_endpoint_auth_method must be 'none'" })
+      .optional(),
+    logo_uri: z.string().optional(),
+    client_uri: z.string().optional(),
+  })
+  .strip();
+
+export type CimdDocument = z.infer<typeof cimdDocumentSchema>;
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/schemas`
+Expected: PASS, 17 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/schemas
+git commit -m "feat: add request and CIMD document schemas"
+```
+
+---
+
+## Task 12: Client store and CIMD resolver
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/services/clients.ts`
+- Create: `packages/shopify-mcp-oauth/src/services/cimd.ts`
+- Test: `packages/shopify-mcp-oauth/src/services/clients.test.ts`, `packages/shopify-mcp-oauth/src/services/cimd.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedConfig` from `../config`; `cimdDocumentSchema`, `CimdDocument` from `../schemas/cimd`; `randomBase64Url` from `../crypto`; `RegisterRequest` from `../schemas/register`
+- Produces:
+  - `createDcrClient(config: ResolvedConfig, input: RegisterRequest): Promise<OAuthClient>`
+  - `isCimdClientId(value: string): boolean`
+  - `resolveCimdClient(config: ResolvedConfig, url: string, opts?: { allowPrivateHosts?: boolean }): Promise<CimdDocument>`
+
+A client identifies itself one of two ways. **DCR** posts its metadata to `/register` and receives a
+generated `client_id`. **CIMD** uses an HTTPS URL as its `client_id`, and we fetch the document that
+URL serves. Resolution is three-tier: cache, then storage, then a live fetch — the fetch result is
+written to both.
+
+The live fetch is the package's only outbound request to an address the caller controls, so it is the
+one place SSRF matters: HTTPS only, no private or loopback addresses, no redirects followed, a body
+cap, and a hard timeout.
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/services/clients.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { createDcrClient } from "./clients";
+
+const REDIRECT_URI = "https://client.example/callback";
+
+function buildConfig(): ResolvedConfig {
+  return resolveConfig({
+    host: "https://mcp.example.com",
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+  });
+}
+
+describe("createDcrClient", () => {
+  it("generates a client_id the caller did not supply", async () => {
+    const client = await createDcrClient(buildConfig(), { redirect_uris: [REDIRECT_URI] });
+    expect(client.clientId).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it("persists the client so it can be found again", async () => {
+    const config = buildConfig();
+    const created = await createDcrClient(config, { redirect_uris: [REDIRECT_URI] });
+    expect(await config.storage.findClient(created.clientId)).not.toBeNull();
+  });
+
+  it("stores the supplied client_name", async () => {
+    const client = await createDcrClient(buildConfig(), {
+      redirect_uris: [REDIRECT_URI],
+      client_name: "Registered Client",
+    });
+    expect(client.clientName).toBe("Registered Client");
+  });
+
+  it("forces token_endpoint_auth_method to none, since we issue only public clients", async () => {
+    const client = await createDcrClient(buildConfig(), { redirect_uris: [REDIRECT_URI] });
+    expect(client.tokenEndpointAuthMethod).toBe("none");
+  });
+
+  it("gives two registrations different client_ids", async () => {
+    const config = buildConfig();
+    const first = await createDcrClient(config, { redirect_uris: [REDIRECT_URI] });
+    const second = await createDcrClient(config, { redirect_uris: [REDIRECT_URI] });
+    expect(first.clientId).not.toBe(second.clientId);
+  });
+});
+```
+
+`src/services/cimd.test.ts`:
+
+```ts
+import { describe, expect, it, vi } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { isCimdClientId, resolveCimdClient } from "./cimd";
+
+const CIMD_URL = "https://client.example/metadata.json";
+const REDIRECT_URI = "https://client.example/callback";
+const CIMD_DOC = { client_name: "Fetched Client", redirect_uris: [REDIRECT_URI] };
+
+function buildConfig(fetchImpl: typeof fetch): ResolvedConfig {
+  return resolveConfig({
+    host: "https://mcp.example.com",
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+    fetchImpl,
+  });
+}
+
+function buildFetch(body: unknown, init: { status?: number } = {}): typeof fetch {
+  return vi.fn().mockResolvedValue(
+    new Response(typeof body === "string" ? body : JSON.stringify(body), {
+      status: init.status ?? 200,
+      headers: { "content-type": "application/json" },
+    })
+  ) as unknown as typeof fetch;
+}
+
+describe("isCimdClientId", () => {
+  it("is true for an https URL", () => {
+    expect(isCimdClientId(CIMD_URL)).toBe(true);
+  });
+
+  it("is false for an opaque registered client_id", () => {
+    expect(isCimdClientId("abc123")).toBe(false);
+  });
+});
+
+describe("resolveCimdClient", () => {
+  it("fetches and returns the document", async () => {
+    const config = buildConfig(buildFetch(CIMD_DOC));
+    const doc = await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+    expect(doc.redirect_uris).toEqual([REDIRECT_URI]);
+  });
+
+  it("serves the second call from cache without refetching", async () => {
+    const fetchImpl = buildFetch(CIMD_DOC);
+    const config = buildConfig(fetchImpl);
+    await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+    await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists the fetched client so its name survives a cache flush", async () => {
+    const config = buildConfig(buildFetch(CIMD_DOC));
+    await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+    expect((await config.storage.findClient(CIMD_URL))?.clientName).toBe("Fetched Client");
+  });
+
+  it("rejects a non-https client_id", async () => {
+    const config = buildConfig(buildFetch(CIMD_DOC));
+    await expect(resolveCimdClient(config, "http://client.example/doc.json")).rejects.toThrow(/HTTPS/);
+  });
+
+  it("rejects a private-address host", async () => {
+    const config = buildConfig(buildFetch(CIMD_DOC));
+    await expect(resolveCimdClient(config, "https://127.0.0.1/doc.json")).rejects.toThrow(/private/);
+  });
+
+  it("rejects a non-200 response", async () => {
+    const config = buildConfig(buildFetch("nope", { status: 404 }));
+    await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+  });
+
+  it("rejects a body that is not JSON", async () => {
+    const config = buildConfig(buildFetch("<html>not json</html>"));
+    await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/JSON/);
+  });
+
+  it("rejects a document with no redirect_uris", async () => {
+    const config = buildConfig(buildFetch({ client_name: "No Redirects" }));
+    await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/redirect_uris/);
+  });
+
+  it("does not follow redirects", async () => {
+    const fetchImpl = buildFetch(CIMD_DOC);
+    const config = buildConfig(fetchImpl);
+    await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+    expect(vi.mocked(fetchImpl).mock.calls[0]?.[1]).toMatchObject({ redirect: "error" });
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/clients.test.ts src/services/cimd.test.ts`
+Expected: FAIL — cannot resolve `./clients` and `./cimd`.
+
+- [ ] **Step 3: Write `src/services/clients.ts`**
+
+```ts
+import type { ResolvedConfig } from "../config";
+import { randomBase64Url } from "../crypto";
+import type { CimdDocument } from "../schemas/cimd";
+import type { RegisterRequest } from "../schemas/register";
+import type { OAuthClient } from "../types";
+
+export async function createDcrClient(config: ResolvedConfig, input: RegisterRequest): Promise<OAuthClient> {
+  return config.storage.createClient({
+    clientId: randomBase64Url(32),
+    clientName: input.client_name ?? null,
+    redirectUris: input.redirect_uris,
+    grantTypes: input.grant_types ?? null,
+    responseTypes: input.response_types ?? null,
+    logoUri: input.logo_uri ?? null,
+    clientUri: input.client_uri ?? null,
+    // We never issue client secrets, so the client authenticates with PKCE alone.
+    tokenEndpointAuthMethod: "none",
+  });
+}
+
+export async function upsertCimdClient(
+  config: ResolvedConfig,
+  clientIdUrl: string,
+  doc: CimdDocument
+): Promise<OAuthClient> {
+  return config.storage.upsertClient({
+    clientId: clientIdUrl,
+    clientName: doc.client_name ?? null,
+    redirectUris: doc.redirect_uris,
+    grantTypes: doc.grant_types ?? null,
+    responseTypes: doc.response_types ?? null,
+    logoUri: doc.logo_uri ?? null,
+    clientUri: doc.client_uri ?? null,
+    tokenEndpointAuthMethod: "none",
+  });
+}
+
+export function clientToCimdDocument(client: OAuthClient): CimdDocument {
+  return {
+    client_name: client.clientName ?? undefined,
+    redirect_uris: client.redirectUris,
+    grant_types: client.grantTypes ?? undefined,
+    response_types: client.responseTypes ?? undefined,
+    logo_uri: client.logoUri ?? undefined,
+    client_uri: client.clientUri ?? undefined,
+    token_endpoint_auth_method: "none",
+  };
+}
+```
+
+- [ ] **Step 4: Write `src/services/cimd.ts`**
+
+```ts
+import dns from "node:dns/promises";
+import net from "node:net";
+import type { ResolvedConfig } from "../config";
+import { cimdDocumentSchema, type CimdDocument } from "../schemas/cimd";
+import { clientToCimdDocument, upsertCimdClient } from "./clients";
+
+const MAX_BYTES = 64 * 1024;
+const TIMEOUT_MS = 3000;
+const CACHE_TTL_SECONDS = 3600;
+const CACHE_PREFIX = "mcp:oauth:cimd:";
+
+export function isCimdClientId(value: string): boolean {
+  return value.startsWith("https://");
+}
+
+function isPrivateOrLoopbackIp(addr: string): boolean {
+  if (net.isIPv4(addr)) {
+    const [a, b] = addr.split(".").map(Number);
+    if (a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b !== undefined && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return false;
+  }
+  if (net.isIPv6(addr)) {
+    const lower = addr.toLowerCase();
+    if (lower === "::1") return true;
+    if (lower.startsWith("fe80:") || lower.startsWith("fc") || lower.startsWith("fd")) return true;
+    if (lower.startsWith("::ffff:")) {
+      const mapped = lower.slice("::ffff:".length);
+      if (net.isIPv4(mapped)) return isPrivateOrLoopbackIp(mapped);
+    }
+    return false;
+  }
+  return false;
+}
+
+async function assertPublicHost(url: URL): Promise<void> {
+  const host = url.hostname;
+  if (net.isIP(host)) {
+    if (isPrivateOrLoopbackIp(host)) {
+      throw new Error(`CIMD URL host ${host} resolves to a private/loopback address`);
+    }
+    return;
+  }
+  const addresses = await dns.lookup(host, { all: true });
+  for (const address of addresses) {
+    if (isPrivateOrLoopbackIp(address.address)) {
+      throw new Error(`CIMD URL host ${host} resolves to a private/loopback address (${address.address})`);
+    }
+  }
+}
+
+async function readBodyCapped(response: Response): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return response.text();
+  const decoder = new TextDecoder();
+  let text = "";
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BYTES) {
+      await reader.cancel();
+      throw new Error(`CIMD document exceeds ${MAX_BYTES} bytes`);
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+async function fetchCimd(config: ResolvedConfig, urlStr: string, allowPrivateHosts: boolean): Promise<CimdDocument> {
+  const url = new URL(urlStr);
+  if (url.protocol !== "https:") throw new Error("CIMD client_id must use HTTPS");
+  if (!allowPrivateHosts) await assertPublicHost(url);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await config.fetchImpl(urlStr, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+      redirect: "error",
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response.ok) throw new Error(`CIMD fetch returned ${response.status}`);
+
+  const text = await readBodyCapped(response);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    throw new Error("CIMD document is not valid JSON");
+  }
+  const parsed = cimdDocumentSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new Error(parsed.error.issues[0]?.message ?? "CIMD document is invalid");
+  }
+  return parsed.data;
+}
+
+export async function resolveCimdClient(
+  config: ResolvedConfig,
+  url: string,
+  opts: { allowPrivateHosts?: boolean } = {}
+): Promise<CimdDocument> {
+  if (!isCimdClientId(url)) throw new Error("CIMD client_id must use HTTPS");
+
+  const cacheKey = `${CACHE_PREFIX}${url}`;
+  try {
+    const cached = await config.cache.get(cacheKey);
+    if (cached) return JSON.parse(cached) as CimdDocument;
+  } catch {
+    // A cache outage must not break login; fall through to storage and the network.
+  }
+
+  const stored = await config.storage.findClient(url);
+  if (stored) {
+    const doc = clientToCimdDocument(stored);
+    await config.cache.set(cacheKey, JSON.stringify(doc), CACHE_TTL_SECONDS).catch(() => {});
+    return doc;
+  }
+
+  const doc = await fetchCimd(config, url, opts.allowPrivateHosts ?? false);
+
+  try {
+    await upsertCimdClient(config, url, doc);
+  } catch (error) {
+    config.logger.error("cimd: failed to persist client", error);
+  }
+  await config.cache.set(cacheKey, JSON.stringify(doc), CACHE_TTL_SECONDS).catch(() => {});
+  return doc;
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/clients.test.ts src/services/cimd.test.ts`
+Expected: PASS, 15 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/services/clients.ts packages/shopify-mcp-oauth/src/services/clients.test.ts packages/shopify-mcp-oauth/src/services/cimd.ts packages/shopify-mcp-oauth/src/services/cimd.test.ts
+git commit -m "feat: add DCR client creation and the SSRF-guarded CIMD resolver"
+```
+
+---
+
+## Task 13: Authorization codes and tokens
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/services/codes.ts`
+- Create: `packages/shopify-mcp-oauth/src/services/tokens.ts`
+- Test: `packages/shopify-mcp-oauth/src/services/codes.test.ts`, `packages/shopify-mcp-oauth/src/services/tokens.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedConfig`; `randomBase64Url`, `sha256Hex` from `../crypto`
+- Produces:
+  - `interface CodeRecord { shopId: string | number; shopDomain: string; clientId: string; redirectUri: string; codeChallenge: string; codeChallengeMethod: string; resource: string }`
+  - `issueCode(config: ResolvedConfig, input: CodeRecord & { ttlSeconds?: number }): Promise<{ code: string }>`
+  - `consumeCode(config: ResolvedConfig, code: string): Promise<CodeRecord | null>`
+  - `interface IssuedTokens { access_token: string; refresh_token: string; expires_in: number; scope: string; token_type: "Bearer" }`
+  - `issueTokens(config: ResolvedConfig, input: { shopId: string | number; shopDomain: string; clientId: string; scope?: string; resource?: string; rotatedFromId?: string | null }): Promise<IssuedTokens>`
+  - `rotateRefresh(config: ResolvedConfig, refreshToken: string, clientId: string): Promise<IssuedTokens | null>`
+  - `revokeByAccessToken(config: ResolvedConfig, token: string): Promise<void>`
+  - `revokeByRefreshToken(config: ResolvedConfig, token: string): Promise<void>`
+
+Codes live in the cache with a 60-second TTL and are keyed by their own hash, so a cache dump does not
+yield redeemable codes. Redemption goes through `getdel` where the backend supports it, which is what
+makes a code single-use under concurrent `/token` calls.
+
+Refresh rotation is one-time-use by construction: it revokes the presented token first and only mints
+a new pair if that revocation actually flipped the row, so two concurrent refreshes cannot both win.
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/services/codes.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { consumeCode, issueCode, type CodeRecord } from "./codes";
+
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const CLIENT_ID = "test-client-id";
+const REDIRECT_URI = "https://client.example/callback";
+const RESOURCE = "https://mcp.example.com/mcp";
+
+function buildConfig(): ResolvedConfig {
+  return resolveConfig({
+    host: "https://mcp.example.com",
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+  });
+}
+
+function buildCodeRecord(overrides: Partial<CodeRecord> = {}): CodeRecord {
+  return {
+    shopId: DEMO_SHOP_ID,
+    shopDomain: DEMO_SHOP,
+    clientId: CLIENT_ID,
+    redirectUri: REDIRECT_URI,
+    codeChallenge: "challenge-value",
+    codeChallengeMethod: "S256",
+    resource: RESOURCE,
+    ...overrides,
+  };
+}
+
+describe("authorization codes", () => {
+  it("round-trips the record", async () => {
+    const config = buildConfig();
+    const { code } = await issueCode(config, buildCodeRecord());
+    expect(await consumeCode(config, code)).toMatchObject({ clientId: CLIENT_ID, redirectUri: REDIRECT_URI });
+  });
+
+  it("cannot be consumed twice", async () => {
+    const config = buildConfig();
+    const { code } = await issueCode(config, buildCodeRecord());
+    await consumeCode(config, code);
+    expect(await consumeCode(config, code)).toBeNull();
+  });
+
+  it("returns null for a code that was never issued", async () => {
+    expect(await consumeCode(buildConfig(), "never-issued")).toBeNull();
+  });
+
+  it("does not store a code whose ttl has already passed", async () => {
+    const config = buildConfig();
+    const { code } = await issueCode(config, { ...buildCodeRecord(), ttlSeconds: -1 });
+    expect(await consumeCode(config, code)).toBeNull();
+  });
+
+  it("stores the code under its hash, not its plaintext", async () => {
+    const config = buildConfig();
+    const { code } = await issueCode(config, buildCodeRecord());
+    expect(await config.cache.get(`mcp:oauth:code:${code}`)).toBeNull();
+  });
+});
+```
+
+`src/services/tokens.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { sha256Hex } from "../crypto";
+import { issueTokens, revokeByAccessToken, rotateRefresh } from "./tokens";
+
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const CLIENT_ID = "test-client-id";
+
+function buildConfig(overrides: { tokenTtl?: { access?: number; refresh?: number } } = {}): ResolvedConfig {
+  return resolveConfig({
+    host: "https://mcp.example.com",
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+    ...overrides,
+  });
+}
+
+describe("issueTokens", () => {
+  it("returns a Bearer bundle", async () => {
+    const tokens = await issueTokens(buildConfig(), { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    expect(tokens.token_type).toBe("Bearer");
+  });
+
+  it("reports the configured access lifetime", async () => {
+    const config = buildConfig({ tokenTtl: { access: 900 } });
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    expect(tokens.expires_in).toBe(900);
+  });
+
+  it("stores the access token hashed, never in plaintext", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const stored = await config.storage.findTokenByAccessHash(sha256Hex(tokens.access_token));
+    expect(stored).not.toBeNull();
+    expect(await config.storage.findTokenByAccessHash(tokens.access_token)).toBeNull();
+  });
+});
+
+describe("rotateRefresh", () => {
+  it("issues a new pair for a valid refresh token", async () => {
+    const config = buildConfig();
+    const first = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const rotated = await rotateRefresh(config, first.refresh_token, CLIENT_ID);
+    expect(rotated?.access_token).not.toBe(first.access_token);
+  });
+
+  it("refuses the same refresh token twice", async () => {
+    const config = buildConfig();
+    const first = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    await rotateRefresh(config, first.refresh_token, CLIENT_ID);
+    expect(await rotateRefresh(config, first.refresh_token, CLIENT_ID)).toBeNull();
+  });
+
+  it("refuses a refresh token presented by a different client", async () => {
+    const config = buildConfig();
+    const first = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    expect(await rotateRefresh(config, first.refresh_token, "some-other-client")).toBeNull();
+  });
+
+  it("returns null for an unknown refresh token", async () => {
+    expect(await rotateRefresh(buildConfig(), "never-issued", CLIENT_ID)).toBeNull();
+  });
+});
+
+describe("revokeByAccessToken", () => {
+  it("makes the access token unusable", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    await revokeByAccessToken(config, tokens.access_token);
+    expect(await config.storage.findTokenByAccessHash(sha256Hex(tokens.access_token))).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/codes.test.ts src/services/tokens.test.ts`
+Expected: FAIL — cannot resolve `./codes` and `./tokens`.
+
+- [ ] **Step 3: Write `src/services/codes.ts`**
+
+```ts
+import type { ResolvedConfig } from "../config";
+import { randomBase64Url, sha256Hex } from "../crypto";
+
+const CODE_TTL_SECONDS = 60;
+const CODE_PREFIX = "mcp:oauth:code:";
+
+export interface CodeRecord {
+  shopId: string | number;
+  shopDomain: string;
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  codeChallengeMethod: string;
+  resource: string;
+}
+
+export async function issueCode(
+  config: ResolvedConfig,
+  input: CodeRecord & { ttlSeconds?: number }
+): Promise<{ code: string }> {
+  const code = randomBase64Url(32);
+  const ttl = input.ttlSeconds ?? CODE_TTL_SECONDS;
+  if (ttl > 0) {
+    const record: CodeRecord = {
+      shopId: input.shopId,
+      shopDomain: input.shopDomain,
+      clientId: input.clientId,
+      redirectUri: input.redirectUri,
+      codeChallenge: input.codeChallenge,
+      codeChallengeMethod: input.codeChallengeMethod,
+      resource: input.resource,
+    };
+    await config.cache.set(`${CODE_PREFIX}${sha256Hex(code)}`, JSON.stringify(record), ttl);
+  }
+  return { code };
+}
+
+export async function consumeCode(config: ResolvedConfig, code: string): Promise<CodeRecord | null> {
+  const key = `${CODE_PREFIX}${sha256Hex(code)}`;
+  // Read-and-delete in one operation where the backend allows it; that atomicity is what makes
+  // a code single-use when two /token requests race.
+  const raw = config.cache.getdel
+    ? await config.cache.getdel(key)
+    : await (async () => {
+        const value = await config.cache.get(key);
+        await config.cache.del(key);
+        return value;
+      })();
+  if (!raw) return null;
+  return JSON.parse(raw) as CodeRecord;
+}
+```
+
+- [ ] **Step 4: Write `src/services/tokens.ts`**
+
+```ts
+import type { ResolvedConfig } from "../config";
+import { randomBase64Url, sha256Hex } from "../crypto";
+
+const DEFAULT_SCOPE = "mcp:*";
+
+export interface IssuedTokens {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+  scope: string;
+  token_type: "Bearer";
+}
+
+export interface IssueTokensInput {
+  shopId: string | number;
+  shopDomain: string;
+  clientId: string;
+  scope?: string;
+  resource?: string;
+  rotatedFromId?: string | null;
+}
+
+export async function issueTokens(config: ResolvedConfig, input: IssueTokensInput): Promise<IssuedTokens> {
+  const accessToken = randomBase64Url(32);
+  const refreshToken = randomBase64Url(32);
+  const scope = input.scope ?? DEFAULT_SCOPE;
+  const now = Date.now();
+
+  await config.storage.createToken({
+    shopId: input.shopId,
+    shopDomain: input.shopDomain,
+    clientId: input.clientId,
+    accessTokenHash: sha256Hex(accessToken),
+    refreshTokenHash: sha256Hex(refreshToken),
+    accessTokenExpiresAt: new Date(now + config.tokenTtl.access * 1000),
+    refreshTokenExpiresAt: new Date(now + config.tokenTtl.refresh * 1000),
+    scope,
+    resource: input.resource ?? config.resource,
+    rotatedFromId: input.rotatedFromId ?? null,
+  });
+
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    expires_in: config.tokenTtl.access,
+    scope,
+    token_type: "Bearer",
+  };
+}
+
+export async function rotateRefresh(
+  config: ResolvedConfig,
+  refreshToken: string,
+  clientId: string
+): Promise<IssuedTokens | null> {
+  const existing = await config.storage.findTokenByRefreshHash(sha256Hex(refreshToken));
+  if (!existing) return null;
+  // Bind rotation to the presenting client: a stolen refresh token is useless to a different one.
+  if (existing.clientId !== clientId) return null;
+  // Only the caller whose revoke actually flipped the row may mint a replacement.
+  const won = await config.storage.revokeToken(existing.id);
+  if (!won) return null;
+
+  return issueTokens(config, {
+    shopId: existing.shopId,
+    shopDomain: existing.shopDomain,
+    clientId: existing.clientId,
+    scope: existing.scope ?? undefined,
+    resource: existing.resource ?? undefined,
+    rotatedFromId: existing.id,
+  });
+}
+
+export async function revokeByAccessToken(config: ResolvedConfig, token: string): Promise<void> {
+  const existing = await config.storage.findTokenByAccessHash(sha256Hex(token));
+  if (existing) await config.storage.revokeToken(existing.id);
+}
+
+export async function revokeByRefreshToken(config: ResolvedConfig, token: string): Promise<void> {
+  const existing = await config.storage.findTokenByRefreshHash(sha256Hex(token));
+  if (existing) await config.storage.revokeToken(existing.id);
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/codes.test.ts src/services/tokens.test.ts`
+Expected: PASS, 13 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/services/codes.ts packages/shopify-mcp-oauth/src/services/codes.test.ts packages/shopify-mcp-oauth/src/services/tokens.ts packages/shopify-mcp-oauth/src/services/tokens.test.ts
+git commit -m "feat: add single-use authorization codes and rotating tokens"
+```
+
+---
+
+## Task 14: Serializers, metadata, register, revoke, challenge
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/serializers/metadata.ts`, `register.ts`, `token.ts`
+- Create: `packages/shopify-mcp-oauth/src/controllers/metadata.ts`, `register.ts`, `revoke.ts`, `openaiAppsChallenge.ts`
+- Test: `packages/shopify-mcp-oauth/src/serializers/metadata.test.ts`, `packages/shopify-mcp-oauth/src/controllers/metadata.test.ts`, `packages/shopify-mcp-oauth/src/controllers/register.test.ts`, `packages/shopify-mcp-oauth/src/controllers/revoke.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedConfig`; `createDcrClient`; `revokeByAccessToken`, `revokeByRefreshToken`; `registerRequestSchema`; `revokeRequestSchema`
+- Produces:
+  - `serializeAuthorizationServerMetadata(config: ResolvedConfig): Record<string, unknown>`
+  - `serializeProtectedResourceMetadata(config: ResolvedConfig): Record<string, unknown>`
+  - `serializeClientRegistration(client: OAuthClient): Record<string, unknown>`
+  - `serializeTokenBundle(tokens: IssuedTokens): Record<string, unknown>`
+  - `authorizationServerMetadataController(config): RequestHandler`
+  - `protectedResourceMetadataController(config): RequestHandler`
+  - `registerController(config): RequestHandler`
+  - `revokeController(config): RequestHandler`
+  - `openaiAppsChallengeController(token: string | null): RequestHandler`
+
+Revocation always answers 200, even for a token we have never seen. RFC 7009 requires it: a
+distinguishable 404 would turn the endpoint into an oracle for guessing valid tokens.
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/serializers/metadata.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { serializeAuthorizationServerMetadata, serializeProtectedResourceMetadata } from "./metadata";
+
+const HOST = "https://mcp.example.com";
+
+function buildConfig(): ResolvedConfig {
+  return resolveConfig({
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+  });
+}
+
+describe("serializeAuthorizationServerMetadata", () => {
+  it("advertises the issuer as the host", () => {
+    expect(serializeAuthorizationServerMetadata(buildConfig()).issuer).toBe(HOST);
+  });
+
+  it("advertises every endpoint under the host", () => {
+    const metadata = serializeAuthorizationServerMetadata(buildConfig());
+    expect(metadata.authorization_endpoint).toBe(`${HOST}/authorize`);
+    expect(metadata.token_endpoint).toBe(`${HOST}/token`);
+    expect(metadata.registration_endpoint).toBe(`${HOST}/register`);
+    expect(metadata.revocation_endpoint).toBe(`${HOST}/revoke`);
+  });
+
+  it("advertises S256 as the only challenge method", () => {
+    expect(serializeAuthorizationServerMetadata(buildConfig()).code_challenge_methods_supported).toEqual(["S256"]);
+  });
+
+  it("declares CIMD support so clients skip registration", () => {
+    expect(serializeAuthorizationServerMetadata(buildConfig()).client_id_metadata_document_supported).toBe(true);
+  });
+});
+
+describe("serializeProtectedResourceMetadata", () => {
+  it("names the canonical resource", () => {
+    expect(serializeProtectedResourceMetadata(buildConfig()).resource).toBe(`${HOST}/mcp`);
+  });
+
+  it("points back at this server as its authorization server", () => {
+    expect(serializeProtectedResourceMetadata(buildConfig()).authorization_servers).toEqual([HOST]);
+  });
+});
+```
+
+`src/controllers/metadata.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig } from "../config";
+import { authorizationServerMetadataController, protectedResourceMetadataController } from "./metadata";
+import { openaiAppsChallengeController } from "./openaiAppsChallenge";
+
+const HOST = "https://mcp.example.com";
+const CHALLENGE_TOKEN = "openai-challenge-token";
+
+function buildConfig() {
+  return resolveConfig({
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+  });
+}
+
+function buildApp() {
+  const config = buildConfig();
+  const app = express();
+  app.get("/.well-known/oauth-authorization-server", authorizationServerMetadataController(config));
+  app.get("/.well-known/oauth-protected-resource", protectedResourceMetadataController(config));
+  app.get("/.well-known/openai-apps-challenge", openaiAppsChallengeController(CHALLENGE_TOKEN));
+  return app;
+}
+
+describe("metadata controllers", () => {
+  it("serves authorization server metadata as JSON", async () => {
+    const response = await request(buildApp()).get("/.well-known/oauth-authorization-server");
+    expect(response.status).toBe(200);
+    expect(response.body.issuer).toBe(HOST);
+  });
+
+  it("serves protected resource metadata as JSON", async () => {
+    const response = await request(buildApp()).get("/.well-known/oauth-protected-resource");
+    expect(response.status).toBe(200);
+    expect(response.body.resource).toBe(`${HOST}/mcp`);
+  });
+
+  it("echoes the configured challenge token", async () => {
+    const response = await request(buildApp()).get("/.well-known/openai-apps-challenge");
+    expect(response.text).toBe(CHALLENGE_TOKEN);
+  });
+});
+```
+
+`src/controllers/register.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig } from "../config";
+import { registerController } from "./register";
+
+const REDIRECT_URI = "https://client.example/callback";
+
+function buildApp() {
+  const config = resolveConfig({
+    host: "https://mcp.example.com",
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+  });
+  const app = express();
+  app.use(express.json());
+  app.post("/register", registerController(config));
+  return app;
+}
+
+describe("registerController", () => {
+  it("returns 201 with a generated client_id", async () => {
+    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    expect(response.status).toBe(201);
+    expect(response.body.client_id).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it("echoes the registered redirect_uris", async () => {
+    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    expect(response.body.redirect_uris).toEqual([REDIRECT_URI]);
+  });
+
+  it("reports token_endpoint_auth_method none", async () => {
+    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    expect(response.body.token_endpoint_auth_method).toBe("none");
+  });
+
+  it("never returns a client_secret", async () => {
+    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    expect(response.body.client_secret).toBeUndefined();
+  });
+
+  it("rejects a body with no redirect_uris", async () => {
+    const response = await request(buildApp()).post("/register").send({ client_name: "No Redirects" });
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_client_metadata");
+  });
+
+  it("rejects a dangerous redirect_uri scheme", async () => {
+    const response = await request(buildApp()).post("/register").send({ redirect_uris: ["javascript:alert(1)"] });
+    expect(response.status).toBe(400);
+  });
+});
+```
+
+`src/controllers/revoke.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { sha256Hex } from "../crypto";
+import { issueTokens } from "../services/tokens";
+import { revokeController } from "./revoke";
+
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const CLIENT_ID = "test-client-id";
+
+function buildApp(config: ResolvedConfig) {
+  const app = express();
+  app.use(express.json());
+  app.post("/revoke", revokeController(config));
+  return app;
+}
+
+function buildConfig(): ResolvedConfig {
+  return resolveConfig({
+    host: "https://mcp.example.com",
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage(),
+  });
+}
+
+describe("revokeController", () => {
+  it("revokes a live access token", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config)).post("/revoke").send({ token: tokens.access_token });
+    expect(response.status).toBe(200);
+    expect(await config.storage.findTokenByAccessHash(sha256Hex(tokens.access_token))).toBeNull();
+  });
+
+  it("revokes a refresh token when hinted", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    await request(buildApp(config))
+      .post("/revoke")
+      .send({ token: tokens.refresh_token, token_type_hint: "refresh_token" });
+    expect(await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token))).toBeNull();
+  });
+
+  it("answers 200 for a token it has never seen, so it is not an oracle", async () => {
+    const response = await request(buildApp(buildConfig())).post("/revoke").send({ token: "never-issued" });
+    expect(response.status).toBe(200);
+  });
+
+  it("rejects a body with no token", async () => {
+    const response = await request(buildApp(buildConfig())).post("/revoke").send({});
+    expect(response.status).toBe(400);
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/serializers src/controllers`
+Expected: FAIL — none of the serializer or controller modules resolve.
+
+- [ ] **Step 3: Write the serializers**
+
+`src/serializers/metadata.ts`:
+
+```ts
+import type { ResolvedConfig } from "../config";
+
+export function serializeAuthorizationServerMetadata(config: ResolvedConfig): Record<string, unknown> {
+  return {
+    issuer: config.host,
+    authorization_endpoint: `${config.host}/authorize`,
+    token_endpoint: `${config.host}/token`,
+    registration_endpoint: `${config.host}/register`,
+    revocation_endpoint: `${config.host}/revoke`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256"],
+    scopes_supported: ["mcp:*"],
+    client_id_metadata_document_supported: true,
+  };
+}
+
+export function serializeProtectedResourceMetadata(config: ResolvedConfig): Record<string, unknown> {
+  return {
+    resource: config.resource,
+    authorization_servers: [config.host],
+    bearer_methods_supported: ["header"],
+    scopes_supported: ["mcp:*"],
+  };
+}
+```
+
+`src/serializers/register.ts`:
+
+```ts
+import type { OAuthClient } from "../types";
+
+export function serializeClientRegistration(client: OAuthClient): Record<string, unknown> {
+  return {
+    client_id: client.clientId,
+    client_name: client.clientName ?? undefined,
+    redirect_uris: client.redirectUris,
+    grant_types: client.grantTypes ?? ["authorization_code", "refresh_token"],
+    response_types: client.responseTypes ?? ["code"],
+    token_endpoint_auth_method: client.tokenEndpointAuthMethod,
+    logo_uri: client.logoUri ?? undefined,
+    client_uri: client.clientUri ?? undefined,
+  };
+}
+```
+
+`src/serializers/token.ts`:
+
+```ts
+import type { IssuedTokens } from "../services/tokens";
+
+export function serializeTokenBundle(tokens: IssuedTokens): Record<string, unknown> {
+  return {
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    token_type: tokens.token_type,
+    expires_in: tokens.expires_in,
+    scope: tokens.scope,
+  };
+}
+```
+
+- [ ] **Step 4: Write the controllers**
+
+`src/controllers/metadata.ts`:
+
+```ts
+import type { RequestHandler } from "express";
+import type { ResolvedConfig } from "../config";
+import {
+  serializeAuthorizationServerMetadata,
+  serializeProtectedResourceMetadata,
+} from "../serializers/metadata";
+
+export function authorizationServerMetadataController(config: ResolvedConfig): RequestHandler {
+  const body = serializeAuthorizationServerMetadata(config);
+  return (_req, res) => {
+    res.status(200).json(body);
+  };
+}
+
+export function protectedResourceMetadataController(config: ResolvedConfig): RequestHandler {
+  const body = serializeProtectedResourceMetadata(config);
+  return (_req, res) => {
+    res.status(200).json(body);
+  };
+}
+```
+
+`src/controllers/register.ts`:
+
+```ts
+import type { RequestHandler } from "express";
+import type { ResolvedConfig } from "../config";
+import { registerRequestSchema } from "../schemas/register";
+import { serializeClientRegistration } from "../serializers/register";
+import { createDcrClient } from "../services/clients";
+
+export function registerController(config: ResolvedConfig): RequestHandler {
+  return async (req, res) => {
+    const parsed = registerRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "invalid_client_metadata",
+        error_description: parsed.error.issues[0]?.message ?? "body must be a JSON object",
+      });
+      return;
+    }
+    const client = await createDcrClient(config, parsed.data);
+    res.status(201).json(serializeClientRegistration(client));
+  };
+}
+```
+
+`src/controllers/revoke.ts`:
+
+```ts
+import type { RequestHandler } from "express";
+import type { ResolvedConfig } from "../config";
+import { revokeRequestSchema } from "../schemas/revoke";
+import { revokeByAccessToken, revokeByRefreshToken } from "../services/tokens";
+
+export function revokeController(config: ResolvedConfig): RequestHandler {
+  return async (req, res) => {
+    const parsed = revokeRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "invalid_request",
+        error_description: parsed.error.issues[0]?.message ?? "token is required",
+      });
+      return;
+    }
+    // RFC 7009 §2.2: answer 200 whether or not the token existed, so the endpoint cannot be
+    // used to test token guesses.
+    if (parsed.data.token_type_hint === "refresh_token") {
+      await revokeByRefreshToken(config, parsed.data.token);
+    } else {
+      await revokeByAccessToken(config, parsed.data.token);
+      await revokeByRefreshToken(config, parsed.data.token);
+    }
+    res.status(200).json({});
+  };
+}
+```
+
+`src/controllers/openaiAppsChallenge.ts`:
+
+```ts
+import type { RequestHandler } from "express";
+
+export function openaiAppsChallengeController(token: string | null): RequestHandler {
+  return (_req, res) => {
+    if (!token) {
+      res.status(404).type("text/plain").send("not configured");
+      return;
+    }
+    res.status(200).type("text/plain").send(token);
+  };
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/serializers src/controllers`
+Expected: PASS, 19 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/serializers packages/shopify-mcp-oauth/src/controllers
+git commit -m "feat: add metadata, registration, revocation, and challenge endpoints"
+```
+
+---
+
+## Task 15: Authorize controller
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/controllers/authorize.ts`
+- Test: `packages/shopify-mcp-oauth/src/controllers/authorize.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedConfig`; `authorizeQuerySchema`; `isCimdClientId`, `resolveCimdClient`; `redirectUriMatches`; `signOuterState`; `randomBase64Url`
+- Produces:
+  - `interface AuthorizeControllerOptions { allowPrivateCimdHosts?: boolean }`
+  - `authorizeController(config: ResolvedConfig, options?: AuthorizeControllerOptions): RequestHandler`
+
+`/authorize` never renders a consent screen. Shop ownership *is* the consent, so it validates the
+client and redirects the browser to Shopify's shop picker with a signed state JWT carrying the whole
+original request.
+
+An invalid request is answered as a 400 rather than a redirect, because a redirect to an unverified
+`redirect_uri` would make this endpoint an open redirector.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/controllers/authorize.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it, vi } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { verifyOuterState } from "../services/stateJwt";
+import { authorizeController } from "./authorize";
+
+const HOST = "https://mcp.example.com";
+const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
+const SHOPIFY_API_KEY = "test-api-key";
+const CIMD_URL = "https://client.example/metadata.json";
+const REDIRECT_URI = "https://client.example/callback";
+const CLIENT_STATE = "client-state-value";
+const CODE_CHALLENGE = "challenge-value";
+
+function buildConfig(): ResolvedConfig {
+  const cimdResponse = new Response(JSON.stringify({ client_name: "Test Client", redirect_uris: [REDIRECT_URI] }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+  return resolveConfig({
+    host: HOST,
+    shopify: { apiKey: SHOPIFY_API_KEY, apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: STATE_SECRET,
+    storage: memoryStorage(),
+    fetchImpl: vi.fn().mockResolvedValue(cimdResponse) as unknown as typeof fetch,
+  });
+}
+
+function buildApp(config: ResolvedConfig) {
+  const app = express();
+  app.get("/authorize", authorizeController(config, { allowPrivateCimdHosts: true }));
+  return app;
+}
+
+const validQuery = {
+  response_type: "code",
+  client_id: CIMD_URL,
+  redirect_uri: REDIRECT_URI,
+  state: CLIENT_STATE,
+  code_challenge: CODE_CHALLENGE,
+  code_challenge_method: "S256",
+};
+
+describe("authorizeController", () => {
+  it("redirects to Shopify's shop picker", async () => {
+    const response = await request(buildApp(buildConfig())).get("/authorize").query(validQuery);
+    expect(response.status).toBe(302);
+    expect(response.headers.location).toContain("https://admin.shopify.com/");
+  });
+
+  it("asks Shopify for our app, with our callback", async () => {
+    const response = await request(buildApp(buildConfig())).get("/authorize").query(validQuery);
+    const redirectParam = new URL(response.headers.location).searchParams.get("redirect") ?? "";
+    expect(redirectParam).toContain(`client_id=${SHOPIFY_API_KEY}`);
+    expect(redirectParam).toContain(encodeURIComponent(`${HOST}/oauth/shopify-callback`));
+  });
+
+  it("carries the original request inside a signed state JWT", async () => {
+    const response = await request(buildApp(buildConfig())).get("/authorize").query(validQuery);
+    const redirectParam = new URL(response.headers.location).searchParams.get("redirect") ?? "";
+    const stateJwt = new URLSearchParams(redirectParam.split("?")[1]).get("state") ?? "";
+    const verified = verifyOuterState(stateJwt, STATE_SECRET);
+    expect(verified.clientId).toBe(CIMD_URL);
+    expect(verified.redirectUri).toBe(REDIRECT_URI);
+    expect(verified.clientState).toBe(CLIENT_STATE);
+    expect(verified.codeChallenge).toBe(CODE_CHALLENGE);
+  });
+
+  it("rejects a redirect_uri the client did not register", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .get("/authorize")
+      .query({ ...validQuery, redirect_uri: "https://attacker.example/callback" });
+    expect(response.status).toBe(400);
+    expect(response.body.error_description).toMatch(/not registered/);
+  });
+
+  it("rejects a resource that is not ours", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .get("/authorize")
+      .query({ ...validQuery, resource: "https://other.example/mcp" });
+    expect(response.status).toBe(400);
+  });
+
+  it("accepts our canonical resource", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .get("/authorize")
+      .query({ ...validQuery, resource: `${HOST}/mcp` });
+    expect(response.status).toBe(302);
+  });
+
+  it("rejects a plain code_challenge_method", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .get("/authorize")
+      .query({ ...validQuery, code_challenge_method: "plain" });
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects an unknown registered client_id", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .get("/authorize")
+      .query({ ...validQuery, client_id: "never-registered" });
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_client");
+  });
+
+  it("accepts a client registered through DCR", async () => {
+    const config = buildConfig();
+    const registered = await config.storage.createClient({
+      clientId: "registered-client-id",
+      clientName: "Registered Client",
+      redirectUris: [REDIRECT_URI],
+      grantTypes: ["authorization_code"],
+      responseTypes: ["code"],
+      logoUri: null,
+      clientUri: null,
+      tokenEndpointAuthMethod: "none",
+    });
+    const response = await request(buildApp(config))
+      .get("/authorize")
+      .query({ ...validQuery, client_id: registered.clientId });
+    expect(response.status).toBe(302);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/controllers/authorize.test.ts`
+Expected: FAIL — cannot resolve `./authorize`.
+
+- [ ] **Step 3: Write `src/controllers/authorize.ts`**
+
+```ts
+import crypto from "node:crypto";
+import type { RequestHandler, Response } from "express";
+import type { ResolvedConfig } from "../config";
+import { authorizeQuerySchema } from "../schemas/authorize";
+import { isCimdClientId, resolveCimdClient } from "../services/cimd";
+import { redirectUriMatches } from "../services/redirectUri";
+import { signOuterState } from "../services/stateJwt";
+
+const STATE_TTL_SECONDS = 600;
+
+export interface AuthorizeControllerOptions {
+  allowPrivateCimdHosts?: boolean;
+}
+
+function bad(res: Response, description: string, code = "invalid_request"): void {
+  // Answered as a 400 rather than a redirect: bouncing to an unvalidated redirect_uri would
+  // make /authorize an open redirector.
+  res.status(400).json({ error: code, error_description: description });
+}
+
+export function authorizeController(
+  config: ResolvedConfig,
+  options: AuthorizeControllerOptions = {}
+): RequestHandler {
+  return async (req, res) => {
+    const parsed = authorizeQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return bad(res, parsed.error.issues[0]?.message ?? "invalid query");
+    }
+    const query = parsed.data;
+
+    const resource = query.resource ?? config.resource;
+    if (resource !== config.resource) {
+      return bad(res, `resource must equal ${config.resource}`);
+    }
+
+    let registeredRedirectUris: string[];
+    if (isCimdClientId(query.client_id)) {
+      try {
+        const doc = await resolveCimdClient(config, query.client_id, {
+          allowPrivateHosts: options.allowPrivateCimdHosts,
+        });
+        registeredRedirectUris = doc.redirect_uris;
+      } catch (error) {
+        return bad(res, (error as Error).message, "invalid_client");
+      }
+    } else {
+      const client = await config.storage.findClient(query.client_id);
+      if (!client) return bad(res, "unknown client_id", "invalid_client");
+      registeredRedirectUris = client.redirectUris;
+    }
+
+    if (!registeredRedirectUris.some((registered) => redirectUriMatches(registered, query.redirect_uri))) {
+      return bad(res, "redirect_uri not registered for this client");
+    }
+
+    const state = signOuterState(
+      {
+        clientId: query.client_id,
+        redirectUri: query.redirect_uri,
+        clientState: query.state,
+        codeChallenge: query.code_challenge,
+        codeChallengeMethod: query.code_challenge_method,
+        resource,
+        nonce: crypto.randomBytes(16).toString("hex"),
+      },
+      config.stateSecret,
+      STATE_TTL_SECONDS
+    );
+
+    const shopifyQuery = new URLSearchParams({
+      response_type: "code",
+      client_id: config.shopify.apiKey,
+      redirect_uri: `${config.host}/oauth/shopify-callback`,
+      scope: config.shopify.scopes,
+      state,
+    });
+
+    // admin.shopify.com renders the shop picker, then replays this path against the shop the
+    // merchant chooses. That picker is the consent step — shop ownership is the consent.
+    const shopPicker = new URL("https://admin.shopify.com/");
+    shopPicker.searchParams.set("redirect", `/oauth/authorize?${shopifyQuery.toString()}`);
+    shopPicker.searchParams.set("no_redirect", "true");
+    res.redirect(shopPicker.toString());
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/controllers/authorize.test.ts`
+Expected: PASS, 9 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/controllers/authorize.ts packages/shopify-mcp-oauth/src/controllers/authorize.test.ts
+git commit -m "feat: add /authorize with client validation and the Shopify bounce"
+```
+
+---
+
+## Task 16: Shopify HMAC middleware and callback controller
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/middlewares/verifyShopifyHmac.ts`
+- Create: `packages/shopify-mcp-oauth/src/controllers/shopifyCallback.ts`
+- Test: `packages/shopify-mcp-oauth/src/middlewares/verifyShopifyHmac.test.ts`, `packages/shopify-mcp-oauth/src/controllers/shopifyCallback.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedConfig`; `shopifyCallbackQuerySchema`; `verifyOuterState`; `issueCode`; `safeEqual`
+- Produces:
+  - `verifyShopifyHmac(queryString: string, secret: string): boolean`
+  - `requireShopifyHmac(secret: string): RequestHandler`
+  - `shopifyCallbackController(config: ResolvedConfig): RequestHandler`
+
+This is where the merchant's identity is established. Three checks run in order, and all three must
+pass before a code is issued:
+
+1. **HMAC** — proves Shopify sent this callback. Shopify signs the *raw* query string it emitted, so
+   the message must be rebuilt from `req.originalUrl`, never from `req.query` (re-encoding decoded
+   values produces a different base string for parameters like `redirect_uri`).
+2. **State JWT** — proves the flow started at our own `/authorize` with these exact parameters.
+3. **Token exchange** — a server-to-server call proving the merchant controls this shop. The resulting
+   Shopify access token is discarded; it was only ever the proof.
+
+Then the shop must already be known to the app, or the callback answers 403.
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/middlewares/verifyShopifyHmac.test.ts`:
+
+```ts
+import crypto from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { requireShopifyHmac, verifyShopifyHmac } from "./verifyShopifyHmac";
+
+const API_SECRET = "test-api-secret";
+const DEMO_SHOP = "demo.myshopify.com";
+
+function signQuery(params: Record<string, string>): string {
+  const message = new URLSearchParams(params).toString();
+  const hmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
+  return `${message}&hmac=${hmac}`;
+}
+
+describe("verifyShopifyHmac", () => {
+  it("accepts a query Shopify signed", () => {
+    expect(verifyShopifyHmac(signQuery({ shop: DEMO_SHOP, code: "abc" }), API_SECRET)).toBe(true);
+  });
+
+  it("rejects a query with no hmac", () => {
+    expect(verifyShopifyHmac(`shop=${DEMO_SHOP}&code=abc`, API_SECRET)).toBe(false);
+  });
+
+  it("rejects a tampered parameter", () => {
+    const signed = signQuery({ shop: DEMO_SHOP, code: "abc" });
+    expect(verifyShopifyHmac(signed.replace("code=abc", "code=xyz"), API_SECRET)).toBe(false);
+  });
+
+  it("rejects a signature made with a different secret", () => {
+    expect(verifyShopifyHmac(signQuery({ shop: DEMO_SHOP }), "a-different-secret")).toBe(false);
+  });
+});
+
+describe("requireShopifyHmac", () => {
+  function buildApp() {
+    const app = express();
+    app.get("/oauth/shopify-callback", requireShopifyHmac(API_SECRET), (_req, res) => {
+      res.status(200).send("reached the controller");
+    });
+    return app;
+  }
+
+  it("passes a correctly signed request through", async () => {
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${signQuery({ shop: DEMO_SHOP })}`);
+    expect(response.status).toBe(200);
+  });
+
+  it("blocks an unsigned request with 400", async () => {
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?shop=${DEMO_SHOP}`);
+    expect(response.status).toBe(400);
+  });
+});
+```
+
+`src/controllers/shopifyCallback.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it, vi } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { consumeCode } from "../services/codes";
+import { signOuterState } from "../services/stateJwt";
+import { shopifyCallbackController } from "./shopifyCallback";
+
+const HOST = "https://mcp.example.com";
+const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const CLIENT_ID = "test-client-id";
+const REDIRECT_URI = "https://client.example/callback";
+const CLIENT_STATE = "client-state-value";
+const SHOPIFY_ACCESS_TOKEN = "shpua_exchanged_token";
+
+function buildConfig(overrides: { installed?: boolean; fetchImpl?: typeof fetch } = {}): ResolvedConfig {
+  const installed = overrides.installed ?? true;
+  const storage = memoryStorage({ shops: installed ? [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] : [] });
+  const fetchImpl =
+    overrides.fetchImpl ??
+    (vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ access_token: SHOPIFY_ACCESS_TOKEN }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    ) as unknown as typeof fetch);
+
+  return resolveConfig({
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: STATE_SECRET,
+    storage,
+    fetchImpl,
+  });
+}
+
+function buildApp(config: ResolvedConfig) {
+  const app = express();
+  // The HMAC middleware is exercised separately; this suite covers the controller itself.
+  app.get("/oauth/shopify-callback", shopifyCallbackController(config));
+  return app;
+}
+
+function buildState(overrides: Record<string, string> = {}): string {
+  return signOuterState(
+    {
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      clientState: CLIENT_STATE,
+      codeChallenge: "challenge-value",
+      codeChallengeMethod: "S256",
+      resource: `${HOST}/mcp`,
+      nonce: "nonce-value",
+      ...overrides,
+    },
+    STATE_SECRET,
+    600
+  );
+}
+
+describe("shopifyCallbackController", () => {
+  it("redirects back to the client with a code and its original state", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.location);
+    expect(`${location.origin}${location.pathname}`).toBe(REDIRECT_URI);
+    expect(location.searchParams.get("state")).toBe(CLIENT_STATE);
+    expect(location.searchParams.get("code")).toBeTruthy();
+  });
+
+  it("binds the issued code to the shop and the client", async () => {
+    const config = buildConfig();
+    const response = await request(buildApp(config))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    const code = new URL(response.headers.location).searchParams.get("code") ?? "";
+    expect(await consumeCode(config, code)).toMatchObject({ shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+  });
+
+  it("exchanges the Shopify code against the shop's own domain", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ access_token: SHOPIFY_ACCESS_TOKEN }), { status: 200 })
+    ) as unknown as typeof fetch;
+    await request(buildApp(buildConfig({ fetchImpl })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(vi.mocked(fetchImpl).mock.calls[0]?.[0]).toBe(`https://${DEMO_SHOP}/admin/oauth/access_token`);
+  });
+
+  it("answers 403 when the shop is not installed", async () => {
+    const response = await request(buildApp(buildConfig({ installed: false })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(403);
+    expect(response.text).toMatch(/install/i);
+  });
+
+  it("rejects a state signed with a different secret", async () => {
+    const forged = signOuterState(
+      {
+        clientId: CLIENT_ID,
+        redirectUri: "https://attacker.example/callback",
+        clientState: CLIENT_STATE,
+        codeChallenge: "challenge-value",
+        codeChallengeMethod: "S256",
+        resource: `${HOST}/mcp`,
+        nonce: "nonce-value",
+      },
+      "an-entirely-different-state-secret",
+      600
+    );
+    const response = await request(buildApp(buildConfig()))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: forged, hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects a shop domain outside myshopify.com", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .get("/oauth/shopify-callback")
+      .query({ shop: "attacker.example.com", code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("fails when Shopify's exchange returns no access token", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })) as unknown as typeof fetch;
+    const response = await request(buildApp(buildConfig({ fetchImpl })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("fails when Shopify's exchange returns an error status", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 401 })) as unknown as typeof fetch;
+    const response = await request(buildApp(buildConfig({ fetchImpl })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(400);
+  });
+});
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/verifyShopifyHmac.test.ts src/controllers/shopifyCallback.test.ts`
+Expected: FAIL — neither module resolves.
+
+- [ ] **Step 3: Write `src/middlewares/verifyShopifyHmac.ts`**
+
+```ts
+import crypto from "node:crypto";
+import type { RequestHandler } from "express";
+import { safeEqual } from "../crypto";
+
+// Shopify signs the raw, URL-encoded query string it sent. Rebuilding the message from decoded
+// values (req.query) re-encodes reserved characters differently and produces a mismatched base
+// string for parameters like redirect_uri.
+export function verifyShopifyHmac(queryString: string, secret: string): boolean {
+  const pairs = queryString.split("&").filter(Boolean);
+  let provided: string | undefined;
+  const rest: string[] = [];
+  for (const pair of pairs) {
+    if (pair.startsWith("hmac=")) {
+      provided = decodeURIComponent(pair.slice("hmac=".length));
+    } else {
+      rest.push(pair);
+    }
+  }
+  if (!provided) return false;
+  const computed = crypto.createHmac("sha256", secret).update(rest.join("&")).digest("hex");
+  return safeEqual(provided, computed);
+}
+
+export function requireShopifyHmac(secret: string): RequestHandler {
+  return (req, res, next) => {
+    const queryString = req.originalUrl.split("?")[1] ?? "";
+    if (!verifyShopifyHmac(queryString, secret)) {
+      res.status(400).type("text/plain").send("invalid hmac");
+      return;
+    }
+    next();
+  };
+}
+```
+
+- [ ] **Step 4: Write `src/controllers/shopifyCallback.ts`**
+
+```ts
+import type { RequestHandler } from "express";
+import type { ResolvedConfig } from "../config";
+import { shopifyCallbackQuerySchema } from "../schemas/shopifyCallback";
+import { issueCode } from "../services/codes";
+import { verifyOuterState, type VerifiedOuterState } from "../services/stateJwt";
+
+export function shopifyCallbackController(config: ResolvedConfig): RequestHandler {
+  return async (req, res) => {
+    const parsed = shopifyCallbackQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res
+        .status(400)
+        .type("text/plain")
+        .send(parsed.error.issues[0]?.message ?? "invalid query");
+      return;
+    }
+    const query = parsed.data;
+
+    let state: VerifiedOuterState;
+    try {
+      state = verifyOuterState(query.state, config.stateSecret);
+    } catch {
+      res.status(400).type("text/plain").send("invalid or expired state");
+      return;
+    }
+
+    let exchange: Response;
+    try {
+      exchange = await config.fetchImpl(`https://${query.shop}/admin/oauth/access_token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: config.shopify.apiKey,
+          client_secret: config.shopify.apiSecret,
+          code: query.code,
+        }),
+      });
+    } catch (error) {
+      res
+        .status(400)
+        .type("text/plain")
+        .send(`shopify exchange failed: ${(error as Error).message}`);
+      return;
+    }
+    if (!exchange.ok) {
+      res.status(400).type("text/plain").send(`shopify exchange returned ${exchange.status}`);
+      return;
+    }
+
+    let accessToken: string | undefined;
+    try {
+      accessToken = ((await exchange.json()) as { access_token?: string }).access_token;
+    } catch {
+      accessToken = undefined;
+    }
+    // The token is only ever proof that this merchant controls this shop. We do not keep it.
+    if (!accessToken) {
+      res.status(400).type("text/plain").send("shopify exchange returned no access token");
+      return;
+    }
+
+    const shop = await config.storage.findShopByDomain(query.shop);
+    if (!shop) {
+      // Shopify installs the app on approval, so reaching this point does not prove the shop was
+      // ever a customer. This lookup is the only install gate.
+      res
+        .status(403)
+        .type("text/plain")
+        .send(`${query.shop} has not installed this app. Install it first, then connect again.`);
+      return;
+    }
+
+    const { code } = await issueCode(config, {
+      shopId: shop.id,
+      shopDomain: shop.domain,
+      clientId: state.clientId,
+      redirectUri: state.redirectUri,
+      codeChallenge: state.codeChallenge,
+      codeChallengeMethod: state.codeChallengeMethod,
+      resource: state.resource,
+    });
+
+    const target = new URL(state.redirectUri);
+    target.searchParams.set("code", code);
+    target.searchParams.set("state", state.clientState);
+    res.redirect(target.toString());
+  };
+}
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/verifyShopifyHmac.test.ts src/controllers/shopifyCallback.test.ts`
+Expected: PASS, 14 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/middlewares/verifyShopifyHmac.ts packages/shopify-mcp-oauth/src/middlewares/verifyShopifyHmac.test.ts packages/shopify-mcp-oauth/src/controllers/shopifyCallback.ts packages/shopify-mcp-oauth/src/controllers/shopifyCallback.test.ts
+git commit -m "feat: verify Shopify's HMAC and issue codes from the callback"
+```
+
+---
+
+## Task 17: Token controller
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/controllers/token.ts`
+- Test: `packages/shopify-mcp-oauth/src/controllers/token.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedConfig`; `tokenRequestSchema`, `AuthorizationCodeGrant`, `RefreshTokenGrant`; `verifyS256`; `consumeCode`, `issueCode`; `issueTokens`, `rotateRefresh`; `serializeTokenBundle`
+- Produces: `tokenController(config: ResolvedConfig): RequestHandler`
+
+The authorization-code grant re-checks everything the code was bound to: the client, the redirect URI,
+and the PKCE challenge. The code is consumed before any of those checks, so a failed attempt still
+burns it — a wrong verifier does not get to try again.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/controllers/token.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { sha256Base64Url } from "../crypto";
+import { issueCode } from "../services/codes";
+import { issueTokens } from "../services/tokens";
+import { tokenController } from "./token";
+
+const HOST = "https://mcp.example.com";
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const CLIENT_ID = "test-client-id";
+const REDIRECT_URI = "https://client.example/callback";
+const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+function buildConfig(): ResolvedConfig {
+  return resolveConfig({
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
+  });
+}
+
+function buildApp(config: ResolvedConfig) {
+  const app = express();
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+  app.post("/token", tokenController(config));
+  return app;
+}
+
+async function issueTestCode(config: ResolvedConfig): Promise<string> {
+  const { code } = await issueCode(config, {
+    shopId: DEMO_SHOP_ID,
+    shopDomain: DEMO_SHOP,
+    clientId: CLIENT_ID,
+    redirectUri: REDIRECT_URI,
+    codeChallenge: sha256Base64Url(CODE_VERIFIER),
+    codeChallengeMethod: "S256",
+    resource: `${HOST}/mcp`,
+  });
+  return code;
+}
+
+describe("tokenController — authorization_code", () => {
+  it("exchanges a valid code for a token bundle", async () => {
+    const config = buildConfig();
+    const response = await request(buildApp(config)).post("/token").send({
+      grant_type: "authorization_code",
+      code: await issueTestCode(config),
+      redirect_uri: REDIRECT_URI,
+      client_id: CLIENT_ID,
+      code_verifier: CODE_VERIFIER,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.token_type).toBe("Bearer");
+    expect(response.body.access_token).toBeTruthy();
+    expect(response.body.refresh_token).toBeTruthy();
+    expect(response.body.expires_in).toBe(3600);
+  });
+
+  it("rejects a wrong PKCE verifier", async () => {
+    const config = buildConfig();
+    const response = await request(buildApp(config)).post("/token").send({
+      grant_type: "authorization_code",
+      code: await issueTestCode(config),
+      redirect_uri: REDIRECT_URI,
+      client_id: CLIENT_ID,
+      code_verifier: "not-the-verifier-that-made-the-challenge",
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_grant");
+  });
+
+  it("rejects a code presented by a different client", async () => {
+    const config = buildConfig();
+    const response = await request(buildApp(config)).post("/token").send({
+      grant_type: "authorization_code",
+      code: await issueTestCode(config),
+      redirect_uri: REDIRECT_URI,
+      client_id: "some-other-client",
+      code_verifier: CODE_VERIFIER,
+    });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects a mismatched redirect_uri", async () => {
+    const config = buildConfig();
+    const response = await request(buildApp(config)).post("/token").send({
+      grant_type: "authorization_code",
+      code: await issueTestCode(config),
+      redirect_uri: "https://attacker.example/callback",
+      client_id: CLIENT_ID,
+      code_verifier: CODE_VERIFIER,
+    });
+
+    expect(response.status).toBe(400);
+  });
+
+  it("refuses to redeem the same code twice", async () => {
+    const config = buildConfig();
+    const app = buildApp(config);
+    const code = await issueTestCode(config);
+    const body = {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: REDIRECT_URI,
+      client_id: CLIENT_ID,
+      code_verifier: CODE_VERIFIER,
+    };
+
+    await request(app).post("/token").send(body);
+    const second = await request(app).post("/token").send(body);
+    expect(second.status).toBe(400);
+  });
+
+  it("accepts a form-encoded body, which is what most clients send", async () => {
+    const config = buildConfig();
+    const response = await request(buildApp(config))
+      .post("/token")
+      .type("form")
+      .send({
+        grant_type: "authorization_code",
+        code: await issueTestCode(config),
+        redirect_uri: REDIRECT_URI,
+        client_id: CLIENT_ID,
+        code_verifier: CODE_VERIFIER,
+      });
+
+    expect(response.status).toBe(200);
+  });
+});
+
+describe("tokenController — refresh_token", () => {
+  it("rotates a valid refresh token", async () => {
+    const config = buildConfig();
+    const first = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config))
+      .post("/token")
+      .send({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: CLIENT_ID });
+
+    expect(response.status).toBe(200);
+    expect(response.body.refresh_token).not.toBe(first.refresh_token);
+  });
+
+  it("rejects a refresh token that was already rotated", async () => {
+    const config = buildConfig();
+    const app = buildApp(config);
+    const first = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const body = { grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: CLIENT_ID };
+
+    await request(app).post("/token").send(body);
+    const second = await request(app).post("/token").send(body);
+    expect(second.status).toBe(400);
+  });
+});
+
+describe("tokenController — bad requests", () => {
+  it("reports unsupported_grant_type for an unknown grant", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .post("/token")
+      .send({ grant_type: "password", username: "merchant" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("unsupported_grant_type");
+  });
+
+  it("reports invalid_request when a known grant is missing a field", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .post("/token")
+      .send({ grant_type: "authorization_code", code: "the-code" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_request");
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/controllers/token.test.ts`
+Expected: FAIL — cannot resolve `./token`.
+
+- [ ] **Step 3: Write `src/controllers/token.ts`**
+
+```ts
+import type { RequestHandler, Response } from "express";
+import type { ResolvedConfig } from "../config";
+import { tokenRequestSchema, type AuthorizationCodeGrant, type RefreshTokenGrant } from "../schemas/token";
+import { serializeTokenBundle } from "../serializers/token";
+import { consumeCode } from "../services/codes";
+import { verifyS256 } from "../services/pkce";
+import { issueTokens, rotateRefresh } from "../services/tokens";
+
+function bad(res: Response, code: string, description: string): void {
+  res.status(400).json({ error: code, error_description: description });
+}
+
+async function handleAuthorizationCode(
+  config: ResolvedConfig,
+  grant: AuthorizationCodeGrant,
+  res: Response
+): Promise<void> {
+  // Consumed first: a failed attempt still burns the code, so a wrong verifier gets no retry.
+  const record = await consumeCode(config, grant.code);
+  if (!record) return bad(res, "invalid_grant", "code unknown, expired, or already used");
+  if (record.clientId !== grant.client_id) return bad(res, "invalid_grant", "client_id mismatch");
+  if (record.redirectUri !== grant.redirect_uri) return bad(res, "invalid_grant", "redirect_uri mismatch");
+  if (!verifyS256(grant.code_verifier, record.codeChallenge)) {
+    return bad(res, "invalid_grant", "PKCE verifier failed");
+  }
+
+  const tokens = await issueTokens(config, {
+    shopId: record.shopId,
+    shopDomain: record.shopDomain,
+    clientId: record.clientId,
+    resource: record.resource,
+  });
+  res.status(200).json(serializeTokenBundle(tokens));
+}
+
+async function handleRefreshToken(
+  config: ResolvedConfig,
+  grant: RefreshTokenGrant,
+  res: Response
+): Promise<void> {
+  const rotated = await rotateRefresh(config, grant.refresh_token, grant.client_id);
+  if (!rotated) return bad(res, "invalid_grant", "refresh_token unknown, expired, or already rotated");
+  res.status(200).json(serializeTokenBundle(rotated));
+}
+
+export function tokenController(config: ResolvedConfig): RequestHandler {
+  return async (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== "object") return bad(res, "invalid_request", "body required");
+
+    const parsed = tokenRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      const grantType = (body as Record<string, unknown>).grant_type;
+      const known = grantType === "authorization_code" || grantType === "refresh_token";
+      if (!known) {
+        return bad(res, "unsupported_grant_type", `grant_type ${String(grantType ?? "(none)")} not supported`);
+      }
+      return bad(res, "invalid_request", parsed.error.issues[0]?.message ?? "invalid request");
+    }
+
+    if (parsed.data.grant_type === "authorization_code") {
+      return handleAuthorizationCode(config, parsed.data, res);
+    }
+    return handleRefreshToken(config, parsed.data, res);
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/controllers/token.test.ts`
+Expected: PASS, 10 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/controllers/token.ts packages/shopify-mcp-oauth/src/controllers/token.test.ts
+git commit -m "feat: add /token with PKCE verification and refresh rotation"
+```
+
+---
+
+## Task 18: requireAuth middleware
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/middlewares/requireAuth.ts`
+- Test: `packages/shopify-mcp-oauth/src/middlewares/requireAuth.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedConfig`; `sha256Hex`; `McpAuthContext` from `../types`
+- Produces:
+  - `requireAuth(config: ResolvedConfig): RequestHandler`
+  - `declare module "express-serve-static-core" { interface Request { mcp?: McpAuthContext } }`
+
+This is the Resource Server half. Every 401 carries an RFC 9728 `WWW-Authenticate` header naming the
+protected-resource metadata document — that header is how a client discovers where to start the login
+flow, so omitting it strands clients that have never seen the server before.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/middlewares/requireAuth.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "../adapters/memoryStorage";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import { sha256Hex } from "../crypto";
+import { issueTokens } from "../services/tokens";
+import { requireAuth } from "./requireAuth";
+
+const HOST = "https://mcp.example.com";
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const CLIENT_ID = "test-client-id";
+
+function buildConfig(): ResolvedConfig {
+  return resolveConfig({
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
+  });
+}
+
+function buildApp(config: ResolvedConfig) {
+  const app = express();
+  app.use(express.json());
+  app.post("/mcp", requireAuth(config), (req, res) => {
+    res.status(200).json(req.mcp);
+  });
+  return app;
+}
+
+describe("requireAuth", () => {
+  it("passes a live token through and exposes the shop", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+
+    expect(response.status).toBe(200);
+    expect(response.body.shopDomain).toBe(DEMO_SHOP);
+    expect(response.body.shopId).toBe(DEMO_SHOP_ID);
+  });
+
+  it("rejects a request with no Authorization header", async () => {
+    const response = await request(buildApp(buildConfig())).post("/mcp").send({});
+    expect(response.status).toBe(401);
+  });
+
+  it("rejects a non-Bearer scheme", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .post("/mcp")
+      .set("Authorization", "Basic dXNlcjpwYXNz")
+      .send({});
+    expect(response.status).toBe(401);
+  });
+
+  it("rejects an unknown token", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .post("/mcp")
+      .set("Authorization", "Bearer never-issued")
+      .send({});
+    expect(response.status).toBe(401);
+  });
+
+  it("rejects a revoked token", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const stored = await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token));
+    await config.storage.revokeToken(stored!.id);
+
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+    expect(response.status).toBe(401);
+  });
+
+  it("points a 401 at the protected-resource metadata document", async () => {
+    const response = await request(buildApp(buildConfig())).post("/mcp").send({});
+    expect(response.headers["www-authenticate"]).toContain(`${HOST}/.well-known/oauth-protected-resource`);
+  });
+
+  it("rejects a token whose shop has since been uninstalled", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, {
+      shopId: "shop_gone",
+      shopDomain: "uninstalled.myshopify.com",
+      clientId: CLIENT_ID,
+    });
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+    expect(response.status).toBe(401);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/requireAuth.test.ts`
+Expected: FAIL — cannot resolve `./requireAuth`.
+
+- [ ] **Step 3: Write `src/middlewares/requireAuth.ts`**
+
+```ts
+import type { RequestHandler } from "express";
+import type { ResolvedConfig } from "../config";
+import { sha256Hex } from "../crypto";
+import type { McpAuthContext } from "../types";
+
+declare module "express-serve-static-core" {
+  interface Request {
+    mcp?: McpAuthContext;
+  }
+}
+
+export function requireAuth(config: ResolvedConfig): RequestHandler {
+  const resourceMetadata = `${config.host}/.well-known/oauth-protected-resource`;
+
+  return async (req, res, next) => {
+    // RFC 9728: the header is how a client that has never seen this server discovers where to
+    // begin the login flow. Every 401 carries it.
+    function unauthorized(error: string): void {
+      res.setHeader("WWW-Authenticate", `Bearer error="${error}", resource_metadata="${resourceMetadata}"`);
+      res.status(401).json({ error });
+    }
+
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith("Bearer ")) {
+      return unauthorized("missing_bearer");
+    }
+
+    const token = header.slice("Bearer ".length).trim();
+    const stored = await config.storage.findTokenByAccessHash(sha256Hex(token));
+    if (!stored) return unauthorized("invalid_token");
+
+    // A token outlives an uninstall, so confirm the shop is still known on every request.
+    const shop = await config.storage.findShopByDomain(stored.shopDomain);
+    if (!shop) return unauthorized("invalid_token");
+
+    req.mcp = { shopId: stored.shopId, shopDomain: stored.shopDomain, tokenId: stored.id };
+    config.storage.touchToken(stored.id, new Date()).catch(() => {});
+    next();
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/requireAuth.test.ts`
+Expected: PASS, 7 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/middlewares/requireAuth.ts packages/shopify-mcp-oauth/src/middlewares/requireAuth.test.ts
+git commit -m "feat: add the resource-server bearer middleware"
+```
+
+---
+
+## Task 19: Rate limiting
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/middlewares/rateLimit.ts`
+- Test: `packages/shopify-mcp-oauth/src/middlewares/rateLimit.test.ts`
+
+**Interfaces:**
+- Consumes: nothing beyond Express types
+- Produces: `createRateLimiter(opts: { limit: number; windowMs: number; keyFor?: (req: Request) => string }): RequestHandler`
+
+A fixed-window counter in process memory, deliberately dependency-free. `/register` is
+unauthenticated by definition, which makes it the one endpoint anyone on the internet can write to.
+
+The limiter is per-process, so a multi-instance deployment multiplies the effective limit by the
+instance count. That is acceptable for a spam brake and is documented rather than engineered around.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/middlewares/rateLimit.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { createRateLimiter } from "./rateLimit";
+
+function buildApp(limit: number, windowMs: number) {
+  const app = express();
+  app.post("/register", createRateLimiter({ limit, windowMs }), (_req, res) => {
+    res.status(201).json({ ok: true });
+  });
+  return app;
+}
+
+describe("createRateLimiter", () => {
+  it("allows requests up to the limit", async () => {
+    const app = buildApp(2, 60_000);
+    expect((await request(app).post("/register")).status).toBe(201);
+    expect((await request(app).post("/register")).status).toBe(201);
+  });
+
+  it("answers 429 once the limit is exceeded", async () => {
+    const app = buildApp(1, 60_000);
+    await request(app).post("/register");
+    const blocked = await request(app).post("/register");
+    expect(blocked.status).toBe(429);
+    expect(blocked.body.error).toBe("too_many_requests");
+  });
+
+  it("sets Retry-After on a blocked response", async () => {
+    const app = buildApp(1, 60_000);
+    await request(app).post("/register");
+    const blocked = await request(app).post("/register");
+    expect(Number(blocked.headers["retry-after"])).toBeGreaterThan(0);
+  });
+
+  it("allows again once the window has passed", async () => {
+    const app = buildApp(1, 1);
+    await request(app).post("/register");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect((await request(app).post("/register")).status).toBe(201);
+  });
+
+  it("counts each key separately", async () => {
+    const app = express();
+    app.post(
+      "/register",
+      createRateLimiter({ limit: 1, windowMs: 60_000, keyFor: (req) => String(req.headers["x-test-key"]) }),
+      (_req, res) => res.status(201).json({ ok: true })
+    );
+
+    expect((await request(app).post("/register").set("x-test-key", "first")).status).toBe(201);
+    expect((await request(app).post("/register").set("x-test-key", "second")).status).toBe(201);
+    expect((await request(app).post("/register").set("x-test-key", "first")).status).toBe(429);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/rateLimit.test.ts`
+Expected: FAIL — cannot resolve `./rateLimit`.
+
+- [ ] **Step 3: Write `src/middlewares/rateLimit.ts`**
+
+```ts
+import type { Request, RequestHandler } from "express";
+
+interface Window {
+  count: number;
+  resetAt: number;
+}
+
+export interface RateLimiterOptions {
+  limit: number;
+  windowMs: number;
+  keyFor?: (req: Request) => string;
+}
+
+function defaultKey(req: Request): string {
+  return req.ip ?? req.socket.remoteAddress ?? "unknown";
+}
+
+// Fixed-window counter held in process memory. On a multi-instance deployment the effective
+// limit multiplies by the instance count; that is acceptable for a spam brake.
+export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
+  const windows = new Map<string, Window>();
+  const keyFor = options.keyFor ?? defaultKey;
+
+  return (req, res, next) => {
+    const key = keyFor(req);
+    const now = Date.now();
+    const current = windows.get(key);
+
+    if (!current || current.resetAt <= now) {
+      windows.set(key, { count: 1, resetAt: now + options.windowMs });
+      return next();
+    }
+
+    if (current.count >= options.limit) {
+      res.setHeader("Retry-After", Math.max(1, Math.ceil((current.resetAt - now) / 1000)));
+      res.status(429).json({ error: "too_many_requests", error_description: "rate limit exceeded" });
+      return;
+    }
+
+    current.count += 1;
+    next();
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/rateLimit.test.ts`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/middlewares/rateLimit.ts packages/shopify-mcp-oauth/src/middlewares/rateLimit.test.ts
+git commit -m "feat: add a fixed-window rate limiter for the registration endpoint"
+```
+
+---
+
+## Task 20: Router, factory, and public exports
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/router.ts`
+- Modify: `packages/shopify-mcp-oauth/src/index.ts` (replace the `PACKAGE_NAME` placeholder from Task 1)
+- Modify: `packages/shopify-mcp-oauth/src/index.test.ts` (replace the placeholder test)
+- Test: `packages/shopify-mcp-oauth/src/router.test.ts`
+
+**Interfaces:**
+- Consumes: every controller and middleware from Tasks 14–19; `resolveConfig` from `./config`
+- Produces:
+  - `buildRouter(config: ResolvedConfig, options?: BuildRouterOptions): Router`
+  - `createShopifyMcpOAuth(config: ShopifyMcpOAuthConfig, options?: BuildRouterOptions): ShopifyMcpOAuth`
+  - the package's full public export surface
+
+The six discovery routes are deliberate duplication. Clients probe different URLs, and a 404 on the
+one a given client happens to check surfaces to the user as "this server does not support OAuth".
+
+- [ ] **Step 1: Write the failing test**
+
+`src/router.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it } from "vitest";
+import { memoryStorage } from "./adapters/memoryStorage";
+import { createShopifyMcpOAuth } from "./index";
+
+const HOST = "https://mcp.example.com";
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const REDIRECT_URI = "https://client.example/callback";
+
+function buildApp() {
+  const oauth = createShopifyMcpOAuth({
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
+  });
+  const app = express();
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+  app.use(oauth.router);
+  app.post("/mcp", oauth.requireAuth, (req, res) => res.status(200).json(req.mcp));
+  return app;
+}
+
+const DISCOVERY_PATHS = [
+  "/.well-known/oauth-authorization-server",
+  "/.well-known/oauth-authorization-server/mcp",
+  "/.well-known/openid-configuration",
+  "/.well-known/openid-configuration/mcp",
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-protected-resource/mcp",
+];
+
+describe("router", () => {
+  it.each(DISCOVERY_PATHS)("serves %s", async (path) => {
+    const response = await request(buildApp()).get(path);
+    expect(response.status).toBe(200);
+  });
+
+  it("mounts /register", async () => {
+    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    expect(response.status).toBe(201);
+  });
+
+  it("mounts /token", async () => {
+    const response = await request(buildApp()).post("/token").send({ grant_type: "password" });
+    expect(response.body.error).toBe("unsupported_grant_type");
+  });
+
+  it("mounts /revoke", async () => {
+    const response = await request(buildApp()).post("/revoke").send({ token: "never-issued" });
+    expect(response.status).toBe(200);
+  });
+
+  it("mounts /authorize", async () => {
+    const response = await request(buildApp()).get("/authorize");
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_request");
+  });
+
+  it("guards the mcp route with requireAuth", async () => {
+    const response = await request(buildApp()).post("/mcp").send({});
+    expect(response.status).toBe(401);
+  });
+
+  it("omits the openai challenge route when no token is configured", async () => {
+    const response = await request(buildApp()).get("/.well-known/openai-apps-challenge");
+    expect(response.status).toBe(404);
+  });
+});
+
+describe("createShopifyMcpOAuth", () => {
+  it("throws on an invalid host before any request is served", () => {
+    expect(() =>
+      createShopifyMcpOAuth({
+        host: "mcp.example.com",
+        shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+        stateSecret: "test-state-secret-at-least-32-bytes-long",
+        storage: memoryStorage(),
+      })
+    ).toThrow(/host/);
+  });
+});
+```
+
+Delete the placeholder test file from Task 1:
+
+```bash
+rm packages/shopify-mcp-oauth/src/index.test.ts
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/router.test.ts`
+Expected: FAIL — `createShopifyMcpOAuth` is not exported from `./index`.
+
+- [ ] **Step 3: Write `src/router.ts`**
+
+```ts
+import { Router } from "express";
+import type { ResolvedConfig } from "./config";
+import { authorizeController } from "./controllers/authorize";
+import {
+  authorizationServerMetadataController,
+  protectedResourceMetadataController,
+} from "./controllers/metadata";
+import { openaiAppsChallengeController } from "./controllers/openaiAppsChallenge";
+import { registerController } from "./controllers/register";
+import { revokeController } from "./controllers/revoke";
+import { shopifyCallbackController } from "./controllers/shopifyCallback";
+import { tokenController } from "./controllers/token";
+import { createRateLimiter } from "./middlewares/rateLimit";
+import { requireShopifyHmac } from "./middlewares/verifyShopifyHmac";
+
+export interface BuildRouterOptions {
+  allowPrivateCimdHosts?: boolean;
+}
+
+export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions = {}): Router {
+  const router = Router();
+
+  const authorizationServer = authorizationServerMetadataController(config);
+  const protectedResource = protectedResourceMetadataController(config);
+
+  // Clients probe different discovery URLs; a 404 on the one a given client checks reads to the
+  // user as "this server does not support OAuth".
+  router.get("/.well-known/oauth-authorization-server", authorizationServer);
+  router.get("/.well-known/oauth-authorization-server/mcp", authorizationServer);
+  router.get("/.well-known/openid-configuration", authorizationServer);
+  router.get("/.well-known/openid-configuration/mcp", authorizationServer);
+  router.get("/.well-known/oauth-protected-resource", protectedResource);
+  router.get("/.well-known/oauth-protected-resource/mcp", protectedResource);
+
+  if (config.openaiAppsChallengeToken) {
+    router.get("/.well-known/openai-apps-challenge", openaiAppsChallengeController(config.openaiAppsChallengeToken));
+  }
+
+  router.post(
+    "/register",
+    createRateLimiter({ limit: config.registerRateLimit.limit, windowMs: config.registerRateLimit.windowMs }),
+    registerController(config)
+  );
+
+  router.get("/authorize", authorizeController(config, { allowPrivateCimdHosts: options.allowPrivateCimdHosts }));
+  router.get(
+    "/oauth/shopify-callback",
+    requireShopifyHmac(config.shopify.apiSecret),
+    shopifyCallbackController(config)
+  );
+  router.post("/token", tokenController(config));
+  router.post("/revoke", revokeController(config));
+
+  return router;
+}
+```
+
+- [ ] **Step 4: Rewrite `src/index.ts` with the full export surface**
+
+```ts
+import type { RequestHandler, Router } from "express";
+import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
+import { requireAuth } from "./middlewares/requireAuth";
+import { buildRouter, type BuildRouterOptions } from "./router";
+
+export interface ShopifyMcpOAuth {
+  router: Router;
+  requireAuth: RequestHandler;
+}
+
+export function createShopifyMcpOAuth(
+  config: ShopifyMcpOAuthConfig,
+  options: BuildRouterOptions = {}
+): ShopifyMcpOAuth {
+  const resolved = resolveConfig(config);
+  return {
+    router: buildRouter(resolved, options),
+    requireAuth: requireAuth(resolved),
+  };
+}
+
+export { allowAnyShop } from "./adapters/allowAnyShop";
+export { memoryCache } from "./adapters/memoryCache";
+export { memoryStorage, type MemoryStorage } from "./adapters/memoryStorage";
+export { prismaStorage, type PrismaLikeClient, type PrismaShopMapping } from "./adapters/prismaStorage";
+export { redisCache, type RedisLikeClient } from "./adapters/redisCache";
+export {
+  shopifySessionStorage,
+  type ShopifySessionLike,
+  type ShopifySessionStorageLike,
+} from "./adapters/shopifySessionStorage";
+export { resolveConfig, type ResolvedConfig, type ShopifyMcpOAuthConfig } from "./config";
+export { OAuthError } from "./errors";
+export type { BuildRouterOptions } from "./router";
+export type {
+  CacheStore,
+  Logger,
+  McpAuthContext,
+  NewOAuthClient,
+  NewToken,
+  OAuthClient,
+  OAuthStorage,
+  ShopRef,
+  StoredToken,
+} from "./types";
+```
+
+- [ ] **Step 5: Run the whole suite**
+
+Run: `pnpm --filter shopify-mcp-oauth test`
+Expected: PASS — every test from Tasks 2–20, including the 13 in `router.test.ts`.
+
+- [ ] **Step 6: Verify typecheck and build**
+
+Run: `pnpm --filter shopify-mcp-oauth typecheck && pnpm --filter shopify-mcp-oauth build`
+Expected: no errors; `dist/` contains `index.js`, `index.cjs`, `index.d.ts`, `testing.js`, `testing.cjs`, `testing.d.ts`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/router.ts packages/shopify-mcp-oauth/src/router.test.ts packages/shopify-mcp-oauth/src/index.ts
+git rm --cached packages/shopify-mcp-oauth/src/index.test.ts 2>/dev/null || true
+git add -A
+git commit -m "feat: assemble the oauth router and public package exports"
+```
+
+---
+
+## Task 21: Full-flow integration test
+
+**Files:**
+- Create: `packages/shopify-mcp-oauth/src/flow.test.ts`
+
+**Interfaces:**
+- Consumes: the entire public surface
+- Produces: nothing — this task only proves the pieces fit together
+
+Every prior task tested one unit against fakes. This one drives the whole login end to end with a
+stubbed Shopify, which is the only way to catch a mismatch between two units that each pass their own
+tests.
+
+- [ ] **Step 1: Write the failing test**
+
+`src/flow.test.ts`:
+
+```ts
+import crypto from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { describe, expect, it, vi } from "vitest";
+import { memoryStorage } from "./adapters/memoryStorage";
+import { sha256Base64Url } from "./crypto";
+import { createShopifyMcpOAuth } from "./index";
+
+const HOST = "https://mcp.example.com";
+const API_SECRET = "test-api-secret";
+const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP_ID = "shop_1";
+const REDIRECT_URI = "https://client.example/callback";
+const CLIENT_STATE = "client-state-value";
+const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+function buildApp() {
+  const oauth = createShopifyMcpOAuth({
+    host: HOST,
+    shopify: { apiKey: "test-api-key", apiSecret: API_SECRET, scopes: "read_products" },
+    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
+    fetchImpl: vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ access_token: "shpua_exchanged_token" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    ) as unknown as typeof fetch,
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+  app.use(oauth.router);
+  app.post("/mcp", oauth.requireAuth, (req, res) => res.status(200).json({ shop: req.mcp?.shopDomain }));
+  return app;
+}
+
+function signShopifyCallback(params: Record<string, string>): string {
+  const message = new URLSearchParams(params).toString();
+  const hmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
+  return `${message}&hmac=${hmac}`;
+}
+
+describe("full authorization flow", () => {
+  it("carries a client from registration to an authenticated MCP call", async () => {
+    const app = buildApp();
+
+    const registration = await request(app).post("/register").send({
+      client_name: "Flow Test Client",
+      redirect_uris: [REDIRECT_URI],
+    });
+    expect(registration.status).toBe(201);
+    const clientId = registration.body.client_id as string;
+
+    const authorize = await request(app).get("/authorize").query({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      state: CLIENT_STATE,
+      code_challenge: sha256Base64Url(CODE_VERIFIER),
+      code_challenge_method: "S256",
+    });
+    expect(authorize.status).toBe(302);
+
+    const shopifyRedirect = new URL(authorize.headers.location).searchParams.get("redirect") ?? "";
+    const stateJwt = new URLSearchParams(shopifyRedirect.split("?")[1]).get("state") ?? "";
+
+    const callbackQuery = signShopifyCallback({ shop: DEMO_SHOP, code: "shopify-code", state: stateJwt });
+    const callback = await request(app).get(`/oauth/shopify-callback?${callbackQuery}`);
+    expect(callback.status).toBe(302);
+
+    const authorizationCode = new URL(callback.headers.location).searchParams.get("code") ?? "";
+    expect(new URL(callback.headers.location).searchParams.get("state")).toBe(CLIENT_STATE);
+
+    const tokenResponse = await request(app).post("/token").type("form").send({
+      grant_type: "authorization_code",
+      code: authorizationCode,
+      redirect_uri: REDIRECT_URI,
+      client_id: clientId,
+      code_verifier: CODE_VERIFIER,
+    });
+    expect(tokenResponse.status).toBe(200);
+
+    const call = await request(app)
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokenResponse.body.access_token}`)
+      .send({});
+    expect(call.status).toBe(200);
+    expect(call.body.shop).toBe(DEMO_SHOP);
+
+    const refreshed = await request(app).post("/token").type("form").send({
+      grant_type: "refresh_token",
+      refresh_token: tokenResponse.body.refresh_token,
+      client_id: clientId,
+    });
+    expect(refreshed.status).toBe(200);
+
+    const afterRevoke = await request(app).post("/revoke").send({ token: refreshed.body.access_token });
+    expect(afterRevoke.status).toBe(200);
+
+    const blocked = await request(app)
+      .post("/mcp")
+      .set("Authorization", `Bearer ${refreshed.body.access_token}`)
+      .send({});
+    expect(blocked.status).toBe(401);
+  });
+
+  it("stops an uninstalled shop at the callback", async () => {
+    const oauth = createShopifyMcpOAuth({
+      host: HOST,
+      shopify: { apiKey: "test-api-key", apiSecret: API_SECRET, scopes: "read_products" },
+      stateSecret: "test-state-secret-at-least-32-bytes-long",
+      storage: memoryStorage(),
+      fetchImpl: vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ access_token: "shpua_exchanged_token" }), { status: 200 })
+      ) as unknown as typeof fetch,
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    const registration = await request(app).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    const authorize = await request(app).get("/authorize").query({
+      response_type: "code",
+      client_id: registration.body.client_id,
+      redirect_uri: REDIRECT_URI,
+      state: CLIENT_STATE,
+      code_challenge: sha256Base64Url(CODE_VERIFIER),
+      code_challenge_method: "S256",
+    });
+    const shopifyRedirect = new URL(authorize.headers.location).searchParams.get("redirect") ?? "";
+    const stateJwt = new URLSearchParams(shopifyRedirect.split("?")[1]).get("state") ?? "";
+
+    const callbackQuery = signShopifyCallback({ shop: DEMO_SHOP, code: "shopify-code", state: stateJwt });
+    const callback = await request(app).get(`/oauth/shopify-callback?${callbackQuery}`);
+    expect(callback.status).toBe(403);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/flow.test.ts`
+Expected: PASS, 2 tests. If a step fails, the mismatch is between two units that each pass in
+isolation — fix the unit, not the flow test.
+
+- [ ] **Step 3: Run the whole suite one final time**
+
+Run: `pnpm --filter shopify-mcp-oauth test && pnpm --filter shopify-mcp-oauth typecheck && pnpm --filter shopify-mcp-oauth build`
+Expected: all green.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/flow.test.ts
+git commit -m "test: cover the full authorization flow end to end"
+```
+
+---
+
+## Done
+
+At this point `shopify-mcp-oauth` is feature-complete against the spec's §3 and ready to be consumed
+by plan 2's example server. Not yet built, by design: the example app, the CLI, the README, and CI —
+those are plans 2 and 3.
+
