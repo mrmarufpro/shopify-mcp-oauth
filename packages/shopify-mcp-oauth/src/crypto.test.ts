@@ -2,6 +2,10 @@ import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { randomBase64Url, safeEqual, sha256Base64Url, sha256Hex } from "./crypto";
 
+// RFC 7636 Appendix B.1 test vector.
+const RFC7636_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const RFC7636_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
 describe("randomBase64Url", () => {
   it("emits URL-safe characters only", () => {
     expect(randomBase64Url(32)).toMatch(/^[A-Za-z0-9_-]+$/);
@@ -20,8 +24,8 @@ describe("sha256Hex", () => {
 });
 
 describe("sha256Base64Url", () => {
-  it("emits the RFC 7636 challenge encoding", () => {
-    expect(sha256Base64Url("verifier")).toMatch(/^[A-Za-z0-9_-]+$/);
+  it("produces the known-good RFC 7636 challenge", () => {
+    expect(sha256Base64Url(RFC7636_VERIFIER)).toBe(RFC7636_CHALLENGE);
   });
 });
 
