@@ -1556,10 +1556,15 @@ interface PrismaDelegate {
   }): Promise<{ count: number }>;
 }
 
-export type PrismaLikeClient = Record<string, PrismaDelegate> & {
+/**
+ * Structural, so the adapter never imports `@prisma/client`. Declared as two named members
+ * rather than an index signature: a real `PrismaClient` carries `$connect`/`$transaction`,
+ * which a `Record<string, PrismaDelegate>` would reject.
+ */
+export interface PrismaLikeClient {
   mcpOAuthClient: PrismaDelegate;
   mcpOAuthToken: PrismaDelegate;
-};
+}
 
 export interface PrismaShopMapping {
   model: string;
@@ -1674,7 +1679,7 @@ export function prismaStorage(
   return {
     ...core,
     async findShopByDomain(domain): Promise<ShopRef | null> {
-      const delegate = prisma[mapping.model];
+      const delegate = (prisma as unknown as Record<string, PrismaDelegate | undefined>)[mapping.model];
       if (!delegate) throw new Error(`prisma client has no "${mapping.model}" model`);
       const row = await delegate.findFirst({
         where: { ...(mapping.where ?? {}), [mapping.domainField]: domain },
