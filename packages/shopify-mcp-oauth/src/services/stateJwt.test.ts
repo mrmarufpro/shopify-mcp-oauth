@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import jwt from "jsonwebtoken";
 import { signOuterState, verifyOuterState, type OuterStatePayload } from "./stateJwt";
 
 const SECRET = "test-state-secret-at-least-32-bytes-long";
@@ -39,5 +40,11 @@ describe("state JWT", () => {
       "base64url"
     );
     expect(() => verifyOuterState(`${header}.${forged}.${signature}`, SECRET)).toThrow();
+  });
+
+  it("rejects a validly signed token with wrong payload shape", () => {
+    const WRONG_SHAPE_PAYLOAD = { clientId: CLIENT_ID, someOtherField: "value" };
+    const token = jwt.sign(WRONG_SHAPE_PAYLOAD, SECRET, { algorithm: "HS256", expiresIn: 600 });
+    expect(() => verifyOuterState(token, SECRET)).toThrow();
   });
 });
