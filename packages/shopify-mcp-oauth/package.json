@@ -1,0 +1,49 @@
+{
+  "name": "shopify-mcp-oauth",
+  "version": "0.1.0",
+  "description": "OAuth 2.1 authorization + resource server for a Shopify app's MCP endpoint",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js",
+      "require": "./dist/testing.cjs"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2"
+  },
+  "peerDependencies": {
+    "express": ">=4.18",
+    "zod": ">=3.23"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^22.0.0",
+    "express": "^5.0.0",
+    "supertest": "^7.0.0",
+    "@types/supertest": "^6.0.2",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "zod": "^3.23.8"
+  },
+  "publishConfig": { "access": "public" }
+}
