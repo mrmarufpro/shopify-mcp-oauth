@@ -44,6 +44,12 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
   const windows = new Map<string, Window>();
   const keyFor = options.keyFor ?? defaultKey;
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
+  // Snapshotted once, like keyFor/maxEntries above -- not read live off `options` on every
+  // request. The ordering argument below depends on windowMs staying constant for this limiter's
+  // whole lifetime; reading it live would let a caller who mutates `options.windowMs` after
+  // construction break that out from under the eviction logic.
+  const windowMs = options.windowMs;
+  const limit = options.limit;
 
   return (req, res, next) => {
     const key = keyFor(req);
@@ -63,31 +69,43 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
       const isNewKey = stored === undefined;
       if (!isNewKey) windows.delete(key);
 
-      // The whole memory story lives here: worst case is bounded at `maxEntries` -- past it, a
-      // genuinely new key evicts the single oldest tracked entry, O(1), unlike a reclaim scan, so
-      // this stays cheap even while an attacker keeps the map pinned at the cap on every request.
-      // Any other expired window is reclaimed lazily, the moment its own key is next seen (above).
+      // Memory bound (unconditional, holds regardless of which key gets evicted or in what
+      // order): every `windows.set` below is preceded by a net entry-count delta of exactly +1
+      // (a new key, only when below the cap) or 0 (a new key evicted-then-inserted at the cap, or
+      // a refresh deleted-then-reinserted just above) -- so `size <= maxEntries` holds after every
+      // call. That's also why this check doesn't need an `isNewKey` guard: whenever this is a
+      // refresh, the delete above has already brought size below the cap (size was <= maxEntries
+      // beforehand, by this same induction), so the check below is always false for a refresh
+      // regardless -- adding `isNewKey &&` here would be an always-false condition, unreachable
+      // dead weight in the same shape as the `Math.max` floor removed from Retry-After.
       //
-      // Deliberately no background sweep beyond that: since a refresh always deletes-then-
-      // reinserts (above), Map iteration order is always ascending by `resetAt` (windowMs is
-      // constant per limiter, so whichever key was touched longest ago also expires soonest) --
-      // meaning eviction here already removes the most-expired entry first, exactly what a sweep
-      // would do. A background sweep can't evict a *different* key than this already does, so it
-      // has no observable effect on responses, on which key gets evicted, or on the memory bound --
-      // its only possible contribution is reclaiming memory slightly earlier than the cap would on
-      // its own, against which a broken sweep (never runs; or its own throttling gets dropped,
-      // degrading into an O(n)-per-request scan on every single request) is indistinguishable from
-      // a correct one to any test. A once-shipped version had exactly that: it mutation-tested
-      // clean everywhere else, but no test could tell a working sweep from a silently broken one.
-      if (isNewKey && windows.size >= maxEntries) {
+      // Victim selection (conditional on two premises, separate from the bound above): given that
+      // (1) windowMs is snapshotted once above rather than re-read from a possibly-mutated
+      // `options`, and (2) Date.now() doesn't step backwards, Map iteration order stays ascending
+      // by `resetAt` -- a refresh always deletes-then-reinserts (above), so whichever key was last
+      // touched longest ago also expires soonest. That's what makes the eviction below remove the
+      // most-expired entry first, not just *some* entry.
+      //
+      // Deliberately no background sweep: it can't lower the bound above (already unconditional),
+      // and under the two premises it can't select a different victim than eviction below already
+      // does either -- so it would have no observable effect on responses, on which key gets
+      // evicted, or on the memory bound. Its only possible contribution -- reclaiming memory
+      // slightly earlier than the cap would on its own -- can't be told apart from a silently
+      // broken sweep (never runs; or its own throttling gets dropped, degrading into an
+      // O(n)-per-request scan) by any test. A once-shipped version had exactly that: it
+      // mutation-tested clean everywhere else, but nothing could tell a working sweep from a
+      // silently broken one. (If a premise above is ever violated -- e.g. a backward system-clock
+      // step -- eviction can pick the wrong victim for a while; that's bounded and self-heals as
+      // more requests arrive, and a sweep wouldn't have been immune to the same violation either.)
+      if (windows.size >= maxEntries) {
         const oldestKey = windows.keys().next().value;
         if (oldestKey !== undefined) windows.delete(oldestKey);
       }
-      windows.set(key, { count: 1, resetAt: now + options.windowMs });
+      windows.set(key, { count: 1, resetAt: now + windowMs });
       return next();
     }
 
-    if (current.count >= options.limit) {
+    if (current.count >= limit) {
       // No floor needed: `current` is only ever truthy when `stored.resetAt > now` (see above),
       // using this same `now` -- so resetAt - now is always strictly positive here, and ceiling
       // any positive number of milliseconds to whole seconds always lands on at least 1 (that

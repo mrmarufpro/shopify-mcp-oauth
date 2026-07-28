@@ -77,6 +77,51 @@ describe("createRateLimiter", () => {
     expect((await request(app).post("/register")).status).toBe(429);
   });
 
+  it("snapshots limit at construction, ignoring later mutation of the options object", async () => {
+    // keyFor and maxEntries are already snapshotted into locals at construction; limit must be
+    // too. Reading it live off `options` on every request would let a consumer mutating this same
+    // object later -- accidentally or otherwise -- raise the limit and unblock an already-blocked
+    // caller mid-window.
+    const options: RateLimiterOptions = { limit: 1, windowMs: 60_000 };
+    const app = express();
+    app.post("/register", createRateLimiter(options), (_req, res) => res.status(201).json({ ok: true }));
+
+    // Spend the one allowed request under the original limit.
+    expect((await request(app).post("/register")).status).toBe(201);
+
+    // Raising `limit` live would unblock the next request instead of keeping it at 429.
+    options.limit = 1000;
+
+    const stillBlocked = await request(app).post("/register");
+    expect(stillBlocked.status).toBe(429);
+  });
+
+  it("snapshots windowMs at construction, ignoring later mutation of the options object", async () => {
+    // Reading windowMs live off `options` would only matter the next time a *fresh* window gets
+    // created (an insert, not a count check against an already-stored one) -- so this needs a
+    // window to actually lapse and get refreshed after the mutation, unlike the limit test above.
+    const options: RateLimiterOptions = { limit: 1, windowMs: 30 };
+    const app = express();
+    app.post("/register", createRateLimiter(options), (_req, res) => res.status(201).json({ ok: true }));
+
+    // First window, under the original (short) windowMs.
+    await request(app).post("/register");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Mutate windowMs to something enormous, then let the lapsed window refresh. If windowMs were
+    // read live, this refresh would adopt the huge value; if snapshotted, it keeps using the
+    // original short one regardless of what `options.windowMs` says now.
+    options.windowMs = 100_000;
+    await request(app).post("/register");
+
+    // Wait past the ORIGINAL windowMs (30ms) again, comfortably short of the mutated one
+    // (100,000ms). If the refresh above had picked up the live 100,000ms value, this request
+    // would still be blocked; snapshotting means it's already lapsed again and reads as fresh.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const shouldBeFreshAgain = await request(app).post("/register");
+    expect(shouldBeFreshAgain.status).toBe(201);
+  });
+
   it("stays blocked well before the window has elapsed", async () => {
     // The dangerous direction of the "allows again once the window has passed" test below: a
     // window that resets on every request (or on some timer shorter than windowMs) would still
