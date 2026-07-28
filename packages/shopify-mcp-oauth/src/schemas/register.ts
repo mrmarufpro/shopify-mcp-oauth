@@ -25,9 +25,6 @@ export const registerRequestSchema = z.object({
         { message: "redirect_uris contains an unacceptable URI" }
       )
   ),
-  // .optional() wraps the whole preprocess+schema pipeline rather than being baked into the inner
-  // schema: ZodOptional short-circuits on an absent key before ever invoking the inner type, so
-  // capOversizedArray never runs at all when the field isn't sent — not just a no-op on undefined.
   grant_types: z
     .preprocess(
       (value) => capOversizedArray(value, REGISTER_MAX_GRANT_TYPES),

@@ -4,6 +4,13 @@
 // array of any size costs the same to reject as one just over the limit — a downstream .max()
 // check still fires on the placeholder and reports the same message.
 //
+// Usage note for an optional field: wrap `.optional()` around the whole
+// `z.preprocess((value) => capOversizedArray(value, cap), schema)` call, not around `schema`
+// itself. `ZodOptional` short-circuits on an absent key before ever invoking the inner type, so
+// that placement means this helper never runs at all when the field isn't sent — not just a
+// no-op on `undefined`. `z.preprocess(fn, schema.optional())` calls `fn` with `undefined` on
+// every absent field instead, which is unnecessary work even though this helper tolerates it.
+//
 // Internal to src/schemas/ — not part of this package's public export surface.
 export function capOversizedArray(value: unknown, cap: number): unknown {
   if (Array.isArray(value) && value.length > cap) {

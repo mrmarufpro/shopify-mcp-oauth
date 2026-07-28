@@ -20,9 +20,6 @@ export const cimdDocumentSchema = z.object({
       .min(1, "CIMD document missing redirect_uris[]")
       .max(CIMD_MAX_REDIRECT_URIS, "CIMD document has too many redirect_uris")
   ),
-  // .optional() wraps the whole preprocess+schema pipeline rather than being baked into the inner
-  // schema: ZodOptional short-circuits on an absent key before ever invoking the inner type, so
-  // capOversizedArray never runs at all when the field isn't sent — not just a no-op on undefined.
   // The document lists what the client supports; we only require the grant we drive.
   grant_types: z
     .preprocess(
