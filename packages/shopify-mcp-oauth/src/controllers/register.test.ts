@@ -3,18 +3,24 @@ import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
+import type { Logger } from "../types";
 import { registerController } from "./register";
 
 const REDIRECT_URI = "https://client.example/callback";
 const API_SECRET_CANARY = "test-api-secret";
 const STATE_SECRET_CANARY = "test-state-secret-at-least-32-bytes-long";
 
-function buildConfig(): ResolvedConfig {
+// Only the "generic 500" test needs this — it deliberately triggers asyncHandler's error log,
+// and the default console logger would print a stack trace on every full-suite run otherwise.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+function buildConfig(overrides: { logger?: Logger } = {}): ResolvedConfig {
   return resolveConfig({
     host: "https://mcp.example.com",
     shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
     stateSecret: STATE_SECRET_CANARY,
     storage: memoryStorage(),
+    ...overrides,
   });
 }
 
@@ -80,11 +86,16 @@ describe("registerController", () => {
 
   it("serializes only the validation message, never the raw issue object", async () => {
     const response = await request(buildApp(buildConfig())).post("/register").send({ client_name: "No Redirects" });
-    expect(response.body.error_description).toBe("redirect_uris must contain at least one entry");
+    // Asserting the whole body (not just error_description) means a sibling key carrying the raw
+    // issue — e.g. a `debug` field — would fail this too, not just a corrupted error_description.
+    expect(response.body).toEqual({
+      error: "invalid_client_metadata",
+      error_description: "redirect_uris must contain at least one entry",
+    });
   });
 
   it("returns a generic 500 without a stack trace when the client store fails", async () => {
-    const config = buildConfig();
+    const config = buildConfig({ logger: silentLogger });
     vi.spyOn(config.storage, "createClient").mockRejectedValue(
       new Error("storage unavailable: connection to db.internal.example refused")
     );

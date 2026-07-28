@@ -67,4 +67,21 @@ describe("asyncHandler", () => {
     expect(response.status).toBe(200);
     expect(nextSpy).toHaveBeenCalledTimes(1);
   });
+
+  it("catches a synchronous throw from a handler that violates its own Promise<void> contract", async () => {
+    // The signature promises a Promise, but nothing at runtime stops a caller from passing a
+    // plain function that throws before ever returning one — the cast below is exactly that
+    // violation, constructed on purpose to prove the wrapper survives it.
+    const throwingHandler = ((_req: unknown, _res: unknown) => {
+      throw new Error("sync boom");
+    }) as unknown as Parameters<typeof asyncHandler>[1];
+    const errorLog = vi.fn();
+    const app = buildApp({ info: () => {}, warn: () => {}, error: errorLog }, throwingHandler);
+
+    const response = await request(app).get("/probe");
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
 });

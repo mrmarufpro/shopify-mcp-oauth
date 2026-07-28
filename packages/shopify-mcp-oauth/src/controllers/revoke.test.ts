@@ -5,6 +5,7 @@ import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
 import { sha256Hex } from "../crypto";
 import { issueTokens } from "../services/tokens";
+import type { Logger } from "../types";
 import { revokeController } from "./revoke";
 
 const DEMO_SHOP = "example.myshopify.com";
@@ -13,6 +14,10 @@ const CLIENT_ID = "test-client-id";
 const API_SECRET_CANARY = "test-api-secret";
 const STATE_SECRET_CANARY = "test-state-secret-at-least-32-bytes-long";
 
+// Only the "generic 500" test needs this — it deliberately triggers asyncHandler's error log,
+// and the default console logger would print a stack trace on every full-suite run otherwise.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
 function buildApp(config: ResolvedConfig) {
   const app = express();
   app.use(express.json());
@@ -20,7 +25,9 @@ function buildApp(config: ResolvedConfig) {
   return app;
 }
 
-function buildConfig(overrides: { tokenTtl?: { access?: number; refresh?: number } } = {}): ResolvedConfig {
+function buildConfig(
+  overrides: { tokenTtl?: { access?: number; refresh?: number }; logger?: Logger } = {}
+): ResolvedConfig {
   return resolveConfig({
     host: "https://mcp.example.com",
     shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
@@ -30,8 +37,8 @@ function buildConfig(overrides: { tokenTtl?: { access?: number; refresh?: number
   });
 }
 
-// Headers carry state too (F2b) — strip only Date, which ticks between requests regardless of
-// what happened, and would otherwise make two truly-identical responses look different.
+// Headers carry state too — strip only Date, which ticks between requests regardless of what
+// happened, and would otherwise make two truly-identical responses look different.
 function headersMinusDate(response: request.Response): Record<string, string> {
   const { date: _date, ...rest } = response.headers as Record<string, string>;
   return rest;
@@ -71,6 +78,20 @@ describe("revokeController", () => {
     expect(headersMinusDate(realResponse)).toEqual(headersMinusDate(fakeResponse));
   });
 
+  it("returns an identical status, body, and headers for a real refresh token and a fake one when hinted, so the two are indistinguishable", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const realResponse = await request(buildApp(config))
+      .post("/revoke")
+      .send({ token: tokens.refresh_token, token_type_hint: "refresh_token" });
+    const fakeResponse = await request(buildApp(buildConfig()))
+      .post("/revoke")
+      .send({ token: "never-issued", token_type_hint: "refresh_token" });
+    expect(realResponse.status).toBe(fakeResponse.status);
+    expect(realResponse.body).toEqual(fakeResponse.body);
+    expect(headersMinusDate(realResponse)).toEqual(headersMinusDate(fakeResponse));
+  });
+
   it("revokes the grant even after the access token has expired", async () => {
     vi.useFakeTimers();
     try {
@@ -94,11 +115,16 @@ describe("revokeController", () => {
 
   it("serializes only the validation message, never the raw issue object", async () => {
     const response = await request(buildApp(buildConfig())).post("/revoke").send({});
-    expect(response.body.error_description).toBe("token is required");
+    // Asserting the whole body (not just error_description) means a sibling key carrying the raw
+    // issue — e.g. a `debug` field — would fail this too, not just a corrupted error_description.
+    expect(response.body).toEqual({
+      error: "invalid_request",
+      error_description: "token is required",
+    });
   });
 
   it("returns a generic 500 without a stack trace when the token store fails", async () => {
-    const config = buildConfig();
+    const config = buildConfig({ logger: silentLogger });
     vi.spyOn(config.storage, "findTokenByAccessHashIgnoringExpiry").mockRejectedValue(
       new Error("storage unavailable: connection to db.internal.example refused")
     );

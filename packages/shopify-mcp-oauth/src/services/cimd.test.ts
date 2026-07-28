@@ -265,10 +265,10 @@ describe("resolveCimdClient", () => {
       ["a public IPv4 host", "https://8.8.8.8/doc.json"],
       ["a public IPv6 host", "https://[2001:db8::1]/doc.json"],
       ["a public host in IPv4-mapped IPv6 notation", "https://[::ffff:8.8.8.8]/doc.json"],
-      // These two are the direct regression guard for N2: a blanket rule over the whole
-      // 64:ff9b::/96 or 2002::/16 prefix would reject these, since 8.8.8.8's embedded form is
-      // just as much "inside" that prefix as 169.254.169.254's is. Extracting the embedded
-      // address and reclassifying it is what tells them apart.
+      // These two are the direct regression guard against over-broad NAT64/6to4 exclusion: a
+      // blanket rule over the whole 64:ff9b::/96 or 2002::/16 prefix would reject these, since
+      // 8.8.8.8's embedded form is just as much "inside" that prefix as 169.254.169.254's is.
+      // Extracting the embedded address and reclassifying it is what tells them apart.
       ["a public host in NAT64 notation (64:ff9b::808:808 = 8.8.8.8)", "https://[64:ff9b::808:808]/doc.json"],
       ["a public host in 6to4 notation (2002:808:808:: = 8.8.8.8)", "https://[2002:808:808::]/doc.json"],
     ];
