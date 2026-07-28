@@ -87,6 +87,19 @@ describe("router", () => {
     const response = await request(buildApp()).get("/.well-known/openai-apps-challenge");
     expect(response.status).toBe(404);
   });
+
+  // The request-level test above is not enough on its own: openaiAppsChallengeController itself
+  // 404s when handed a null token, so unconditionally registering the route regardless of
+  // config -- `router.get(path, openaiAppsChallengeController(config.openaiAppsChallengeToken))`
+  // with no `if` at all -- produces the exact same 404 response and would NOT redden that test.
+  // Verified by mutation. This asserts the thing that actually distinguishes the two: no layer
+  // for that path exists in the router's own stack at all when the token isn't configured.
+  it("does not register a layer for the openai challenge path at all when no token is configured", () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const stack = (oauth.router as unknown as { stack: Array<{ route?: { path: string } }> }).stack;
+    const matchingLayer = stack.find((layer) => layer.route?.path === "/.well-known/openai-apps-challenge");
+    expect(matchingLayer).toBeUndefined();
+  });
 });
 
 describe("createShopifyMcpOAuth", () => {
@@ -222,6 +235,30 @@ describe("terminal error handler", () => {
   });
 });
 
+describe("mounts a rate limiter on /register", () => {
+  // Mirrors the /revoke block below exactly. The brief already wired createRateLimiter onto
+  // /register; nothing in this file had actually driven it past its own configured limit through
+  // the fully-wired app before this test existed -- unmounting it left the full suite green.
+  it("answers 429 once the configured register rate limit is exceeded", async () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ registerRateLimit: { limit: 1, windowMs: 60_000 } }));
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    const first = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+    const second = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(429);
+    expect(second.body.error).toBe("too_many_requests");
+    expect(second.headers["retry-after"]).toBeDefined();
+  });
+});
+
 describe("mounts a rate limiter on /revoke", () => {
   it("answers 429 once the configured revoke rate limit is exceeded", async () => {
     const oauth = createShopifyMcpOAuth(buildBaseConfig({ revokeRateLimit: { limit: 1, windowMs: 60_000 } }));
@@ -234,6 +271,8 @@ describe("mounts a rate limiter on /revoke", () => {
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(429);
+    expect(second.body.error).toBe("too_many_requests");
+    expect(second.headers["retry-after"]).toBeDefined();
   });
 
   it("keeps the revoke and register rate limits independent of one another", async () => {
