@@ -1029,7 +1029,7 @@ git commit -m "feat: add HS256 state JWT for the Shopify round trip"
 **Files:**
 - Create: `packages/shopify-mcp-oauth/src/adapters/memoryStorage.ts`
 - Create: `packages/shopify-mcp-oauth/src/adapters/memoryCache.ts`
-- Create: `packages/shopify-mcp-oauth/src/testing/storageContract.ts`
+- Create: `packages/shopify-mcp-oauth/src/testing/storageContract.ts`, `src/testing/cacheContract.ts`, `src/testing/index.ts`
 - Modify: `packages/shopify-mcp-oauth/tsup.config.ts` (add the `testing` entry), `packages/shopify-mcp-oauth/package.json` (vitest as an optional peer dependency)
 - Test: `packages/shopify-mcp-oauth/src/adapters/memoryStorage.test.ts`, `packages/shopify-mcp-oauth/src/adapters/memoryCache.test.ts`
 
@@ -1039,9 +1039,10 @@ git commit -m "feat: add HS256 state JWT for the Shopify round trip"
   - `memoryStorage(seed?: { shops?: ShopRef[] }): OAuthStorage & { addShop(shop: ShopRef): void }`
   - `memoryCache(): CacheStore`
   - `runStorageContractTests(makeStorage: () => Promise<OAuthStorage> | OAuthStorage, opts: { seedShop: ShopRef }): void` — registers a `describe` block; callers invoke it inside their own test file. `seedShop` must already exist in the storage the factory returns.
+  - `runCacheContractTests(makeCache: () => Promise<CacheStore> | CacheStore): void` — same pattern, for `CacheStore`. Exercises the atomic-`getdel` guarantee directly (several concurrent callers racing one key, exactly one may see the value), since that atomicity is what keeps an authorization code and a refresh-token rotation single-use — a caller's own cache adapter has to prove it holds before this package will trust it.
 
-`runStorageContractTests` is exported from the package's `./testing` subpath so that Vitest never
-enters the main bundle.
+`runStorageContractTests` and `runCacheContractTests` are exported from the package's `./testing`
+subpath (via `src/testing/index.ts`) so that Vitest never enters the main bundle.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1203,7 +1204,9 @@ describe("memoryCache", () => {
 Run: `pnpm --filter shopify-mcp-oauth test src/adapters`
 Expected: FAIL — cannot resolve `./memoryStorage`, `./memoryCache`, `../testing/storageContract`.
 
-- [ ] **Step 3: Write `src/testing/storageContract.ts`**
+- [ ] **Step 3: Write the testing contract helpers**
+
+`src/testing/storageContract.ts`:
 
 ```ts
 import { beforeEach, describe, expect, it } from "vitest";
@@ -1377,6 +1380,95 @@ export function runStorageContractTests(
     });
   });
 }
+```
+
+`src/testing/cacheContract.ts`:
+
+```ts
+import { describe, expect, it, vi } from "vitest";
+import type { CacheStore } from "../types";
+
+const CONTRACT_KEY = "mcp:oauth:contract-key";
+const CONTRACT_VALUE = "contract-value";
+const CONCURRENT_REDEMPTIONS = 5;
+
+export function runCacheContractTests(makeCache: () => Promise<CacheStore> | CacheStore): void {
+  describe("CacheStore contract", () => {
+    it("returns null for a key that was never stored", async () => {
+      const cache = await makeCache();
+      expect(await cache.get(CONTRACT_KEY)).toBeNull();
+    });
+
+    it("returns a stored value", async () => {
+      const cache = await makeCache();
+      await cache.set(CONTRACT_KEY, CONTRACT_VALUE, 60);
+      expect(await cache.get(CONTRACT_KEY)).toBe(CONTRACT_VALUE);
+    });
+
+    // Real Redis rejects a non-positive EX outright ("ERR invalid expire time"); a permissive
+    // adapter that silently stores an already-expired value papers over that disagreement instead
+    // of surfacing it — and lets a caller's own positive-ttl guard (see issueCode) go untested.
+    it("rejects a non-positive ttl instead of silently storing an already-expired value", async () => {
+      const cache = await makeCache();
+      await expect(cache.set(CONTRACT_KEY, CONTRACT_VALUE, 0)).rejects.toThrow();
+      await expect(cache.set(CONTRACT_KEY, CONTRACT_VALUE, -1)).rejects.toThrow();
+    });
+
+    it("expires a value once its ttl elapses", async () => {
+      vi.useFakeTimers();
+      try {
+        const cache = await makeCache();
+        await cache.set(CONTRACT_KEY, CONTRACT_VALUE, 1);
+        vi.advanceTimersByTime(2_000);
+        expect(await cache.get(CONTRACT_KEY)).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("returns null after del", async () => {
+      const cache = await makeCache();
+      await cache.set(CONTRACT_KEY, CONTRACT_VALUE, 60);
+      await cache.del(CONTRACT_KEY);
+      expect(await cache.get(CONTRACT_KEY)).toBeNull();
+    });
+
+    it("getdel returns null for a key that was never stored", async () => {
+      const cache = await makeCache();
+      expect(await cache.getdel(CONTRACT_KEY)).toBeNull();
+    });
+
+    it("getdel returns the value and removes it in one call", async () => {
+      const cache = await makeCache();
+      await cache.set(CONTRACT_KEY, CONTRACT_VALUE, 60);
+      expect(await cache.getdel(CONTRACT_KEY)).toBe(CONTRACT_VALUE);
+      expect(await cache.get(CONTRACT_KEY)).toBeNull();
+    });
+
+    // The property the whole package leans on for single-use codes and one-shot refresh rotation:
+    // of several callers racing the same key, exactly one may see the value. A get-then-del
+    // implementation fails this every time, because every caller's get() runs before any del().
+    it("lets only one of several concurrent getdel calls win", async () => {
+      const cache = await makeCache();
+      await cache.set(CONTRACT_KEY, CONTRACT_VALUE, 60);
+      const results = await Promise.all(
+        Array.from({ length: CONCURRENT_REDEMPTIONS }, () => cache.getdel(CONTRACT_KEY))
+      );
+      expect(results.filter((result) => result !== null)).toHaveLength(1);
+    });
+  });
+}
+```
+
+The barrel the package's `./testing` subpath actually resolves to. Both contract helpers are
+re-exported from here, not from their individual files, so the tsup `testing` entry (Step 6 below)
+only has to name one file to publish both:
+
+`src/testing/index.ts`:
+
+```ts
+export { runCacheContractTests } from "./cacheContract";
+export { runStorageContractTests } from "./storageContract";
 ```
 
 - [ ] **Step 4: Write `src/adapters/memoryCache.ts`**
@@ -1553,14 +1645,20 @@ constrain the Prisma adapter in Task 8.
 
 - [ ] **Step 6: Publish the `./testing` subpath and externalize vitest**
 
-`src/testing/storageContract.ts` is the first file to enter the build, so wire its entry here —
-Task 1 built the index alone because this file did not exist yet.
+`src/testing/index.ts` is the first file to enter the build, so wire its entry here — Task 1 built
+the index alone because this file did not exist yet.
 
 `packages/shopify-mcp-oauth/tsup.config.ts` — add the second entry:
 
 ```ts
-  entry: { index: "src/index.ts", testing: "src/testing/storageContract.ts" },
+  entry: { index: "src/index.ts", testing: "src/testing/index.ts" },
 ```
+
+Points at the barrel (`src/testing/index.ts`), not at `storageContract.ts` directly: entering the
+build through the file that re-exports both `runStorageContractTests` and `runCacheContractTests`
+is what keeps `./testing`'s published surface complete. Pointing this at a single contract file
+instead — even correctly, the way an earlier draft of this step did — silently drops whichever
+helper isn't named, without any build error to catch it.
 
 `packages/shopify-mcp-oauth/package.json` — vitest must become an **optional peer dependency**:
 
