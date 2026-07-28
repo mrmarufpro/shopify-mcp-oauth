@@ -66,8 +66,30 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig(buildConfig({ host: "https:///" }))).toThrow(/host/);
   });
 
+  it("rejects a host with a username and password", () => {
+    expect(() => resolveConfig(buildConfig({ host: "https://user:pass@mcp.example.com" }))).toThrow(/host/);
+  });
+
+  it("rejects a host with just a username", () => {
+    expect(() => resolveConfig(buildConfig({ host: "https://attacker@mcp.example.com" }))).toThrow(/host/);
+  });
+
   it("keeps a base path when deriving the resource", () => {
     expect(resolveConfig(buildConfig({ host: `${HOST}/base` })).resource).toBe(`${HOST}/base/mcp`);
+  });
+
+  it("lowercases an uppercase host", () => {
+    expect(resolveConfig(buildConfig({ host: "HTTPS://MCP.EXAMPLE.COM" })).resource).toBe(`${HOST}/mcp`);
+  });
+
+  it("drops an explicit default port", () => {
+    expect(resolveConfig(buildConfig({ host: `${HOST}:443` })).resource).toBe(`${HOST}/mcp`);
+  });
+
+  it("produces a single slash before mcp for a plain host with no path", () => {
+    const resolved = resolveConfig(buildConfig({ host: HOST }));
+    expect(resolved.host).toBe(HOST);
+    expect(resolved.resource).toBe(`${HOST}/mcp`);
   });
 
   it("rejects a state secret shorter than 32 characters", () => {

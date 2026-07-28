@@ -57,6 +57,10 @@ function validateHost(value: string, ctx: z.RefinementCtx): void {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must include a hostname" });
     return;
   }
+  if (url.username || url.password) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a username or password" });
+    return;
+  }
   if (url.search) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a query string" });
     return;
@@ -91,7 +95,11 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
   }
   if (!input.storage) throw new Error('shopify-mcp-oauth config invalid at "storage": storage is required');
 
-  const host = parsed.data.host.replace(/\/+$/, "");
+  // validateHost already proved this parses; re-derive from the URL (not the raw string) so the
+  // scheme and hostname are lowercased and a default port is dropped — token-audience matching
+  // against `resource` is plain string equality, so an unnormalized host would fail it silently.
+  const parsedHost = new URL(parsed.data.host);
+  const host = `${parsedHost.protocol}//${parsedHost.host}${parsedHost.pathname}`.replace(/\/+$/, "");
   const logger = input.logger ?? console;
 
   if (!input.cache) logger.warn(CACHE_FALLBACK_WARNING);
