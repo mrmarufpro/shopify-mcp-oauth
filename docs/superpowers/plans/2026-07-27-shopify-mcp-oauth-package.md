@@ -5271,10 +5271,7 @@ export function serializeTokenBundle(tokens: IssuedTokens): Record<string, unkno
 ```ts
 import type { RequestHandler } from "express";
 import type { ResolvedConfig } from "../config";
-import {
-  serializeAuthorizationServerMetadata,
-  serializeProtectedResourceMetadata,
-} from "../serializers/metadata";
+import { serializeAuthorizationServerMetadata, serializeProtectedResourceMetadata } from "../serializers/metadata";
 
 export function authorizationServerMetadataController(config: ResolvedConfig): RequestHandler {
   const body = serializeAuthorizationServerMetadata(config);
@@ -5299,9 +5296,10 @@ import type { ResolvedConfig } from "../config";
 import { registerRequestSchema } from "../schemas/register";
 import { serializeClientRegistration } from "../serializers/register";
 import { createDcrClient } from "../services/clients";
+import { asyncHandler } from "./asyncHandler";
 
 export function registerController(config: ResolvedConfig): RequestHandler {
-  return async (req, res) => {
+  return asyncHandler(config.logger, async (req, res) => {
     const parsed = registerRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -5312,7 +5310,7 @@ export function registerController(config: ResolvedConfig): RequestHandler {
     }
     const client = await createDcrClient(config, parsed.data);
     res.status(201).json(serializeClientRegistration(client));
-  };
+  });
 }
 ```
 
@@ -5323,9 +5321,10 @@ import type { RequestHandler } from "express";
 import type { ResolvedConfig } from "../config";
 import { revokeRequestSchema } from "../schemas/revoke";
 import { revokeByAccessToken, revokeByRefreshToken } from "../services/tokens";
+import { asyncHandler } from "./asyncHandler";
 
 export function revokeController(config: ResolvedConfig): RequestHandler {
-  return async (req, res) => {
+  return asyncHandler(config.logger, async (req, res) => {
     const parsed = revokeRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -5343,7 +5342,7 @@ export function revokeController(config: ResolvedConfig): RequestHandler {
       await revokeByRefreshToken(config, parsed.data.token);
     }
     res.status(200).json({});
-  };
+  });
 }
 ```
 
