@@ -238,7 +238,9 @@ Expected: FAIL — the workspace does not exist yet, or `./index` has no `PACKAG
   "name": "shopify-mcp",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
@@ -489,84 +491,22 @@ Copy the full contents of the **Locked Interfaces** `types.ts` block above verba
 - [ ] **Step 4: Write `src/errors.ts`**
 
 ```ts
-export interface ShopRef {
-  id: string | number;
-  domain: string;
-}
+export class OAuthError extends Error {
+  readonly code: string;
+  readonly description: string;
+  readonly status: number;
 
-export interface OAuthClient {
-  clientId: string;
-  clientName: string | null;
-  redirectUris: string[];
-  grantTypes: string[] | null;
-  responseTypes: string[] | null;
-  logoUri: string | null;
-  clientUri: string | null;
-  tokenEndpointAuthMethod: string;
-  revokedAt: Date | null;
-}
-export type NewOAuthClient = Omit<OAuthClient, "revokedAt">;
+  constructor(code: string, description: string, status = 400) {
+    super(`${code}: ${description}`);
+    this.name = "OAuthError";
+    this.code = code;
+    this.description = description;
+    this.status = status;
+  }
 
-export interface StoredToken {
-  id: string;
-  shopId: string | number;
-  /** Denormalized so the resource server can name the shop without a reverse lookup by id. */
-  shopDomain: string;
-  clientId: string;
-  accessTokenHash: string;
-  refreshTokenHash: string | null;
-  accessTokenExpiresAt: Date;
-  refreshTokenExpiresAt: Date | null;
-  scope: string | null;
-  resource: string | null;
-  revokedAt: Date | null;
-  rotatedFromId: string | null;
-}
-export type NewToken = Omit<StoredToken, "id" | "revokedAt">;
-
-export interface OAuthStorage {
-  findClient(clientId: string): Promise<OAuthClient | null>;
-  createClient(client: NewOAuthClient): Promise<OAuthClient>;
-  upsertClient(client: NewOAuthClient): Promise<OAuthClient>;
-  createToken(token: NewToken): Promise<StoredToken>;
-  findTokenByAccessHash(hash: string): Promise<StoredToken | null>;
-  /**
-   * Same match as findTokenByAccessHash, but ignores accessTokenExpiresAt — an expired access
-   * token still names a real grant, and /revoke must be able to kill that grant (including its
-   * still-live refresh token) after the access token has expired. Still excludes an already-
-   * revoked row, so this can't resurrect a dead grant.
-   */
-  findTokenByAccessHashIgnoringExpiry(hash: string): Promise<StoredToken | null>;
-  findTokenByRefreshHash(hash: string): Promise<StoredToken | null>;
-  /** Returns false when the row was already revoked. Rotation relies on this for one-time use. */
-  revokeToken(id: string): Promise<boolean>;
-  touchToken(id: string, lastUsedAt: Date): Promise<void>;
-  findShopByDomain(domain: string): Promise<ShopRef | null>;
-}
-
-export interface CacheStore {
-  get(key: string): Promise<string | null>;
-  set(key: string, value: string, ttlSeconds: number): Promise<void>;
-  del(key: string): Promise<void>;
-  /**
-   * Read and delete in a single atomic step: of two concurrent callers on the same key, exactly
-   * one may see the value. This is what makes an authorization code single-use, so a get-then-del
-   * implementation is not a valid substitute — required, not optional, so a non-atomic cache is
-   * rejected at the type level instead of silently allowing a code to be redeemed twice.
-   */
-  getdel(key: string): Promise<string | null>;
-}
-
-export interface Logger {
-  info(msg: string, meta?: unknown): void;
-  warn(msg: string, meta?: unknown): void;
-  error(msg: string, meta?: unknown): void;
-}
-
-export interface McpAuthContext {
-  shopId: string | number;
-  shopDomain: string;
-  tokenId: string;
+  toBody(): { error: string; error_description: string } {
+    return { error: this.code, error_description: this.description };
+  }
 }
 ```
 
@@ -609,6 +549,10 @@ import crypto from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { randomBase64Url, safeEqual, sha256Base64Url, sha256Hex } from "./crypto";
 
+// RFC 7636 Appendix B.1 test vector.
+const RFC7636_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const RFC7636_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
 describe("randomBase64Url", () => {
   it("emits URL-safe characters only", () => {
     expect(randomBase64Url(32)).toMatch(/^[A-Za-z0-9_-]+$/);
@@ -627,8 +571,8 @@ describe("sha256Hex", () => {
 });
 
 describe("sha256Base64Url", () => {
-  it("emits the RFC 7636 challenge encoding", () => {
-    expect(sha256Base64Url("verifier")).toMatch(/^[A-Za-z0-9_-]+$/);
+  it("produces the known-good RFC 7636 challenge", () => {
+    expect(sha256Base64Url(RFC7636_VERIFIER)).toBe(RFC7636_CHALLENGE);
   });
 });
 
@@ -653,8 +597,7 @@ describe("safeEqual", () => {
 import { describe, expect, it } from "vitest";
 import { verifyS256 } from "./pkce";
 
-// RFC 7636 Appendix B.1 test vector. Pinning both halves keeps this suite from
-// checking sha256Base64Url against itself.
+// RFC 7636 Appendix B.1 test vector.
 const RFC7636_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const RFC7636_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
@@ -755,6 +698,11 @@ import { redirectUriMatches, validateRedirectUri } from "./redirectUri";
 const HTTPS_CALLBACK = "https://client.example/callback";
 const LOOPBACK_CALLBACK = "http://127.0.0.1:8976/callback";
 const PRIVATE_SCHEME_CALLBACK = "com.example.app://oauth";
+const REGISTERED_HTTPS = "https://good.example.com/cb";
+const SUFFIX_ATTACK = "https://good.example.com.evil.test/cb";
+const USERINFO_WITH_USER = "https://attacker@client.example/callback";
+const USERINFO_WITH_PASS = "https://user:password@client.example/callback";
+const LOOPBACK_VARIANT = "http://127.0.0.5:8976/callback";
 
 describe("validateRedirectUri", () => {
   it("accepts https", () => {
@@ -781,8 +729,16 @@ describe("validateRedirectUri", () => {
     expect(validateRedirectUri("not a url")).toMatch(/valid URL/);
   });
 
-  it("rejects a URI carrying userinfo", () => {
-    expect(validateRedirectUri("https://attacker@client.example/callback")).toMatch(/userinfo/);
+  it("rejects userinfo (username)", () => {
+    expect(validateRedirectUri(USERINFO_WITH_USER)).toMatch(/userinfo/);
+  });
+
+  it("rejects userinfo (username:password)", () => {
+    expect(validateRedirectUri(USERINFO_WITH_PASS)).toMatch(/userinfo/);
+  });
+
+  it("accepts loopback address 127.0.0.5", () => {
+    expect(validateRedirectUri(LOOPBACK_VARIANT)).toBeNull();
   });
 });
 
@@ -807,16 +763,20 @@ describe("redirectUriMatches", () => {
     expect(redirectUriMatches(HTTPS_CALLBACK, "https://attacker.example/callback")).toBe(false);
   });
 
-  it("rejects a userinfo prefix that impersonates the registered host", () => {
-    expect(redirectUriMatches(HTTPS_CALLBACK, "https://attacker@client.example/callback")).toBe(false);
+  it("rejects suffix confusion attack (attacker.com.evil.test)", () => {
+    expect(redirectUriMatches(REGISTERED_HTTPS, SUFFIX_ATTACK)).toBe(false);
   });
 
-  it("rejects a host that merely ends with the registered host", () => {
-    expect(redirectUriMatches(HTTPS_CALLBACK, "https://client.example.attacker.example/callback")).toBe(false);
+  it("rejects userinfo injection (username)", () => {
+    expect(redirectUriMatches(HTTPS_CALLBACK, USERINFO_WITH_USER)).toBe(false);
   });
 
-  it("allows any port on a loopback host outside the three canonical literals", () => {
-    expect(redirectUriMatches("http://127.0.0.5:1234/callback", "http://127.0.0.5:55555/callback")).toBe(true);
+  it("rejects userinfo injection (username:password)", () => {
+    expect(redirectUriMatches(HTTPS_CALLBACK, USERINFO_WITH_PASS)).toBe(false);
+  });
+
+  it("ignores port on extended loopback range (127.0.0.5)", () => {
+    expect(redirectUriMatches("http://127.0.0.5:1234/callback", "http://127.0.0.5:5678/callback")).toBe(true);
   });
 });
 ```
@@ -948,6 +908,7 @@ The state JWT is what survives the round trip through Shopify: `/authorize` sign
 
 ```ts
 import { describe, expect, it } from "vitest";
+import jwt from "jsonwebtoken";
 import { signOuterState, verifyOuterState, type OuterStatePayload } from "./stateJwt";
 
 const SECRET = "test-state-secret-at-least-32-bytes-long";
@@ -984,9 +945,16 @@ describe("state JWT", () => {
   it("rejects a tampered payload", () => {
     const token = signOuterState(payload, SECRET, 600);
     const [header, , signature] = token.split(".");
-    const forged = Buffer.from(JSON.stringify({ ...payload, redirectUri: "https://attacker.example/cb" }))
-      .toString("base64url");
+    const forged = Buffer.from(JSON.stringify({ ...payload, redirectUri: "https://attacker.example/cb" })).toString(
+      "base64url"
+    );
     expect(() => verifyOuterState(`${header}.${forged}.${signature}`, SECRET)).toThrow();
+  });
+
+  it("rejects a validly signed token with wrong payload shape", () => {
+    const WRONG_SHAPE_PAYLOAD = { clientId: CLIENT_ID, someOtherField: "value" };
+    const token = jwt.sign(WRONG_SHAPE_PAYLOAD, SECRET, { algorithm: "HS256", expiresIn: 600 });
+    expect(() => verifyOuterState(token, SECRET)).toThrow();
   });
 });
 ```
@@ -1072,8 +1040,12 @@ import { describe, expect, it } from "vitest";
 import { runStorageContractTests } from "../testing/storageContract";
 import { memoryStorage } from "./memoryStorage";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const DEMO_SHOP_ID = "shop_1";
+const MUTATION_CLIENT_ID = "mutation-test-client";
+const ORIGINAL_REDIRECT_URI = "https://original.example/callback";
+const INJECTED_REDIRECT_URI = "https://injected.example/callback";
+const HIJACKED_SHOP_ID = "hijacked-shop-id";
 
 runStorageContractTests(() => memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }), {
   seedShop: { id: DEMO_SHOP_ID, domain: DEMO_SHOP },
@@ -1091,15 +1063,95 @@ describe("memoryStorage", () => {
     expect(await storage.findShopByDomain(DEMO_SHOP)).toEqual({ id: DEMO_SHOP_ID, domain: DEMO_SHOP });
   });
 });
+
+describe("memoryStorage reference isolation", () => {
+  it("does not let a mutated findClient result change stored state", async () => {
+    const storage = memoryStorage();
+    await storage.createClient({
+      clientId: MUTATION_CLIENT_ID,
+      clientName: null,
+      redirectUris: [ORIGINAL_REDIRECT_URI],
+      grantTypes: null,
+      responseTypes: null,
+      logoUri: null,
+      clientUri: null,
+      tokenEndpointAuthMethod: "none",
+    });
+
+    const found = await storage.findClient(MUTATION_CLIENT_ID);
+    found?.redirectUris.push(INJECTED_REDIRECT_URI);
+
+    const refetched = await storage.findClient(MUTATION_CLIENT_ID);
+    expect(refetched?.redirectUris).toEqual([ORIGINAL_REDIRECT_URI]);
+  });
+
+  it("does not let a mutated createClient input array change stored state", async () => {
+    const storage = memoryStorage();
+    const redirectUris = [ORIGINAL_REDIRECT_URI];
+    await storage.createClient({
+      clientId: MUTATION_CLIENT_ID,
+      clientName: null,
+      redirectUris,
+      grantTypes: null,
+      responseTypes: null,
+      logoUri: null,
+      clientUri: null,
+      tokenEndpointAuthMethod: "none",
+    });
+
+    redirectUris.push(INJECTED_REDIRECT_URI);
+
+    const found = await storage.findClient(MUTATION_CLIENT_ID);
+    expect(found?.redirectUris).toEqual([ORIGINAL_REDIRECT_URI]);
+  });
+
+  it("does not let a mutated seeded ShopRef change what findShopByDomain returns", async () => {
+    const seededShop = { id: DEMO_SHOP_ID, domain: DEMO_SHOP };
+    const storage = memoryStorage({ shops: [seededShop] });
+
+    seededShop.id = HIJACKED_SHOP_ID;
+
+    const found = await storage.findShopByDomain(DEMO_SHOP);
+    expect(found?.id).toBe(DEMO_SHOP_ID);
+  });
+
+  it("keeps a token reference held across revokeToken consistent with a fresh read", async () => {
+    const storage = memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] });
+    const token = await storage.createToken({
+      shopId: DEMO_SHOP_ID,
+      shopDomain: DEMO_SHOP,
+      clientId: MUTATION_CLIENT_ID,
+      accessTokenHash: "access-hash-for-revoke-consistency",
+      refreshTokenHash: "refresh-hash-for-revoke-consistency",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      refreshTokenExpiresAt: new Date(Date.now() + 86_400_000),
+      scope: "mcp:*",
+      resource: "https://mcp.example.com/mcp",
+      rotatedFromId: null,
+    });
+
+    await storage.revokeToken(token.id);
+
+    // A held reference is a frozen snapshot from before the revoke, matching real database
+    // snapshot semantics — a caller must re-fetch to observe the storage's current state.
+    expect(token.revokedAt).toBeNull();
+
+    const refetched = await storage.findTokenByAccessHash("access-hash-for-revoke-consistency");
+    expect(refetched).toBeNull();
+  });
+});
 ```
 
 `src/adapters/memoryCache.test.ts`:
 
 ```ts
 import { describe, expect, it } from "vitest";
+import { runCacheContractTests } from "../testing/cacheContract";
 import { memoryCache } from "./memoryCache";
 
 const KEY = "mcp:oauth:code:abc";
+
+runCacheContractTests(() => memoryCache());
 
 describe("memoryCache", () => {
   it("returns null for a key it never stored", async () => {
@@ -1112,10 +1164,10 @@ describe("memoryCache", () => {
     expect(await cache.get(KEY)).toBe("stored-value");
   });
 
-  it("expires a value once its TTL has passed", async () => {
+  it("rejects a non-positive ttl", async () => {
     const cache = memoryCache();
-    await cache.set(KEY, "stored-value", -1);
-    expect(await cache.get(KEY)).toBeNull();
+    await expect(cache.set(KEY, "stored-value", 0)).rejects.toThrow();
+    await expect(cache.set(KEY, "stored-value", -1)).rejects.toThrow();
   });
 
   it("deletes a value", async () => {
@@ -1128,7 +1180,7 @@ describe("memoryCache", () => {
   it("reads and deletes atomically via getdel", async () => {
     const cache = memoryCache();
     await cache.set(KEY, "stored-value", 60);
-    expect(await cache.getdel?.(KEY)).toBe("stored-value");
+    expect(await cache.getdel(KEY)).toBe("stored-value");
     expect(await cache.get(KEY)).toBeNull();
   });
 });
@@ -1560,6 +1612,7 @@ Typed against a minimal structural interface rather than a specific client, so `
 
 ```ts
 import { describe, expect, it, vi } from "vitest";
+import { runCacheContractTests } from "../testing/cacheContract";
 import { redisCache, type RedisLikeClient } from "./redisCache";
 
 const KEY = "mcp:oauth:code:abc";
@@ -1569,9 +1622,50 @@ function buildFakeRedis(overrides: Partial<RedisLikeClient> = {}): RedisLikeClie
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue("OK"),
     del: vi.fn().mockResolvedValue(1),
+    getDel: vi.fn().mockResolvedValue(null),
     ...overrides,
   };
 }
+
+// Backed by a real map with EX semantics, unlike buildFakeRedis's canned responses — the shared
+// cache contract needs a client whose state actually mutates across calls, and whose getDel is
+// genuinely atomic, to exercise get/set/del/ttl/exclusivity meaningfully.
+function buildStatefulFakeRedis(): RedisLikeClient {
+  const entries = new Map<string, { value: string; expiresAt: number }>();
+
+  function read(key: string): string | null {
+    const entry = entries.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      entries.delete(key);
+      return null;
+    }
+    return entry.value;
+  }
+
+  return {
+    async get(key) {
+      return read(key);
+    },
+    async set(key, value, opts) {
+      // Mirrors real Redis's "ERR invalid expire time in 'set' command" — a fake that's more
+      // permissive than production here would let the contract's rejection clause pass for the
+      // wrong reason.
+      if (opts.EX <= 0) throw new Error("ERR invalid expire time in 'set' command");
+      entries.set(key, { value, expiresAt: Date.now() + opts.EX * 1000 });
+    },
+    async del(key) {
+      entries.delete(key);
+    },
+    async getDel(key) {
+      const value = read(key);
+      entries.delete(key);
+      return value;
+    },
+  };
+}
+
+runCacheContractTests(() => redisCache(buildStatefulFakeRedis()));
 
 describe("redisCache", () => {
   it("sets with an EX ttl", async () => {
@@ -1585,19 +1679,29 @@ describe("redisCache", () => {
     expect(await redisCache(client).get(KEY)).toBe("stored-value");
   });
 
-  it("uses getDel when the client supports it", async () => {
+  it("delegates getdel to the client's native getDel", async () => {
     const getDel = vi.fn().mockResolvedValue("stored-value");
     const client = buildFakeRedis({ getDel });
-    expect(await redisCache(client).getdel?.(KEY)).toBe("stored-value");
+    expect(await redisCache(client).getdel(KEY)).toBe("stored-value");
     expect(getDel).toHaveBeenCalledWith(KEY);
   });
-
-  it("falls back to get then del when getDel is absent", async () => {
-    const client = buildFakeRedis({ get: vi.fn().mockResolvedValue("stored-value") });
-    expect(await redisCache(client).getdel?.(KEY)).toBe("stored-value");
-    expect(client.del).toHaveBeenCalledWith(KEY);
-  });
 });
+
+// Type-only regression guard: a client without a native getDel must not satisfy RedisLikeClient —
+// the get+del fallback that optionality used to permit was not atomic, making a redeemed
+// authorization code replayable under concurrent requests. Declared but never called; exists
+// solely for `pnpm typecheck` to catch a regression if getDel is ever made optional again.
+function clientWithoutGetDelIsRejected(): void {
+  const clientMissingGetDel = {
+    get: async () => null,
+    set: async () => undefined,
+    del: async () => undefined,
+  };
+  // @ts-expect-error getDel is required — a client without it must not satisfy RedisLikeClient
+  const client: RedisLikeClient = clientMissingGetDel;
+  void client;
+}
+void clientWithoutGetDelIsRejected;
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1685,7 +1789,7 @@ import { describe, expect, it, vi } from "vitest";
 import { prismaStorage, type PrismaLikeClient } from "./prismaStorage";
 import type { NewOAuthClient, NewToken } from "../types";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const CLIENT_ID = "prisma-client-id";
 const TOKEN_ID = "token-1";
 const LAST_USED_AT = new Date("2026-01-15T12:00:00.000Z");
@@ -1729,18 +1833,6 @@ describe("prismaStorage", () => {
     expect(found?.clientName).toBe("Prisma Client");
   });
 
-  it("filters expired and revoked rows in the access-hash lookup", async () => {
-    const findFirst = vi.fn().mockResolvedValue(null);
-    const prisma = buildPrisma({
-      mcpOAuthToken: { findFirst, create: vi.fn(), updateMany: vi.fn() },
-    });
-    await prismaStorage(prisma).findTokenByAccessHash("some-hash");
-    const where = findFirst.mock.calls[0]?.[0]?.where;
-    expect(where.accessTokenHash).toBe("some-hash");
-    expect(where.revokedAt).toBeNull();
-    expect(where.accessTokenExpiresAt.gt).toBeInstanceOf(Date);
-  });
-
   it("passes client fields through to create and maps the returned row back", async () => {
     const newClient: NewOAuthClient = {
       clientId: CLIENT_ID,
@@ -1779,8 +1871,6 @@ describe("prismaStorage", () => {
     await prismaStorage(prisma).upsertClient(newClient);
     const call = upsert.mock.calls[0]?.[0];
     expect(call.where).toEqual({ clientId: CLIENT_ID });
-    // The empty update IS the insert-if-absent semantics: a second write returns the existing
-    // row rather than overwriting it, matching memoryStorage and the shared contract test.
     expect(call.update).toEqual({});
   });
 
@@ -1797,13 +1887,37 @@ describe("prismaStorage", () => {
       resource: "https://mcp.example.com/mcp",
       rotatedFromId: null,
     };
-    const create = vi.fn().mockResolvedValue({ ...newToken, id: TOKEN_ID, revokedAt: null });
+    const create = vi.fn().mockResolvedValue({ ...newToken, id: "token-row-1", revokedAt: null });
     const prisma = buildPrisma({
       mcpOAuthToken: { findFirst: vi.fn(), create, updateMany: vi.fn() },
     });
     const created = await prismaStorage(prisma).createToken(newToken);
     expect(create).toHaveBeenCalledWith({ data: newToken });
     expect(created.clientId).toBe(CLIENT_ID);
+  });
+
+  it("filters expired and revoked rows in the access-hash lookup", async () => {
+    const findFirst = vi.fn().mockResolvedValue(null);
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst, create: vi.fn(), updateMany: vi.fn() },
+    });
+    await prismaStorage(prisma).findTokenByAccessHash("some-hash");
+    const where = findFirst.mock.calls[0]?.[0]?.where;
+    expect(where.accessTokenHash).toBe("some-hash");
+    expect(where.revokedAt).toBeNull();
+    expect(where.accessTokenExpiresAt.gt).toBeInstanceOf(Date);
+  });
+
+  it("ignores expiry but still filters revoked rows in the revocation access-hash lookup", async () => {
+    const findFirst = vi.fn().mockResolvedValue(null);
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst, create: vi.fn(), updateMany: vi.fn() },
+    });
+    await prismaStorage(prisma).findTokenByAccessHashIgnoringExpiry("some-hash");
+    const where = findFirst.mock.calls[0]?.[0]?.where;
+    expect(where.accessTokenHash).toBe("some-hash");
+    expect(where.revokedAt).toBeNull();
+    expect(where.accessTokenExpiresAt).toBeUndefined();
   });
 
   it("filters expired and revoked rows in the refresh-hash lookup", async () => {
@@ -1815,6 +1929,7 @@ describe("prismaStorage", () => {
     const where = findFirst.mock.calls[0]?.[0]?.where;
     expect(where.refreshTokenHash).toBe("some-refresh-hash");
     expect(where.revokedAt).toBeNull();
+    expect(where.refreshTokenExpiresAt.gt).toBeInstanceOf(Date);
   });
 
   it("revokeToken reports false when no unrevoked row matched", async () => {
@@ -1837,6 +1952,13 @@ describe("prismaStorage", () => {
     expect(call.data.revokedAt).toBeInstanceOf(Date);
   });
 
+  it("touchToken does not throw when the delegate has no updateMany", async () => {
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany: undefined },
+    });
+    await expect(prismaStorage(prisma).touchToken(TOKEN_ID, new Date())).resolves.toBeUndefined();
+  });
+
   it("touchToken sends the id and lastUsedAt to updateMany", async () => {
     const updateMany = vi.fn().mockResolvedValue({ count: 1 });
     const prisma = buildPrisma({
@@ -1846,13 +1968,6 @@ describe("prismaStorage", () => {
     const call = updateMany.mock.calls[0]?.[0];
     expect(call.where).toEqual({ id: TOKEN_ID });
     expect(call.data.lastUsedAt).toBe(LAST_USED_AT);
-  });
-
-  it("touchToken does not throw when the delegate has no updateMany", async () => {
-    const prisma = buildPrisma({
-      mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany: undefined },
-    });
-    await expect(prismaStorage(prisma).touchToken(TOKEN_ID, LAST_USED_AT)).resolves.toBeUndefined();
   });
 
   it("looks the shop up through the configured mapping", async () => {
@@ -1873,6 +1988,18 @@ describe("prismaStorage", () => {
     expect(await storage.findShopByDomain(DEMO_SHOP)).toBeNull();
   });
 });
+
+// Type-only regression guard: `prismaStorage` without a shop mapping must not expose
+// `findShopByDomain`. Declared but never called — it exists solely for `pnpm typecheck` to catch a
+// regression in the overload. If the overload's enforcement is ever lost, the line below stops
+// producing a real error and typecheck fails on "Unused '@ts-expect-error' directive."
+function unmappedStorageHasNoShopLookup(prisma: PrismaLikeClient): void {
+  const storageWithoutShopMapping = prismaStorage(prisma);
+  // @ts-expect-error findShopByDomain is intentionally absent without a shop mapping
+  const lookup = storageWithoutShopMapping.findShopByDomain;
+  void lookup;
+}
+void unmappedStorageHasNoShopLookup;
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2112,9 +2239,10 @@ where the adopter's sessions live.
 import { describe, expect, it, vi } from "vitest";
 import { shopifySessionStorage, type ShopifySessionLike } from "./shopifySessionStorage";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const OTHER_SHOP = "other.myshopify.com";
 const OFFLINE_TOKEN = "shpua_offline_token";
+const EMPTY_TOKEN = "";
 
 function buildSessionStorage(sessions: ShopifySessionLike[]) {
   return { findSessionsByShop: vi.fn().mockResolvedValue(sessions) };
@@ -2153,7 +2281,9 @@ describe("shopifySessionStorage", () => {
   });
 
   it("ignores an offline session with an empty-string access token", async () => {
-    const lookup = shopifySessionStorage(buildSessionStorage([{ shop: DEMO_SHOP, isOnline: false, accessToken: "" }]));
+    const lookup = shopifySessionStorage(
+      buildSessionStorage([{ shop: DEMO_SHOP, isOnline: false, accessToken: EMPTY_TOKEN }])
+    );
     expect(await lookup(DEMO_SHOP)).toBeNull();
   });
 
@@ -2165,8 +2295,9 @@ describe("shopifySessionStorage", () => {
   });
 
   it("returns null when the session storage resolves a non-array", () => {
-    const lookup = shopifySessionStorage({ findSessionsByShop: vi.fn().mockResolvedValue(undefined) });
-    // Returned, not awaited: a rejected promise must fail this test rather than pass it.
+    const lookup = shopifySessionStorage({
+      findSessionsByShop: vi.fn().mockResolvedValue(undefined),
+    });
     return expect(lookup(DEMO_SHOP)).resolves.toBeNull();
   });
 
@@ -2326,7 +2457,7 @@ function buildConfig(overrides: Partial<ShopifyMcpOAuthConfig> = {}): ShopifyMcp
 
 describe("resolveConfig", () => {
   it("derives the canonical resource identifier from the host", () => {
-    expect(resolveConfig(buildConfig()).resource).toBe(`${HOST}/mcp`);
+    expect(resolveConfig(buildConfig({ host: HOST })).resource).toBe(`${HOST}/mcp`);
   });
 
   it("strips a trailing slash from the host", () => {
@@ -2357,33 +2488,16 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig(buildConfig({ host: "mcp.example.com" }))).toThrow(/host/);
   });
 
-  it("rejects a state secret shorter than 32 characters", () => {
-    expect(() => resolveConfig(buildConfig({ stateSecret: "too-short" }))).toThrow(/stateSecret/);
+  it("rejects a host with a query string", () => {
+    expect(() => resolveConfig(buildConfig({ host: `${HOST}?x=1` }))).toThrow(/host/);
   });
 
-  it("rejects a missing Shopify api secret", () => {
-    const config = buildConfig({ shopify: { apiKey: "test-api-key", apiSecret: "", scopes: "read_products" } });
-    expect(() => resolveConfig(config)).toThrow(/apiSecret/);
+  it("rejects a host with a fragment", () => {
+    expect(() => resolveConfig(buildConfig({ host: `${HOST}#frag` }))).toThrow(/host/);
   });
 
-  it("defaults the openai challenge token to null", () => {
-    expect(resolveConfig(buildConfig()).openaiAppsChallengeToken).toBeNull();
-  });
-
-  it("rejects a host carrying a query string", () => {
-    expect(() => resolveConfig(buildConfig({ host: `${HOST}?x=1` }))).toThrow(/query string/);
-  });
-
-  it("rejects a host carrying a fragment", () => {
-    expect(() => resolveConfig(buildConfig({ host: `${HOST}#frag` }))).toThrow(/fragment/);
-  });
-
-  it("rejects a URL with no host", () => {
+  it("rejects a host with no hostname", () => {
     expect(() => resolveConfig(buildConfig({ host: "https:///" }))).toThrow(/host/);
-  });
-
-  it("keeps a base path, which an app mounted under one needs", () => {
-    expect(resolveConfig(buildConfig({ host: `${HOST}/base` })).resource).toBe(`${HOST}/base/mcp`);
   });
 
   it("rejects a host with a username and password", () => {
@@ -2392,6 +2506,10 @@ describe("resolveConfig", () => {
 
   it("rejects a host with just a username", () => {
     expect(() => resolveConfig(buildConfig({ host: "https://attacker@mcp.example.com" }))).toThrow(/host/);
+  });
+
+  it("keeps a base path when deriving the resource", () => {
+    expect(resolveConfig(buildConfig({ host: `${HOST}/base` })).resource).toBe(`${HOST}/base/mcp`);
   });
 
   it("lowercases an uppercase host", () => {
@@ -2408,10 +2526,23 @@ describe("resolveConfig", () => {
     expect(resolved.resource).toBe(`${HOST}/mcp`);
   });
 
+  it("rejects a state secret shorter than 32 characters", () => {
+    expect(() => resolveConfig(buildConfig({ stateSecret: "too-short" }))).toThrow(/stateSecret/);
+  });
+
+  it("rejects a missing Shopify api secret", () => {
+    const config = buildConfig({ shopify: { apiKey: "test-api-key", apiSecret: "", scopes: "read_products" } });
+    expect(() => resolveConfig(config)).toThrow(/apiSecret/);
+  });
+
   it("reports every invalid field, not just the first", () => {
-    const config = buildConfig({ host: "not-a-url", stateSecret: "too-short" });
+    const config = buildConfig({ host: "not-a-host", stateSecret: "too-short" });
     expect(() => resolveConfig(config)).toThrow(/host/);
     expect(() => resolveConfig(config)).toThrow(/stateSecret/);
+  });
+
+  it("defaults the openai challenge token to null", () => {
+    expect(resolveConfig(buildConfig()).openaiAppsChallengeToken).toBeNull();
   });
 
   it("warns when no cache is supplied", () => {
@@ -2419,6 +2550,7 @@ describe("resolveConfig", () => {
     resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() } }));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("single-process"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("redisCache"));
   });
 
   it("does not warn when a cache is supplied", () => {
