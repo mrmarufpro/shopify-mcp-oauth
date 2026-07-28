@@ -37,6 +37,16 @@ describe("verifyShopifyHmac", () => {
     expect(() => verifyShopifyHmac(`shop=${DEMO_SHOP}&hmac=%`, API_SECRET)).not.toThrow();
     expect(verifyShopifyHmac(`shop=${DEMO_SHOP}&hmac=%`, API_SECRET)).toBe(false);
   });
+
+  it("verifies a raw %20-encoded space, which a decode/re-encode round trip would turn into a +", () => {
+    // A space is %20 in a raw query string but re-serializes as + under URLSearchParams (or
+    // querystring.stringify) once it has been decoded -- so a signed message built from the raw
+    // bytes and one rebuilt from the decoded value diverge for this exact byte, and only the raw
+    // one is what Shopify actually signed.
+    const rawQueryWithoutHmac = `shop=${DEMO_SHOP}&state=a%20b`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
+    expect(verifyShopifyHmac(`${rawQueryWithoutHmac}&hmac=${hmac}`, API_SECRET)).toBe(true);
+  });
 });
 
 describe("requireShopifyHmac", () => {
@@ -64,5 +74,21 @@ describe("requireShopifyHmac", () => {
     const response = await request(buildApp()).get(`/oauth/shopify-callback?${tampered}`);
     expect(response.status).toBe(400);
     expect(response.text).toBe("invalid hmac");
+  });
+
+  it("verifies against the raw query string Express received, not a rebuild from req.query", async () => {
+    // This is the binding constraint of this whole module: the message must come from
+    // req.originalUrl, never be reconstructed from req.query. A %20-encoded space is the vector
+    // that exposes a rebuild -- Express decodes it to a literal space in req.query, and
+    // re-serializing that (via URLSearchParams, querystring.stringify, or an object) turns it back
+    // into "+", not "%20", producing a different base string and therefore a different digest. If
+    // requireShopifyHmac is ever changed to source its queryString from req.query instead of
+    // req.originalUrl, this test goes red even though every other test in this file -- whose
+    // signed values never contain a character with more than one valid percent-encoding -- stays
+    // green.
+    const rawQueryWithoutHmac = `shop=${DEMO_SHOP}&state=a%20b`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${rawQueryWithoutHmac}&hmac=${hmac}`);
+    expect(response.status).toBe(200);
   });
 });
