@@ -332,4 +332,69 @@ describe("createRateLimiter", () => {
       expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(true);
     });
   });
+
+  describe("input validation", () => {
+    // Task 20 exports this factory on the package's public surface, where a consumer calling it
+    // directly has none of resolveConfig's zod schema in front of them -- these guards are what
+    // stands between a typo'd option and one of the silent-misbehavior cases below.
+    it("throws when windowMs is zero", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: 0 })).toThrow(/windowMs/);
+    });
+
+    it("throws when windowMs is negative", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: -1 })).toThrow(/windowMs/);
+    });
+
+    it("throws when windowMs is NaN", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: NaN })).toThrow(/windowMs/);
+    });
+
+    it("throws when windowMs is Infinity, which would otherwise put a non-finite Retry-After on every blocked response", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: Infinity })).toThrow(/windowMs/);
+    });
+
+    it("throws when limit is negative", () => {
+      expect(() => createRateLimiter({ limit: -1, windowMs: 60_000 })).toThrow(/limit/);
+    });
+
+    it("throws when limit is not an integer", () => {
+      expect(() => createRateLimiter({ limit: 1.5, windowMs: 60_000 })).toThrow(/limit/);
+    });
+
+    it("throws when limit is NaN", () => {
+      expect(() => createRateLimiter({ limit: NaN, windowMs: 60_000 })).toThrow(/limit/);
+    });
+
+    it("throws when maxEntries is zero", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: 60_000, maxEntries: 0 })).toThrow(/maxEntries/);
+    });
+
+    it("throws when maxEntries is not an integer", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: 60_000, maxEntries: 2.5 })).toThrow(/maxEntries/);
+    });
+
+    it("accepts limit: 0 as a valid (if unusual) input rather than rejecting it", () => {
+      expect(() => createRateLimiter({ limit: 0, windowMs: 60_000 })).not.toThrow();
+    });
+  });
+
+  describe("limit: 0 blocks every request", () => {
+    it("blocks the very first request in a brand-new window, not just requests after it", async () => {
+      // Before this fix, a fresh window's first request skipped the limit check entirely and was
+      // always let through -- correct for any limit >= 1, but silently wrong for limit: 0, which
+      // this test would otherwise report as 201 instead of the 429 "block everything" its value
+      // claims.
+      const app = buildApp({ limit: 0, windowMs: 60_000 });
+      const response = await request(app).post("/register");
+      expect(response.status).toBe(429);
+      expect(response.body.error).toBe("too_many_requests");
+    });
+
+    it("keeps blocking every subsequent request in the same window too", async () => {
+      const app = buildApp({ limit: 0, windowMs: 60_000 });
+      await request(app).post("/register");
+      const second = await request(app).post("/register");
+      expect(second.status).toBe(429);
+    });
+  });
 });

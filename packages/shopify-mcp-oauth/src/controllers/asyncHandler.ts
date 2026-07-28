@@ -3,7 +3,10 @@ import type { Logger } from "../types";
 
 type AsyncControllerHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>;
 
-const GENERIC_SERVER_ERROR_BODY = { error: "server_error", error_description: "An unexpected error occurred" };
+// Exported so middlewares/errorHandler.ts — the terminal handler for errors this wrapper never
+// gets a chance to see — answers with the exact same body. Two call sites hand-typing the same
+// literal would drift silently; importing this one guarantees they can't.
+export const GENERIC_SERVER_ERROR_BODY = { error: "server_error", error_description: "An unexpected error occurred" };
 
 // Express 4 drops a route handler's rejected promise on the floor — the request hangs, and
 // Node's default unhandled-rejection policy then kills the process. Express 5 forwards the

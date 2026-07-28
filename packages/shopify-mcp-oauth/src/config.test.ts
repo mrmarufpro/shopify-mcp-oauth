@@ -46,6 +46,23 @@ describe("resolveConfig", () => {
     expect(resolveConfig(buildConfig()).registerRateLimit).toEqual({ limit: 20, windowMs: 3_600_000 });
   });
 
+  it("defaults the revoke rate limit to 20 per hour", () => {
+    expect(resolveConfig(buildConfig()).revokeRateLimit).toEqual({ limit: 20, windowMs: 3_600_000 });
+  });
+
+  it("keeps an explicit revoke rate limit instead of the default", () => {
+    const revokeRateLimit = { limit: 5, windowMs: 30_000 };
+    expect(resolveConfig(buildConfig({ revokeRateLimit })).revokeRateLimit).toEqual(revokeRateLimit);
+  });
+
+  it("keeps registerRateLimit and revokeRateLimit independently tunable", () => {
+    const resolved = resolveConfig(
+      buildConfig({ registerRateLimit: { limit: 1, windowMs: 1000 }, revokeRateLimit: { limit: 2, windowMs: 2000 } })
+    );
+    expect(resolved.registerRateLimit).toEqual({ limit: 1, windowMs: 1000 });
+    expect(resolved.revokeRateLimit).toEqual({ limit: 2, windowMs: 2000 });
+  });
+
   it("supplies a memory cache when none is given", () => {
     expect(resolveConfig(buildConfig()).cache).toBeDefined();
   });
@@ -129,6 +146,7 @@ describe("resolveConfig", () => {
     const warningMessage = warn.mock.calls[0]![0];
     expect(warningMessage).not.toContain("rate-limit counters");
     expect(warningMessage).toContain("registerRateLimit");
+    expect(warningMessage).toContain("revokeRateLimit");
   });
 
   it("does not warn when a cache is supplied", () => {

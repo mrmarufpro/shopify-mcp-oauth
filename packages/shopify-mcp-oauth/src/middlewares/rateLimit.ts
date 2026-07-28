@@ -19,6 +19,25 @@ export interface RateLimiterOptions {
 
 const DEFAULT_MAX_ENTRIES = 10_000;
 
+// Config-driven limiters (registerRateLimit, revokeRateLimit) already pass through resolveConfig's
+// zod schema (z.number().int().positive()), which rules out every case rejected below. A consumer
+// calling this exported factory directly has no such schema in front of them, so it can't be
+// allowed to silently misbehave: a non-finite or non-positive windowMs (0, negative, NaN, Infinity)
+// would make every window already-expired the instant it's created (and Infinity would put that
+// same value straight into a Retry-After header), and a limit that isn't a non-negative integer
+// would either allow unlimited requests (negative) or not do what its value claims.
+function assertValidRateLimiterOptions(options: RateLimiterOptions): void {
+  if (!Number.isFinite(options.windowMs) || options.windowMs <= 0) {
+    throw new Error("createRateLimiter: windowMs must be a positive, finite number of milliseconds");
+  }
+  if (!Number.isInteger(options.limit) || options.limit < 0) {
+    throw new Error("createRateLimiter: limit must be a non-negative integer");
+  }
+  if (options.maxEntries !== undefined && (!Number.isInteger(options.maxEntries) || options.maxEntries <= 0)) {
+    throw new Error("createRateLimiter: maxEntries must be a positive integer");
+  }
+}
+
 // req.ip only names the real caller when the app has configured Express's `trust proxy` setting
 // to match its actual deployment (see https://expressjs.com/en/guide/behind-proxies.html) --
 // something this package cannot do on the consumer's behalf, since it only ever receives a
@@ -41,6 +60,7 @@ function defaultKey(req: Request): string {
 // multiplies by the instance count, which is an acceptable, well-understood shape for a spam
 // brake and is documented as such on `registerRateLimit`.
 export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
+  assertValidRateLimiterOptions(options);
   const windows = new Map<string, Window>();
   const keyFor = options.keyFor ?? defaultKey;
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
@@ -56,7 +76,7 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
     const now = Date.now();
 
     const stored = windows.get(key);
-    const current = stored && stored.resetAt > now ? stored : undefined;
+    let current = stored && stored.resetAt > now ? stored : undefined;
 
     if (!current) {
       // A lapsed key that's still in the map is being refreshed, not newly added. `Map#set` on a
@@ -101,8 +121,13 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
         const oldestKey = windows.keys().next().value;
         if (oldestKey !== undefined) windows.delete(oldestKey);
       }
-      windows.set(key, { count: 1, resetAt: now + windowMs });
-      return next();
+      // count starts at 0, not 1: a fresh window still has to pass the same `count >= limit` check
+      // below before its first request is allowed through. Starting at 1 (and returning next()
+      // immediately, skipping that check) would let exactly one request through per window no
+      // matter what `limit` says -- correct for every limit >= 1, but silently wrong for `limit: 0`
+      // ("block every request"), which would then let the first one through anyway.
+      current = { count: 0, resetAt: now + windowMs };
+      windows.set(key, current);
     }
 
     if (current.count >= limit) {

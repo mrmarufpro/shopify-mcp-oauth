@@ -5,6 +5,7 @@ import type { CacheStore, Logger, OAuthStorage } from "./types";
 const DEFAULT_ACCESS_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30;
 const DEFAULT_REGISTER_RATE_LIMIT = { limit: 20, windowMs: 60 * 60 * 1000 };
+const DEFAULT_REVOKE_RATE_LIMIT = { limit: 20, windowMs: 60 * 60 * 1000 };
 
 export interface ShopifyMcpOAuthConfig {
   host: string;
@@ -21,6 +22,16 @@ export interface ShopifyMcpOAuthConfig {
    * a cache-backed counter isn't a safe substitute.
    */
   registerRateLimit?: { limit: number; windowMs: number };
+  /**
+   * Caps requests to the unauthenticated `/revoke` endpoint. Same process-local shape as
+   * `registerRateLimit` above (see its own doc comment) — its own field rather than sharing
+   * registerRateLimit because the two endpoints see different legitimate call volume and must be
+   * tunable independently. RFC 7009 requires `/revoke` to answer 200 whether or not the submitted
+   * token existed, so this isn't guarding against it being used as a token-guessing oracle (the
+   * response never reveals that either way) — only against unlimited free work (two hash +
+   * storage lookups per request) from an unauthenticated caller.
+   */
+  revokeRateLimit?: { limit: number; windowMs: number };
   logger?: Logger;
   fetchImpl?: typeof fetch;
 }
@@ -35,6 +46,7 @@ export interface ResolvedConfig {
   tokenTtl: { access: number; refresh: number };
   openaiAppsChallengeToken: string | null;
   registerRateLimit: { limit: number; windowMs: number };
+  revokeRateLimit: { limit: number; windowMs: number };
   logger: Logger;
   fetchImpl: typeof fetch;
 }
@@ -42,8 +54,9 @@ export interface ResolvedConfig {
 const CACHE_FALLBACK_WARNING =
   "shopify-mcp-oauth: no cache supplied, falling back to an in-memory cache. This cache is single-process, so " +
   "authorization codes written by one instance are invisible to the others and login will fail intermittently " +
-  "across multiple instances — supply a shared cache such as redisCache in production. (The /register rate " +
-  "limiter is separate from this cache and always process-local — see registerRateLimit.)";
+  "across multiple instances — supply a shared cache such as redisCache in production. (The /register and " +
+  "/revoke rate limiters are separate from this cache and always process-local — see registerRateLimit and " +
+  "revokeRateLimit.)";
 
 // A prefix regex only checks the string starts with a scheme; new URL() also catches a missing
 // hostname, a query string, or a fragment, none of which are valid in the resource identifier
@@ -90,6 +103,7 @@ const configSchema = z.object({
     .optional(),
   openaiAppsChallengeToken: z.string().min(1).nullish(),
   registerRateLimit: z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() }).optional(),
+  revokeRateLimit: z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() }).optional(),
 });
 
 export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
@@ -124,6 +138,7 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
     },
     openaiAppsChallengeToken: parsed.data.openaiAppsChallengeToken ?? null,
     registerRateLimit: parsed.data.registerRateLimit ?? DEFAULT_REGISTER_RATE_LIMIT,
+    revokeRateLimit: parsed.data.revokeRateLimit ?? DEFAULT_REVOKE_RATE_LIMIT,
     logger,
     fetchImpl: input.fetchImpl ?? fetch,
   };
