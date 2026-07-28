@@ -1876,6 +1876,12 @@ const app = express();
 app.use(express.json());
 app.use(oauth.router);
 app.post("/mcp", oauth.requireAuth, myMcpHandler);
+
+// Must be the LAST app.use(...) call, after every body-parser and route above (oauth.router
+// included) -- a body-parser's SyntaxError on malformed JSON is thrown before Express ever
+// reaches oauth.router, so an error handler mounted inside that router can't catch it. Only an
+// error handler registered here, at this app's own outermost level, sees it.
+app.use(oauth.errorHandler);
 ```
 
 `requireAuth` sets `req.mcp = { shopId, shopDomain, tokenId }`.
@@ -1894,6 +1900,7 @@ app.post("/mcp", oauth.requireAuth, myMcpHandler);
 | `tokenTtl.refresh` | no | `2592000` | Seconds — 30 days. |
 | `openaiAppsChallengeToken` | no | `null` | Only needed to list the server as a ChatGPT app. The route is omitted when null. |
 | `registerRateLimit` | no | `{ limit: 20, windowMs: 3600000 }` | Dynamic client registration is unauthenticated by definition. |
+| `revokeRateLimit` | no | `{ limit: 20, windowMs: 3600000 }` | `/revoke` is also unauthenticated by design (RFC 7009) — its own field, tuned independently of `registerRateLimit`. |
 | `logger` | no | `console` | Anything with `info` / `warn` / `error`. |
 
 Configuration is validated when you construct it. A missing or malformed value throws immediately,
@@ -1973,6 +1980,9 @@ interface OAuthStorage {
 
   createToken(token: NewToken): Promise<StoredToken>;
   findTokenByAccessHash(hash: string): Promise<StoredToken | null>;
+  // Same match as findTokenByAccessHash, but ignoring expiry -- /revoke needs to be able to kill
+  // a grant (including its still-live refresh token) even after the access token itself expired.
+  findTokenByAccessHashIgnoringExpiry(hash: string): Promise<StoredToken | null>;
   findTokenByRefreshHash(hash: string): Promise<StoredToken | null>;
   revokeToken(id: string): Promise<boolean>;
   touchToken(id: string, lastUsedAt: Date): Promise<void>;
@@ -1984,7 +1994,7 @@ interface CacheStore {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ttlSeconds: number): Promise<void>;
   del(key: string): Promise<void>;
-  getdel?(key: string): Promise<string | null>;
+  getdel(key: string): Promise<string | null>;
 }
 ```
 
@@ -1996,8 +2006,13 @@ Three details carry weight:
   as its one-time-use guard: the request that flips `revokedAt` from null wins, and a concurrent
   second redemption of the same refresh token gets `false` and is rejected. Implement it as a
   conditional update (`WHERE id = ? AND revoked_at IS NULL`), not read-then-write.
-- **`getdel` is optional.** Provide it when your backend has an atomic read-and-delete; the package
-  falls back to `get` + `del`.
+- **`getdel` is required, not optional, and must be atomic.** It's what makes an authorization code
+  single-use: of two concurrent callers redeeming the same key, exactly one may see the value. A
+  `get` followed by a separate `del` is not a valid substitute — both callers can read the value
+  before either deletes it, letting one code be redeemed twice. If your backend has no native
+  atomic read-and-delete (a Lua script on Redis, a single transactional statement on SQL), implement
+  it as a conditional delete that returns the pre-delete value only to the caller whose delete
+  actually removed the row.
 
 ## Shipped adapters
 
