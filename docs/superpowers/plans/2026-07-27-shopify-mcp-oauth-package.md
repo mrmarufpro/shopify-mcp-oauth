@@ -4935,20 +4935,31 @@ describe("metadata controllers", () => {
 ```ts
 import express from "express";
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
-import { resolveConfig } from "../config";
+import { resolveConfig, type ResolvedConfig } from "../config";
+import type { Logger } from "../types";
 import { registerController } from "./register";
 
 const REDIRECT_URI = "https://client.example/callback";
+const API_SECRET_CANARY = "test-api-secret";
+const STATE_SECRET_CANARY = "test-state-secret-at-least-32-bytes-long";
 
-function buildApp() {
-  const config = resolveConfig({
+// Only the "generic 500" test needs this — it deliberately triggers asyncHandler's error log,
+// and the default console logger would print a stack trace on every full-suite run otherwise.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+function buildConfig(overrides: { logger?: Logger } = {}): ResolvedConfig {
+  return resolveConfig({
     host: "https://mcp.example.com",
-    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
-    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+    stateSecret: STATE_SECRET_CANARY,
     storage: memoryStorage(),
+    ...overrides,
   });
+}
+
+function buildApp(config: ResolvedConfig) {
   const app = express();
   app.use(express.json());
   app.post("/register", registerController(config));
@@ -4957,35 +4968,81 @@ function buildApp() {
 
 describe("registerController", () => {
   it("returns 201 with a generated client_id", async () => {
-    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    const response = await request(buildApp(buildConfig()))
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
     expect(response.status).toBe(201);
     expect(response.body.client_id).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 
   it("echoes the registered redirect_uris", async () => {
-    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    const response = await request(buildApp(buildConfig()))
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
     expect(response.body.redirect_uris).toEqual([REDIRECT_URI]);
   });
 
   it("reports token_endpoint_auth_method none", async () => {
-    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    const response = await request(buildApp(buildConfig()))
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
     expect(response.body.token_endpoint_auth_method).toBe("none");
   });
 
   it("never returns a client_secret", async () => {
-    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    const response = await request(buildApp(buildConfig()))
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
     expect(response.body.client_secret).toBeUndefined();
   });
 
   it("rejects a body with no redirect_uris", async () => {
-    const response = await request(buildApp()).post("/register").send({ client_name: "No Redirects" });
+    const response = await request(buildApp(buildConfig())).post("/register").send({ client_name: "No Redirects" });
     expect(response.status).toBe(400);
     expect(response.body.error).toBe("invalid_client_metadata");
   });
 
   it("rejects a dangerous redirect_uri scheme", async () => {
-    const response = await request(buildApp()).post("/register").send({ redirect_uris: ["javascript:alert(1)"] });
+    const response = await request(buildApp(buildConfig()))
+      .post("/register")
+      .send({ redirect_uris: ["javascript:alert(1)"] });
     expect(response.status).toBe(400);
+  });
+
+  it("does not persist a client when the redirect_uri is rejected", async () => {
+    const config = buildConfig();
+    const createClientSpy = vi.spyOn(config.storage, "createClient");
+    const response = await request(buildApp(config))
+      .post("/register")
+      .send({ redirect_uris: ["javascript:alert(1)"] });
+    expect(response.status).toBe(400);
+    expect(createClientSpy).not.toHaveBeenCalled();
+  });
+
+  it("serializes only the validation message, never the raw issue object", async () => {
+    const response = await request(buildApp(buildConfig())).post("/register").send({ client_name: "No Redirects" });
+    // Asserting the whole body (not just error_description) means a sibling key carrying the raw
+    // issue — e.g. a `debug` field — would fail this too, not just a corrupted error_description.
+    expect(response.body).toEqual({
+      error: "invalid_client_metadata",
+      error_description: "redirect_uris must contain at least one entry",
+    });
+  });
+
+  it("returns a generic 500 without a stack trace when the client store fails", async () => {
+    const config = buildConfig({ logger: silentLogger });
+    vi.spyOn(config.storage, "createClient").mockRejectedValue(
+      new Error("storage unavailable: connection to db.internal.example refused")
+    );
+    const response = await request(buildApp(config))
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    const raw = JSON.stringify(response.body);
+    expect(raw).not.toContain("db.internal.example");
+    expect(raw).not.toContain(API_SECRET_CANARY);
+    expect(raw).not.toContain(STATE_SECRET_CANARY);
   });
 });
 ```
@@ -4995,16 +5052,23 @@ describe("registerController", () => {
 ```ts
 import express from "express";
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
 import { sha256Hex } from "../crypto";
 import { issueTokens } from "../services/tokens";
+import type { Logger } from "../types";
 import { revokeController } from "./revoke";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const DEMO_SHOP_ID = "shop_1";
 const CLIENT_ID = "test-client-id";
+const API_SECRET_CANARY = "test-api-secret";
+const STATE_SECRET_CANARY = "test-state-secret-at-least-32-bytes-long";
+
+// Only the "generic 500" test needs this — it deliberately triggers asyncHandler's error log,
+// and the default console logger would print a stack trace on every full-suite run otherwise.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 
 function buildApp(config: ResolvedConfig) {
   const app = express();
@@ -5013,13 +5077,23 @@ function buildApp(config: ResolvedConfig) {
   return app;
 }
 
-function buildConfig(): ResolvedConfig {
+function buildConfig(
+  overrides: { tokenTtl?: { access?: number; refresh?: number }; logger?: Logger } = {}
+): ResolvedConfig {
   return resolveConfig({
     host: "https://mcp.example.com",
-    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
-    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+    stateSecret: STATE_SECRET_CANARY,
     storage: memoryStorage(),
+    ...overrides,
   });
+}
+
+// Headers carry state too — strip only Date, which ticks between requests regardless of what
+// happened, and would otherwise make two truly-identical responses look different.
+function headersMinusDate(response: request.Response): Record<string, string> {
+  const { date: _date, ...rest } = response.headers as Record<string, string>;
+  return rest;
 }
 
 describe("revokeController", () => {
@@ -5034,9 +5108,10 @@ describe("revokeController", () => {
   it("revokes a refresh token when hinted", async () => {
     const config = buildConfig();
     const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
-    await request(buildApp(config))
+    const response = await request(buildApp(config))
       .post("/revoke")
       .send({ token: tokens.refresh_token, token_type_hint: "refresh_token" });
+    expect(response.status).toBe(200);
     expect(await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token))).toBeNull();
   });
 
@@ -5045,9 +5120,73 @@ describe("revokeController", () => {
     expect(response.status).toBe(200);
   });
 
+  it("returns an identical status, body, and headers for a real token and a fake one, so the two are indistinguishable", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const realResponse = await request(buildApp(config)).post("/revoke").send({ token: tokens.access_token });
+    const fakeResponse = await request(buildApp(buildConfig())).post("/revoke").send({ token: "never-issued" });
+    expect(realResponse.status).toBe(fakeResponse.status);
+    expect(realResponse.body).toEqual(fakeResponse.body);
+    expect(headersMinusDate(realResponse)).toEqual(headersMinusDate(fakeResponse));
+  });
+
+  it("returns an identical status, body, and headers for a real refresh token and a fake one when hinted, so the two are indistinguishable", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const realResponse = await request(buildApp(config))
+      .post("/revoke")
+      .send({ token: tokens.refresh_token, token_type_hint: "refresh_token" });
+    const fakeResponse = await request(buildApp(buildConfig()))
+      .post("/revoke")
+      .send({ token: "never-issued", token_type_hint: "refresh_token" });
+    expect(realResponse.status).toBe(fakeResponse.status);
+    expect(realResponse.body).toEqual(fakeResponse.body);
+    expect(headersMinusDate(realResponse)).toEqual(headersMinusDate(fakeResponse));
+  });
+
+  it("revokes the grant even after the access token has expired", async () => {
+    vi.useFakeTimers();
+    try {
+      const config = buildConfig({ tokenTtl: { access: 1 } });
+      const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+      vi.advanceTimersByTime(2_000);
+
+      const response = await request(buildApp(config)).post("/revoke").send({ token: tokens.access_token });
+
+      expect(response.status).toBe(200);
+      expect(await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token))).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects a body with no token", async () => {
     const response = await request(buildApp(buildConfig())).post("/revoke").send({});
     expect(response.status).toBe(400);
+  });
+
+  it("serializes only the validation message, never the raw issue object", async () => {
+    const response = await request(buildApp(buildConfig())).post("/revoke").send({});
+    // Asserting the whole body (not just error_description) means a sibling key carrying the raw
+    // issue — e.g. a `debug` field — would fail this too, not just a corrupted error_description.
+    expect(response.body).toEqual({
+      error: "invalid_request",
+      error_description: "token is required",
+    });
+  });
+
+  it("returns a generic 500 without a stack trace when the token store fails", async () => {
+    const config = buildConfig({ logger: silentLogger });
+    vi.spyOn(config.storage, "findTokenByAccessHashIgnoringExpiry").mockRejectedValue(
+      new Error("storage unavailable: connection to db.internal.example refused")
+    );
+    const response = await request(buildApp(config)).post("/revoke").send({ token: "some-token" });
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    const raw = JSON.stringify(response.body);
+    expect(raw).not.toContain("db.internal.example");
+    expect(raw).not.toContain(API_SECRET_CANARY);
+    expect(raw).not.toContain(STATE_SECRET_CANARY);
   });
 });
 ```
