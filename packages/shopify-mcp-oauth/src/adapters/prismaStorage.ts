@@ -3,6 +3,8 @@ import type { NewOAuthClient, NewToken, OAuthClient, OAuthStorage, ShopRef, Stor
 interface PrismaDelegate {
   findFirst(args: { where: Record<string, unknown> }): Promise<Record<string, unknown> | null>;
   create(args: { data: Record<string, unknown> }): Promise<Record<string, unknown>>;
+  // Optional so a minimal delegate (e.g. a shop-mapping model that only needs findFirst) still
+  // satisfies this type; callers that need them get a runtime guard instead (upsertClient/revokeToken).
   upsert?(args: {
     where: Record<string, unknown>;
     create: Record<string, unknown>;
