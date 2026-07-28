@@ -56,15 +56,27 @@ async function handleRefreshToken(config: ResolvedConfig, grant: RefreshTokenGra
 
 export function tokenController(config: ResolvedConfig): RequestHandler {
   return asyncHandler(config.logger, async (req, res) => {
+    // RFC 6749 §5.1: a token response — success or error — must never be cached. Set this before
+    // any branch below, since a shared or browser cache holding a response that carries (or once
+    // carried) a bearer token would leak it to whoever reuses that cache entry next.
+    res.set({ "Cache-Control": "no-store", Pragma: "no-cache" });
+
     const body = req.body;
     if (!body || typeof body !== "object") return bad(res, "invalid_request", "body required");
 
     const parsed = tokenRequestSchema.safeParse(body);
     if (!parsed.success) {
       const grantType = (body as Record<string, unknown>).grant_type;
+      // RFC 6749 §5.2: a missing required parameter is invalid_request; unsupported_grant_type is
+      // only for a grant_type that was actually presented and isn't one this server implements.
+      if (grantType === undefined) {
+        return bad(res, "invalid_request", "grant_type is required");
+      }
       const known = grantType === "authorization_code" || grantType === "refresh_token";
       if (!known) {
-        return bad(res, "unsupported_grant_type", `grant_type ${String(grantType ?? "(none)")} not supported`);
+        // Fixed text, never the submitted value: reflecting caller-controlled input back into the
+        // response body is the same class of leak this package already avoids for zod issues.
+        return bad(res, "unsupported_grant_type", "grant_type is not supported");
       }
       return bad(res, "invalid_request", parsed.error.issues[0]?.message ?? "invalid request");
     }

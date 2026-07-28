@@ -1,9 +1,9 @@
-import express from "express";
+import express, { type Request, type Response } from "express";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
-import { sha256Base64Url } from "../crypto";
+import { sha256Base64Url, sha256Hex } from "../crypto";
 import { issueCode } from "../services/codes";
 import { issueTokens } from "../services/tokens";
 import { tokenController } from "./token";
@@ -19,6 +19,11 @@ const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const WRONG_CODE_VERIFIER = "not-the-verifier-that-made-the-challenge-xyz";
 const LOOPBACK_BOUND_REDIRECT_URI = "http://127.0.0.1:4000/callback";
 const LOOPBACK_DIFFERENT_PORT_REDIRECT_URI = "http://127.0.0.1:53219/callback";
+const DEFAULT_SCOPE = "mcp:*";
+// Deliberately different from config.resource (`${HOST}/mcp`, see resolveConfig): if a check
+// dropped `resource: record.resource` and just let issueTokens default to config.resource, using
+// the default value here would still pass by coincidence. This constant makes that impossible.
+const DISTINCT_RESOURCE = `${HOST}/mcp/reports`;
 
 function buildConfig(): ResolvedConfig {
   return resolveConfig({
@@ -37,7 +42,10 @@ function buildApp(config: ResolvedConfig) {
   return app;
 }
 
-async function issueTestCode(config: ResolvedConfig, overrides: { redirectUri?: string } = {}): Promise<string> {
+async function issueTestCode(
+  config: ResolvedConfig,
+  overrides: { redirectUri?: string; resource?: string } = {}
+): Promise<string> {
   const { code } = await issueCode(config, {
     shopId: DEMO_SHOP_ID,
     shopDomain: DEMO_SHOP,
@@ -45,9 +53,40 @@ async function issueTestCode(config: ResolvedConfig, overrides: { redirectUri?: 
     redirectUri: overrides.redirectUri ?? REDIRECT_URI,
     codeChallenge: sha256Base64Url(CODE_VERIFIER),
     codeChallengeMethod: "S256",
-    resource: `${HOST}/mcp`,
+    resource: overrides.resource ?? `${HOST}/mcp`,
   });
   return code;
+}
+
+// Invokes the controller directly, bypassing Express/supertest's real HTTP transport. Two
+// requests sent through supertest never actually race the atomic-getdel window inside
+// consumeCode — the transport overhead alone outlasts it, so a non-atomic get+del mutation would
+// look "single-use" by accident. Calling the handler function twice back-to-back under
+// Promise.all keeps both calls in the same microtask interleaving the real HTTP path can't offer.
+function invokeTokenController(
+  config: ResolvedConfig,
+  body: Record<string, unknown>
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const handler = tokenController(config);
+  return new Promise((resolve, reject) => {
+    let statusCode = 200;
+    const res = {
+      headersSent: false,
+      set() {
+        return res;
+      },
+      status(code: number) {
+        statusCode = code;
+        return res;
+      },
+      json(payload: Record<string, unknown>) {
+        resolve({ status: statusCode, body: payload });
+      },
+    } as unknown as Response;
+    handler({ body } as unknown as Request, res, (err?: unknown) => {
+      if (err) reject(err);
+    });
+  });
 }
 
 describe("tokenController — authorization_code", () => {
@@ -68,6 +107,52 @@ describe("tokenController — authorization_code", () => {
     expect(response.body.access_token).toBeTruthy();
     expect(response.body.refresh_token).toBeTruthy();
     expect(response.body.expires_in).toBe(3600);
+    expect(response.body.scope).toBe(DEFAULT_SCOPE);
+  });
+
+  it("binds the issued token to the code's own shop, client, and resource, not a default", async () => {
+    // shopId/shopDomain/clientId/resource are copied from the consumed code record onto the
+    // issued token (services/tokens.ts's issueTokens + storage.createToken). Looks the stored row
+    // up by access-token hash and asserts all four together, so a mutation that forges any single
+    // field — or defaults `resource` to config.resource instead of the code's own — gets caught.
+    const config = buildConfig();
+    const code = await issueTestCode(config, { resource: DISTINCT_RESOURCE });
+
+    const response = await request(buildApp(config)).post("/token").send({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: REDIRECT_URI,
+      client_id: CLIENT_ID,
+      code_verifier: CODE_VERIFIER,
+    });
+
+    expect(response.status).toBe(200);
+    const stored = await config.storage.findTokenByAccessHash(sha256Hex(response.body.access_token));
+    expect(stored).not.toBeNull();
+    expect(stored?.shopId).toBe(DEMO_SHOP_ID);
+    expect(stored?.shopDomain).toBe(DEMO_SHOP);
+    expect(stored?.clientId).toBe(CLIENT_ID);
+    expect(stored?.resource).toBe(DISTINCT_RESOURCE);
+  });
+
+  it("lets only one of two concurrent redemptions of the same code win", async () => {
+    const config = buildConfig();
+    const code = await issueTestCode(config);
+    const body = {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: REDIRECT_URI,
+      client_id: CLIENT_ID,
+      code_verifier: CODE_VERIFIER,
+    };
+
+    const [first, second] = await Promise.all([
+      invokeTokenController(config, body),
+      invokeTokenController(config, body),
+    ]);
+
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([200, 400]);
   });
 
   it("rejects a wrong PKCE verifier", async () => {
@@ -127,6 +212,7 @@ describe("tokenController — authorization_code", () => {
       });
 
     expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_grant");
   });
 
   it("rejects a mismatched redirect_uri", async () => {
@@ -142,6 +228,7 @@ describe("tokenController — authorization_code", () => {
       });
 
     expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_grant");
   });
 
   it("rejects a loopback redirect_uri whose port differs from the one bound to the code", async () => {
@@ -246,6 +333,24 @@ describe("tokenController — refresh_token", () => {
     const second = await request(app).post("/token").send(body);
     expect(second.status).toBe(400);
   });
+
+  it("ignores a client-requested scope and returns the token's own stored scope", async () => {
+    // refreshTokenGrantSchema accepts an optional `scope`, but rotateRefresh never reads it —
+    // only the stored record's own scope carries over. Requesting a wider one here must not
+    // widen what comes back.
+    const config = buildConfig();
+    const first = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config)).post("/token").send({
+      grant_type: "refresh_token",
+      refresh_token: first.refresh_token,
+      client_id: CLIENT_ID,
+      scope: "admin:* mcp:*",
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.scope).toBe(first.scope);
+    expect(response.body.scope).toBe(DEFAULT_SCOPE);
+  });
 });
 
 describe("tokenController — bad requests", () => {
@@ -258,6 +363,15 @@ describe("tokenController — bad requests", () => {
     expect(response.body.error).toBe("unsupported_grant_type");
   });
 
+  it("reports invalid_request, not unsupported_grant_type, when grant_type itself is missing", async () => {
+    // RFC 6749 §5.2: a missing required parameter is invalid_request. unsupported_grant_type is
+    // only for a grant_type that was actually presented and just isn't one this server supports.
+    const response = await request(buildApp(buildConfig())).post("/token").send({ code: "the-code" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_request");
+  });
+
   it("reports invalid_request when a known grant is missing a field", async () => {
     const response = await request(buildApp(buildConfig()))
       .post("/token")
@@ -265,5 +379,34 @@ describe("tokenController — bad requests", () => {
 
     expect(response.status).toBe(400);
     expect(response.body.error).toBe("invalid_request");
+  });
+
+  it("never echoes the submitted grant_type value back into the error body", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .post("/token")
+      .send({ grant_type: "<script>alert(1)</script>" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("unsupported_grant_type");
+    expect(JSON.stringify(response.body)).not.toContain("<script>");
+  });
+
+  it("marks every /token response, success or error, as not cacheable per RFC 6749 §5.1", async () => {
+    const config = buildConfig();
+    const successResponse = await request(buildApp(config))
+      .post("/token")
+      .send({
+        grant_type: "authorization_code",
+        code: await issueTestCode(config),
+        redirect_uri: REDIRECT_URI,
+        client_id: CLIENT_ID,
+        code_verifier: CODE_VERIFIER,
+      });
+    expect(successResponse.headers["cache-control"]).toBe("no-store");
+    expect(successResponse.headers["pragma"]).toBe("no-cache");
+
+    const errorResponse = await request(buildApp(config)).post("/token").send({ grant_type: "bogus" });
+    expect(errorResponse.headers["cache-control"]).toBe("no-store");
+    expect(errorResponse.headers["pragma"]).toBe("no-cache");
   });
 });
