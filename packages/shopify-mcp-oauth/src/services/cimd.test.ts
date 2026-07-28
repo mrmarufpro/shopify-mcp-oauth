@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { memoryCache } from "../adapters/memoryCache";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
+import { OAuthError } from "../errors";
 import type { CacheStore } from "../types";
 import { isCimdClientId, resolveCimdClient } from "./cimd";
 
@@ -228,6 +230,29 @@ describe("resolveCimdClient", () => {
     await expect(resolveCimdClient(config, "https://localhost/doc.json")).rejects.toThrow(/private/);
   });
 
+  it("does not put the DNS-resolved address in the client-facing error, unlike the literal-IP case", async () => {
+    // The literal-IP branch (e.g. "rejects a private-address host" above) is safe to echo back —
+    // the caller supplied that IP themselves. This is the DNS branch: the resolved address is
+    // *our* resolver's answer, which split-horizon DNS means can differ from the caller's own, so
+    // it must not appear in the response even though it's fine to log for our own diagnostics.
+    const warnSpy = vi.fn();
+    const config = buildConfig(buildFetch(CIMD_DOC), {
+      // Also supplied so the "no cache configured" warning (which every other test in this file
+      // avoids only by routing through silentLogger) doesn't land on this same spy and make the
+      // call count assertion below about the wrong warning.
+      cache: memoryCache(),
+      logger: { info: () => {}, warn: warnSpy, error: () => {} },
+    });
+    const error = await resolveCimdClient(config, "https://localhost/doc.json").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(OAuthError);
+    expect((error as OAuthError).description).toBe("CIMD URL host localhost resolves to a private/loopback address");
+    expect((error as OAuthError).description).not.toMatch(/\d+\.\d+\.\d+\.\d+/);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const loggedMessage = warnSpy.mock.calls[0]?.[0] as string;
+    expect(loggedMessage).toContain("localhost");
+    expect(loggedMessage).toMatch(/private|loopback/);
+  });
+
   describe("SSRF guard: private, loopback, and reserved address families", () => {
     // Each row is an address family the guard must reject that a naive implementation (matching
     // on textual prefixes like "10." or "fe80:") is prone to missing -- particularly the last two,
@@ -412,6 +437,86 @@ describe("resolveCimdClient", () => {
       // a regression here previously hung for the full suite timeout with no diagnostic.
       expect(sawAbort()).toBe(true);
       await assertion;
+    });
+
+    it("rejects with an OAuthError, not a raw DOMException, when a stalled body read is aborted by the timeout", async () => {
+      // Companion to the test above: same scenario (a body that stalls past TIMEOUT_MS), but
+      // pinning the *type* the controller actually branches on, not just that the message
+      // happens to contain "abort" -- the two are not the same guarantee.
+      vi.useFakeTimers();
+      const { fetchImpl, sawAbort } = buildStalledBodyFetch();
+      const config = buildConfig(fetchImpl);
+      const resolution = resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+      const caught = resolution.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(CIMD_FETCH_TIMEOUT_MS + 1);
+      expect(sawAbort()).toBe(true);
+      expect(await caught).toBeInstanceOf(OAuthError);
+    });
+
+    it("rejects with an OAuthError, not a raw AbortError, when the timeout fires before the initial fetch resolves", async () => {
+      // Same timer, different call site: the test above stalls after headers arrive (aborting a
+      // pending reader.read()); this one never gets headers at all (aborting the pending
+      // fetchImpl call itself). Both must classify as OAuthError, not a raw DOMException that
+      // falls through the controller's `instanceof OAuthError` check.
+      vi.useFakeTimers();
+      const fetchImpl = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      }) as unknown as typeof fetch;
+      const config = buildConfig(fetchImpl);
+      const resolution = resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+      const assertion = expect(resolution).rejects.toThrow(/abort/i);
+      await vi.advanceTimersByTimeAsync(CIMD_FETCH_TIMEOUT_MS + 1);
+      await assertion;
+      const error = await resolution.catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(OAuthError);
+    });
+  });
+
+  describe("classifying native network/parse failures as OAuthError", () => {
+    // authorizeController only treats an OAuthError as safe to reflect into a 400; anything else
+    // it rethrows, and asyncHandler turns that into a generic 500 (with a logged stack trace).
+    // Each of these is a native throw/rejection this file's own code does not raise directly, so
+    // without a catch here it would reach the controller as a plain Error/TypeError/DOMException
+    // and 500 instead of 400 -- exactly the regression this describe block guards against.
+
+    it("rejects with an OAuthError, not a raw TypeError, for a malformed client_id URL", async () => {
+      const config = buildConfig(buildFetch(CIMD_DOC));
+      const error = await resolveCimdClient(config, "https://[", { allowPrivateHosts: true }).catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toBeInstanceOf(OAuthError);
+      expect((error as OAuthError).description).toBe("CIMD client_id must be a valid URL");
+    });
+
+    it("rejects with an OAuthError, not a raw DNS error, when the host cannot be resolved", async () => {
+      // ".invalid" is reserved by RFC 2606 to never resolve, so this is a real (not mocked)
+      // dns.lookup failure -- no network access required and no flakiness risk.
+      const config = buildConfig(buildFetch(CIMD_DOC));
+      const error = await resolveCimdClient(config, "https://this-host-does-not-exist.invalid/doc.json").catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toBeInstanceOf(OAuthError);
+      expect((error as OAuthError).description).toBe(
+        "CIMD URL host this-host-does-not-exist.invalid could not be resolved"
+      );
+    });
+
+    it("rejects with an OAuthError, not a raw network error, when the fetch itself fails", async () => {
+      const canaryMessage = "connect ECONNREFUSED 10.1.2.3:443";
+      const fetchImpl = vi.fn().mockRejectedValue(new TypeError(canaryMessage)) as unknown as typeof fetch;
+      const config = buildConfig(fetchImpl);
+      const error = await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true }).catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toBeInstanceOf(OAuthError);
+      expect((error as OAuthError).description).toBe("CIMD document could not be fetched");
+      // Fixed text, not the caught error's message -- the raw network error must not ride along.
+      expect((error as OAuthError).description).not.toContain(canaryMessage);
+      expect((error as OAuthError).description).not.toContain("10.1.2.3");
     });
   });
 

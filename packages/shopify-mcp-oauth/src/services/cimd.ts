@@ -3,6 +3,7 @@ import net from "node:net";
 import type { ResolvedConfig } from "../config";
 import { OAuthError } from "../errors";
 import { cimdDocumentSchema, type CimdDocument } from "../schemas/cimd";
+import type { Logger } from "../types";
 import { clientToCimdDocument, upsertCimdClient } from "./clients";
 
 const MAX_BYTES = 64 * 1024;
@@ -166,23 +167,35 @@ function stripIpv6Brackets(hostname: string): string {
   return hostname;
 }
 
-async function assertPublicHost(url: URL): Promise<void> {
+async function assertPublicHost(url: URL, logger: Logger): Promise<void> {
   const host = url.hostname;
   const literal = stripIpv6Brackets(host);
   if (net.isIP(literal)) {
     if (isPrivateOrLoopbackIp(literal)) {
+      // The caller supplied this IP literally, so naming it back is not a disclosure of anything
+      // they don't already know.
       throw new OAuthError("invalid_client", `CIMD URL host ${literal} resolves to a private/loopback address`);
     }
     return;
   }
-  const addresses = await dns.lookup(host, { all: true });
-  for (const address of addresses) {
-    if (isPrivateOrLoopbackIp(address.address)) {
-      throw new OAuthError(
-        "invalid_client",
-        `CIMD URL host ${host} resolves to a private/loopback address (${address.address})`
-      );
+  try {
+    const addresses = await dns.lookup(host, { all: true });
+    for (const address of addresses) {
+      if (isPrivateOrLoopbackIp(address.address)) {
+        // Unlike the literal-IP branch above, this address came from *our* resolver, not from the
+        // caller — split-horizon DNS means it can differ from what the caller's own resolver would
+        // return, so it's internal information and must not ride in the client-facing description.
+        // The full detail (including the resolved address) still goes to the log, for our own
+        // debugging.
+        logger.warn(
+          `cimd: rejected CIMD URL host ${host}, which resolved to private/loopback address ${address.address}`
+        );
+        throw new OAuthError("invalid_client", `CIMD URL host ${host} resolves to a private/loopback address`);
+      }
     }
+  } catch (error) {
+    if (error instanceof OAuthError) throw error;
+    throw new OAuthError("invalid_client", `CIMD URL host ${host} could not be resolved`);
   }
 }
 
@@ -199,23 +212,39 @@ async function readBodyCapped(response: Response): Promise<string> {
   const decoder = new TextDecoder();
   let text = "";
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_BYTES) {
-      await reader.cancel();
-      throw new OAuthError("invalid_client", `CIMD document exceeds ${MAX_BYTES} bytes`);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_BYTES) {
+        await reader.cancel();
+        throw new OAuthError("invalid_client", `CIMD document exceeds ${MAX_BYTES} bytes`);
+      }
+      text += decoder.decode(value, { stream: true });
     }
-    text += decoder.decode(value, { stream: true });
+  } catch (error) {
+    if (error instanceof OAuthError) throw error;
+    // The timeout's AbortController is wired to this same read (see fetchCimd) -- a body that
+    // stalls past TIMEOUT_MS rejects here, not at the initial fetchImpl call. Fixed text, not the
+    // caught error's message, either way: a raw stream error could carry connection-level detail.
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new OAuthError("invalid_client", "CIMD document fetch was aborted (timed out)");
+    }
+    throw new OAuthError("invalid_client", "CIMD document could not be read");
   }
   return text + decoder.decode();
 }
 
 async function fetchCimd(config: ResolvedConfig, urlStr: string, allowPrivateHosts: boolean): Promise<CimdDocument> {
-  const url = new URL(urlStr);
+  let url: URL;
+  try {
+    url = new URL(urlStr);
+  } catch {
+    throw new OAuthError("invalid_client", "CIMD client_id must be a valid URL");
+  }
   if (url.protocol !== "https:") throw new OAuthError("invalid_client", "CIMD client_id must use HTTPS");
-  if (!allowPrivateHosts) await assertPublicHost(url);
+  if (!allowPrivateHosts) await assertPublicHost(url, config.logger);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -224,12 +253,25 @@ async function fetchCimd(config: ResolvedConfig, urlStr: string, allowPrivateHos
     // The timer must stay live through the body read, not just the initial fetch -- a server
     // that responds with headers immediately but drips the body slowly (staying under the byte
     // cap the whole time) would otherwise pin a handler and a socket indefinitely.
-    const response = await config.fetchImpl(urlStr, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-      redirect: "error",
-    });
+    let response: Response;
+    try {
+      response = await config.fetchImpl(urlStr, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+        redirect: "error",
+      });
+    } catch (error) {
+      // Fixed text, not the caught error's message: a raw network error (e.g. a connection-refused
+      // message naming an address) is server-side detail about how *we* tried to reach the
+      // client's host, not a judgment about the client's document — but classifying it as
+      // OAuthError here is still correct, because from an unauthenticated caller's point of view
+      // "we couldn't fetch your document" is exactly as safe to say as any of the throws below.
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new OAuthError("invalid_client", "CIMD document fetch was aborted (timed out)");
+      }
+      throw new OAuthError("invalid_client", "CIMD document could not be fetched");
+    }
     if (!response.ok) throw new OAuthError("invalid_client", `CIMD fetch returned ${response.status}`);
     // The byte cap is enforced here, before JSON.parse ever runs — an oversized body never
     // reaches the parser, let alone the schema, regardless of whether it would have been valid

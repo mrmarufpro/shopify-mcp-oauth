@@ -3,6 +3,7 @@ import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
+import { sha256Base64Url } from "../crypto";
 import { verifyOuterState } from "../services/stateJwt";
 import type { Logger } from "../types";
 import { authorizeController } from "./authorize";
@@ -14,10 +15,11 @@ const API_SECRET_CANARY = "test-api-secret";
 const CIMD_URL = "https://client.example/metadata.json";
 const REDIRECT_URI = "https://client.example/callback";
 const CLIENT_STATE = "client-state-value";
-// authorizeQuerySchema requires code_challenge to be exactly 43 characters (base64url(SHA-256(...))
-// with no padding) — this isn't a real SHA-256 output, but it satisfies the shape check, and no
-// test here redeems the code, so the shape is all that matters.
-const CODE_CHALLENGE = "test-code-challenge-value-12345678901234567";
+// RFC 7636 Appendix B.1 test vector (same pair used in crypto.test.ts / schemas.test.ts), with the
+// challenge derived via this package's own sha256Base64Url rather than a hand-typed placeholder —
+// so a later full-flow test (Task 21) can redeem a code using this exact verifier.
+const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const CODE_CHALLENGE = sha256Base64Url(CODE_VERIFIER);
 
 // Only the "generic 500" test needs this — it deliberately triggers asyncHandler's error log,
 // and the default console logger would print a stack trace on every full-suite run otherwise.
@@ -44,11 +46,26 @@ function buildApp(config: ResolvedConfig) {
   return app;
 }
 
+// No options object at all -- the shape a real deployment mounts the controller with. Exists
+// specifically to prove the SSRF guard is actually on by default; every other test in this file
+// uses buildApp above, which opts into the private-host escape hatch for test convenience.
+function buildAppWithDefaultCimdHosts(config: ResolvedConfig) {
+  const app = express();
+  app.get("/authorize", authorizeController(config));
+  return app;
+}
+
 // supertest/superagent types response.headers as a plain string-keyed record, so
 // noUncheckedIndexedAccess widens response.headers.location to string | undefined even though a
 // 302 always sets it — every caller here already depends on that redirect having happened.
 function redirectLocation(response: request.Response): string {
   return response.headers.location ?? "";
+}
+
+function extractOuterState(response: request.Response) {
+  const redirectParam = new URL(redirectLocation(response)).searchParams.get("redirect") ?? "";
+  const stateJwt = new URLSearchParams(redirectParam.split("?")[1]).get("state") ?? "";
+  return verifyOuterState(stateJwt, STATE_SECRET);
 }
 
 const validQuery = {
@@ -75,14 +92,24 @@ describe("authorizeController", () => {
   });
 
   it("carries the original request inside a signed state JWT", async () => {
+    // All 7 outerStatePayloadSchema fields, not a subset: codeChallengeMethod in particular is a
+    // PKCE-downgrade guard (S256-only is a binding constraint Tasks 16/17 rely on), and resource
+    // is what ties the eventual token back to this specific audience.
     const response = await request(buildApp(buildConfig())).get("/authorize").query(validQuery);
-    const redirectParam = new URL(redirectLocation(response)).searchParams.get("redirect") ?? "";
-    const stateJwt = new URLSearchParams(redirectParam.split("?")[1]).get("state") ?? "";
-    const verified = verifyOuterState(stateJwt, STATE_SECRET);
+    const verified = extractOuterState(response);
     expect(verified.clientId).toBe(CIMD_URL);
     expect(verified.redirectUri).toBe(REDIRECT_URI);
     expect(verified.clientState).toBe(CLIENT_STATE);
     expect(verified.codeChallenge).toBe(CODE_CHALLENGE);
+    expect(verified.codeChallengeMethod).toBe("S256");
+    expect(verified.resource).toBe(`${HOST}/mcp`);
+    expect(verified.nonce.length).toBeGreaterThan(0);
+  });
+
+  it("signs a fresh nonce on every authorize call", async () => {
+    const firstResponse = await request(buildApp(buildConfig())).get("/authorize").query(validQuery);
+    const secondResponse = await request(buildApp(buildConfig())).get("/authorize").query(validQuery);
+    expect(extractOuterState(firstResponse).nonce).not.toBe(extractOuterState(secondResponse).nonce);
   });
 
   it("rejects a redirect_uri the client did not register", async () => {
@@ -205,5 +232,48 @@ describe("authorizeController", () => {
       error_description: "redirect_uris: CIMD document missing redirect_uris[]",
     });
     expect(response.status).toBe(400);
+  });
+
+  it("returns 400, not 500, when the CIMD host is unreachable, and does not log a stack trace", async () => {
+    const errorSpy = vi.fn();
+    const config = buildConfig({
+      logger: { info: () => {}, warn: () => {}, error: errorSpy },
+      fetchImpl: vi.fn().mockRejectedValue(new TypeError("fetch failed")) as unknown as typeof fetch,
+    });
+    const response = await request(buildApp(config)).get("/authorize").query(validQuery);
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_client");
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns 400, not 500, for a malformed client_id URL, and does not log a stack trace", async () => {
+    const errorSpy = vi.fn();
+    const config = buildConfig({ logger: { info: () => {}, warn: () => {}, error: errorSpy } });
+    const response = await request(buildApp(config))
+      .get("/authorize")
+      .query({ ...validQuery, client_id: "https://[" });
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_client");
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects a private-host CIMD client_id when allowPrivateCimdHosts is not set (the production default)", async () => {
+    // buildAppWithDefaultCimdHosts, not buildApp -- proving the SSRF guard is actually on unless a
+    // caller opts out, not merely that it CAN reject a private host when told to.
+    const response = await request(buildAppWithDefaultCimdHosts(buildConfig()))
+      .get("/authorize")
+      .query({ ...validQuery, client_id: "https://127.0.0.1/metadata.json" });
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_client");
+  });
+
+  it("never embeds a secret in the bounce URL, and pins the picker's shape", async () => {
+    const response = await request(buildApp(buildConfig())).get("/authorize").query(validQuery);
+    const location = redirectLocation(response);
+    expect(location).not.toContain(API_SECRET_CANARY);
+    expect(location).not.toContain(STATE_SECRET);
+    const shopPickerUrl = new URL(location);
+    expect(shopPickerUrl.host).toBe("admin.shopify.com");
+    expect(shopPickerUrl.searchParams.get("no_redirect")).toBe("true");
   });
 });
