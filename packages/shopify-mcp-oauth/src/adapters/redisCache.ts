@@ -1,10 +1,17 @@
 import type { CacheStore } from "../types";
 
+/**
+ * Shaped after node-redis v4: `getDel` casing, `set(key, value, { EX })`. `getDel` is required,
+ * not optional — this adapter needs node-redis ≥4 talking to Redis ≥6.2 (the GETDEL command it
+ * wraps), because a get-then-del fallback is not atomic: two concurrent redemptions of one
+ * authorization code could both read it before either delete lands, making the code replayable.
+ * Requiring it here narrows compatibility no further than this interface already does.
+ */
 export interface RedisLikeClient {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, opts: { EX: number }): Promise<unknown>;
   del(key: string): Promise<unknown>;
-  getDel?(key: string): Promise<string | null>;
+  getDel(key: string): Promise<string | null>;
 }
 
 export function redisCache(client: RedisLikeClient): CacheStore {
@@ -19,14 +26,7 @@ export function redisCache(client: RedisLikeClient): CacheStore {
       await client.del(key);
     },
     async getdel(key) {
-      // This branches on client capability, not server version: a client that exposes getDel
-      // against a pre-6.2 Redis surfaces the server's error rather than falling back. The
-      // fallback itself is not atomic — two concurrent redemptions of one authorization code
-      // could both read it before either delete lands.
-      if (client.getDel) return client.getDel(key);
-      const value = await client.get(key);
-      await client.del(key);
-      return value;
+      return client.getDel(key);
     },
   };
 }

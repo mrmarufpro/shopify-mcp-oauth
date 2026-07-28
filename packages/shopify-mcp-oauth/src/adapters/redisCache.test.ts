@@ -3,13 +3,13 @@ import { runCacheContractTests } from "../testing/cacheContract";
 import { redisCache, type RedisLikeClient } from "./redisCache";
 
 const KEY = "mcp:oauth:code:abc";
-const CONCURRENT_REDEMPTIONS = 5;
 
 function buildFakeRedis(overrides: Partial<RedisLikeClient> = {}): RedisLikeClient {
   return {
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue("OK"),
     del: vi.fn().mockResolvedValue(1),
+    getDel: vi.fn().mockResolvedValue(null),
     ...overrides,
   };
 }
@@ -62,28 +62,26 @@ describe("redisCache", () => {
     expect(await redisCache(client).get(KEY)).toBe("stored-value");
   });
 
-  it("uses getDel when the client supports it", async () => {
+  it("delegates getdel to the client's native getDel", async () => {
     const getDel = vi.fn().mockResolvedValue("stored-value");
     const client = buildFakeRedis({ getDel });
     expect(await redisCache(client).getdel(KEY)).toBe("stored-value");
     expect(getDel).toHaveBeenCalledWith(KEY);
   });
-
-  it("falls back to get then del when getDel is absent", async () => {
-    const client = buildFakeRedis({ get: vi.fn().mockResolvedValue("stored-value") });
-    expect(await redisCache(client).getdel(KEY)).toBe("stored-value");
-    expect(client.del).toHaveBeenCalledWith(KEY);
-  });
-
-  // Documents a known, currently-accepted gap rather than a guarantee: when the underlying
-  // Redis client doesn't expose a native getDel, the get+del fallback is two round trips with
-  // no lock between them, so concurrent callers can all read before any of them deletes. Every
-  // caller here "wins" — the exact failure mode CacheStore.getdel's atomicity contract exists
-  // to rule out. Flagged in the Task 13 review; left as-is pending a decision on how to close it.
-  it("KNOWN LIMITATION: the get+del fallback is not exclusive under concurrent calls", async () => {
-    const client = buildFakeRedis({ get: vi.fn().mockResolvedValue("stored-value") });
-    const cache = redisCache(client);
-    const results = await Promise.all(Array.from({ length: CONCURRENT_REDEMPTIONS }, () => cache.getdel(KEY)));
-    expect(results.filter((result) => result !== null)).toHaveLength(CONCURRENT_REDEMPTIONS);
-  });
 });
+
+// Type-only regression guard: a client without a native getDel must not satisfy RedisLikeClient —
+// the get+del fallback that optionality used to permit was not atomic, making a redeemed
+// authorization code replayable under concurrent requests. Declared but never called; exists
+// solely for `pnpm typecheck` to catch a regression if getDel is ever made optional again.
+function clientWithoutGetDelIsRejected(): void {
+  const clientMissingGetDel = {
+    get: async () => null,
+    set: async () => undefined,
+    del: async () => undefined,
+  };
+  // @ts-expect-error getDel is required — a client without it must not satisfy RedisLikeClient
+  const client: RedisLikeClient = clientMissingGetDel;
+  void client;
+}
+void clientWithoutGetDelIsRejected;
