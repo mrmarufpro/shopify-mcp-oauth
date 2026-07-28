@@ -6,12 +6,17 @@ import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
 const HOST = "https://mcp.example.com";
 const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
 
+// Silent by default so the no-cache warning does not spray stderr across every case that isn't
+// about it. The two tests that assert the warning pass their own spy logger.
+const silentLogger = { info: () => {}, warn: () => {}, error: () => {} };
+
 function buildConfig(overrides: Partial<ShopifyMcpOAuthConfig> = {}): ShopifyMcpOAuthConfig {
   return {
     host: HOST,
     shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
     stateSecret: STATE_SECRET,
     storage: memoryStorage(),
+    logger: silentLogger,
     ...overrides,
   };
 }
