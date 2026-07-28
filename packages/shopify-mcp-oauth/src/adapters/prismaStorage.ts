@@ -97,6 +97,11 @@ function buildCore(prisma: PrismaLikeClient): Omit<OAuthStorage, "findShopByDoma
       return row ? toToken(row) : null;
     },
 
+    async findTokenByAccessHashIgnoringExpiry(hash) {
+      const row = await prisma.mcpOAuthToken.findFirst({ where: { accessTokenHash: hash, revokedAt: null } });
+      return row ? toToken(row) : null;
+    },
+
     async findTokenByRefreshHash(hash) {
       const row = await prisma.mcpOAuthToken.findFirst({
         where: { refreshTokenHash: hash, revokedAt: null, refreshTokenExpiresAt: { gt: new Date() } },

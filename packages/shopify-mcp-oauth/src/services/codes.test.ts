@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
+import { sha256Hex } from "../crypto";
 import { consumeCode, issueCode, type CodeRecord } from "./codes";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const DEMO_SHOP_ID = "shop_1";
 const CLIENT_ID = "test-client-id";
 const REDIRECT_URI = "https://client.example/callback";
@@ -34,8 +35,9 @@ function buildCodeRecord(overrides: Partial<CodeRecord> = {}): CodeRecord {
 describe("authorization codes", () => {
   it("round-trips the record", async () => {
     const config = buildConfig();
-    const { code } = await issueCode(config, buildCodeRecord());
-    expect(await consumeCode(config, code)).toMatchObject({ clientId: CLIENT_ID, redirectUri: REDIRECT_URI });
+    const record = buildCodeRecord();
+    const { code } = await issueCode(config, record);
+    expect(await consumeCode(config, code)).toEqual(record);
   });
 
   it("cannot be consumed twice", async () => {
@@ -59,5 +61,13 @@ describe("authorization codes", () => {
     const config = buildConfig();
     const { code } = await issueCode(config, buildCodeRecord());
     expect(await config.cache.get(`mcp:oauth:code:${code}`)).toBeNull();
+    expect(await config.cache.get(`mcp:oauth:code:${sha256Hex(code)}`)).not.toBeNull();
+  });
+
+  it("returns null instead of throwing for a corrupted cache entry", async () => {
+    const config = buildConfig();
+    const code = "hand-crafted-code";
+    await config.cache.set(`mcp:oauth:code:${sha256Hex(code)}`, "{not valid json", 60);
+    await expect(consumeCode(config, code)).resolves.toBeNull();
   });
 });

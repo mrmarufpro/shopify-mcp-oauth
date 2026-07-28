@@ -73,7 +73,9 @@ export async function rotateRefresh(
 }
 
 export async function revokeByAccessToken(config: ResolvedConfig, token: string): Promise<void> {
-  const existing = await config.storage.findTokenByAccessHash(sha256Hex(token));
+  // Ignores expiry deliberately: an access token that has expired since it was issued still
+  // names a real grant, and revocation must be able to kill that grant's refresh token too.
+  const existing = await config.storage.findTokenByAccessHashIgnoringExpiry(sha256Hex(token));
   if (existing) await config.storage.revokeToken(existing.id);
 }
 

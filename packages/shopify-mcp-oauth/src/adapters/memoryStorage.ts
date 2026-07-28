@@ -78,6 +78,13 @@ export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
       return null;
     },
 
+    async findTokenByAccessHashIgnoringExpiry(hash) {
+      for (const token of tokens.values()) {
+        if (token.accessTokenHash === hash && token.revokedAt === null) return cloneToken(token);
+      }
+      return null;
+    },
+
     async findTokenByRefreshHash(hash) {
       for (const token of tokens.values()) {
         if (token.refreshTokenHash !== hash) continue;

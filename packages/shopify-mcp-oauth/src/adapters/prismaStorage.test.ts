@@ -121,6 +121,18 @@ describe("prismaStorage", () => {
     expect(where.accessTokenExpiresAt.gt).toBeInstanceOf(Date);
   });
 
+  it("ignores expiry but still filters revoked rows in the revocation access-hash lookup", async () => {
+    const findFirst = vi.fn().mockResolvedValue(null);
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst, create: vi.fn(), updateMany: vi.fn() },
+    });
+    await prismaStorage(prisma).findTokenByAccessHashIgnoringExpiry("some-hash");
+    const where = findFirst.mock.calls[0]?.[0]?.where;
+    expect(where.accessTokenHash).toBe("some-hash");
+    expect(where.revokedAt).toBeNull();
+    expect(where.accessTokenExpiresAt).toBeUndefined();
+  });
+
   it("filters expired and revoked rows in the refresh-hash lookup", async () => {
     const findFirst = vi.fn().mockResolvedValue(null);
     const prisma = buildPrisma({

@@ -91,6 +91,29 @@ export function runStorageContractTests(
       expect(await storage.findTokenByAccessHash("revoke-me")).toBeNull();
     });
 
+    it("findTokenByAccessHashIgnoringExpiry finds an expired-but-unrevoked token", async () => {
+      await storage.createToken(
+        buildToken(opts.seedShop, {
+          accessTokenHash: "expired-but-revocable-hash",
+          accessTokenExpiresAt: new Date(Date.now() - 1000),
+        })
+      );
+      const found = await storage.findTokenByAccessHashIgnoringExpiry("expired-but-revocable-hash");
+      expect(found?.accessTokenHash).toBe("expired-but-revocable-hash");
+    });
+
+    it("findTokenByAccessHashIgnoringExpiry does not return a revoked token", async () => {
+      const token = await storage.createToken(
+        buildToken(opts.seedShop, { accessTokenHash: "revoke-me-ignoring-expiry" })
+      );
+      await storage.revokeToken(token.id);
+      expect(await storage.findTokenByAccessHashIgnoringExpiry("revoke-me-ignoring-expiry")).toBeNull();
+    });
+
+    it("findTokenByAccessHashIgnoringExpiry returns null for a hash that was never stored", async () => {
+      expect(await storage.findTokenByAccessHashIgnoringExpiry("never-stored-access-hash")).toBeNull();
+    });
+
     it("finds a token by its refresh hash", async () => {
       await storage.createToken(
         buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup", clientId: CONTRACT_CLIENT_ID })
