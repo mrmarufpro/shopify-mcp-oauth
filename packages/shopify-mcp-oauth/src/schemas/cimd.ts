@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { capOversizedArray } from "./capOversizedArray";
 
 // This document is fetched from a URL the client controls — hostile input. Bound its worst case
 // here rather than depending on a fetch layer's byte cap owned by a different task: that cap could
@@ -8,17 +9,6 @@ export const CIMD_MAX_URI_LENGTH = 2048;
 export const CIMD_MAX_GRANT_TYPES = 10;
 export const CIMD_MAX_RESPONSE_TYPES = 10;
 export const CIMD_MAX_CLIENT_NAME_LENGTH = 200;
-
-// zod validates every array element's shape before any .max()/.refine() check runs, so a bounded
-// refine alone still pays O(n) to parse an oversized array's elements. Replace an over-cap array
-// with a fixed-size placeholder before it reaches the real schema, so a hostile array of any size
-// costs the same to reject as one just over the limit — the count check below still fires on it.
-function capOversizedArray(value: unknown, cap: number): unknown {
-  if (Array.isArray(value) && value.length > cap) {
-    return Array.from({ length: cap + 1 }, () => "");
-  }
-  return value;
-}
 
 export const cimdDocumentSchema = z.object({
   client_id: z.string().max(CIMD_MAX_URI_LENGTH, "client_id is too long").optional(),
@@ -30,17 +20,26 @@ export const cimdDocumentSchema = z.object({
       .min(1, "CIMD document missing redirect_uris[]")
       .max(CIMD_MAX_REDIRECT_URIS, "CIMD document has too many redirect_uris")
   ),
+  // .optional() wraps the whole preprocess+schema pipeline rather than being baked into the inner
+  // schema: ZodOptional short-circuits on an absent key before ever invoking the inner type, so
+  // capOversizedArray never runs at all when the field isn't sent — not just a no-op on undefined.
   // The document lists what the client supports; we only require the grant we drive.
   grant_types: z
-    .array(z.string())
-    .max(CIMD_MAX_GRANT_TYPES, "CIMD document has too many grant_types")
-    .refine((types) => types.length > CIMD_MAX_GRANT_TYPES || types.includes("authorization_code"), {
-      message: "CIMD grant_types must include 'authorization_code'",
-    })
+    .preprocess(
+      (value) => capOversizedArray(value, CIMD_MAX_GRANT_TYPES),
+      z
+        .array(z.string())
+        .max(CIMD_MAX_GRANT_TYPES, "CIMD document has too many grant_types")
+        .refine((types) => types.length > CIMD_MAX_GRANT_TYPES || types.includes("authorization_code"), {
+          message: "CIMD grant_types must include 'authorization_code'",
+        })
+    )
     .optional(),
   response_types: z
-    .array(z.string())
-    .max(CIMD_MAX_RESPONSE_TYPES, "CIMD document has too many response_types")
+    .preprocess(
+      (value) => capOversizedArray(value, CIMD_MAX_RESPONSE_TYPES),
+      z.array(z.string()).max(CIMD_MAX_RESPONSE_TYPES, "CIMD document has too many response_types")
+    )
     .optional(),
   token_endpoint_auth_method: z
     .literal("none", { message: "CIMD token_endpoint_auth_method must be 'none'" })

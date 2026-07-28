@@ -211,6 +211,16 @@ describe("registerRequestSchema", () => {
     ).toBe(false);
   });
 
+  it("treats an absent grant_types as valid and leaves it undefined", () => {
+    const result = registerRequestSchema.parse({ redirect_uris: [REDIRECT_URI] });
+    expect(result.grant_types).toBeUndefined();
+  });
+
+  it("treats an absent response_types as valid and leaves it undefined", () => {
+    const result = registerRequestSchema.parse({ redirect_uris: [REDIRECT_URI] });
+    expect(result.response_types).toBeUndefined();
+  });
+
   it("accepts a logo_uri at the length cap", () => {
     const logoUriAtCap = buildUriOfExactLength(REGISTER_MAX_URI_LENGTH);
     expect(registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], logo_uri: logoUriAtCap }).success).toBe(
@@ -374,6 +384,32 @@ describe("cimdDocumentSchema", () => {
     expect(
       cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], response_types: responseTypesOverCap }).success
     ).toBe(false);
+  });
+
+  it("treats an absent grant_types as valid and leaves it undefined", () => {
+    const result = cimdDocumentSchema.parse({ redirect_uris: [REDIRECT_URI] });
+    expect(result.grant_types).toBeUndefined();
+  });
+
+  it("treats an absent response_types as valid and leaves it undefined", () => {
+    const result = cimdDocumentSchema.parse({ redirect_uris: [REDIRECT_URI] });
+    expect(result.response_types).toBeUndefined();
+  });
+
+  it("reports only the count issue when grant_types is both over cap and missing authorization_code", () => {
+    const grantTypesOverCapWithoutAuthCode = Array.from(
+      { length: CIMD_MAX_GRANT_TYPES + 1 },
+      (_, index) => `grant-${index}`
+    );
+    const result = cimdDocumentSchema.safeParse({
+      redirect_uris: [REDIRECT_URI],
+      grant_types: grantTypesOverCapWithoutAuthCode,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const messages = result.error.issues.map((issue) => issue.message);
+      expect(messages).toEqual(["CIMD document has too many grant_types"]);
+    }
   });
 
   it("accepts a logo_uri at the length cap", () => {
