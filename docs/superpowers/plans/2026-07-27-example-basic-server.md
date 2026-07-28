@@ -2376,6 +2376,12 @@ export function createApp(deps: AppDeps): Express {
   app.get("/mcp", methodNotAllowed);
   app.delete("/mcp", methodNotAllowed);
 
+  // Must be the LAST app.use(...) call, after every body-parser and route above (oauth.router
+  // included) -- a body-parser's SyntaxError on malformed JSON is thrown before Express ever
+  // reaches oauth.router, so an error handler mounted inside that router can't catch it. Only an
+  // error handler registered here, at this app's own outermost level, sees it.
+  app.use(oauth.errorHandler);
+
   return app;
 }
 ```
