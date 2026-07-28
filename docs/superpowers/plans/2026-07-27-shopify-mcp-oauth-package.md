@@ -357,7 +357,7 @@ docs/
     "jsonwebtoken": "^9.0.2"
   },
   "peerDependencies": {
-    "express": ">=4.18",
+    "express": ">=5",
     "zod": ">=3.23"
   },
   "devDependencies": {
@@ -1554,7 +1554,7 @@ Task 1 built the index alone because this file did not exist yet.
 
 ```json
   "peerDependencies": {
-    "express": ">=4.18",
+    "express": ">=5",
     "zod": ">=3.23",
     "vitest": ">=2.0"
   },
@@ -5674,6 +5674,7 @@ import { authorizeQuerySchema } from "../schemas/authorize";
 import { isCimdClientId, resolveCimdClient } from "../services/cimd";
 import { redirectUriMatches } from "../services/redirectUri";
 import { signOuterState } from "../services/stateJwt";
+import { asyncHandler } from "./asyncHandler";
 
 const STATE_TTL_SECONDS = 600;
 
@@ -5691,7 +5692,7 @@ export function authorizeController(
   config: ResolvedConfig,
   options: AuthorizeControllerOptions = {}
 ): RequestHandler {
-  return async (req, res) => {
+  return asyncHandler(config.logger, async (req, res) => {
     const parsed = authorizeQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       return bad(res, parsed.error.issues[0]?.message ?? "invalid query");
@@ -5751,7 +5752,7 @@ export function authorizeController(
     shopPicker.searchParams.set("redirect", `/oauth/authorize?${shopifyQuery.toString()}`);
     shopPicker.searchParams.set("no_redirect", "true");
     res.redirect(shopPicker.toString());
-  };
+  });
 }
 ```
 
@@ -6064,9 +6065,10 @@ import type { ResolvedConfig } from "../config";
 import { shopifyCallbackQuerySchema } from "../schemas/shopifyCallback";
 import { issueCode } from "../services/codes";
 import { verifyOuterState, type VerifiedOuterState } from "../services/stateJwt";
+import { asyncHandler } from "./asyncHandler";
 
 export function shopifyCallbackController(config: ResolvedConfig): RequestHandler {
-  return async (req, res) => {
+  return asyncHandler(config.logger, async (req, res) => {
     const parsed = shopifyCallbackQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       res
@@ -6145,7 +6147,7 @@ export function shopifyCallbackController(config: ResolvedConfig): RequestHandle
     target.searchParams.set("code", code);
     target.searchParams.set("state", state.clientState);
     res.redirect(target.toString());
-  };
+  });
 }
 ```
 
@@ -6381,6 +6383,7 @@ import { serializeTokenBundle } from "../serializers/token";
 import { consumeCode } from "../services/codes";
 import { verifyS256 } from "../services/pkce";
 import { issueTokens, rotateRefresh } from "../services/tokens";
+import { asyncHandler } from "./asyncHandler";
 
 function bad(res: Response, code: string, description: string): void {
   res.status(400).json({ error: code, error_description: description });
@@ -6420,7 +6423,7 @@ async function handleRefreshToken(
 }
 
 export function tokenController(config: ResolvedConfig): RequestHandler {
-  return async (req, res) => {
+  return asyncHandler(config.logger, async (req, res) => {
     const body = req.body;
     if (!body || typeof body !== "object") return bad(res, "invalid_request", "body required");
 
@@ -6438,7 +6441,7 @@ export function tokenController(config: ResolvedConfig): RequestHandler {
       return handleAuthorizationCode(config, parsed.data, res);
     }
     return handleRefreshToken(config, parsed.data, res);
-  };
+  });
 }
 ```
 
