@@ -1,0 +1,72 @@
+import type { RequestHandler, Response } from "express";
+import type { ResolvedConfig } from "../config";
+import { tokenRequestSchema, type AuthorizationCodeGrant, type RefreshTokenGrant } from "../schemas/token";
+import { serializeTokenBundle } from "../serializers/token";
+import { consumeCode } from "../services/codes";
+import { verifyS256 } from "../services/pkce";
+import { redirectUriMatches } from "../services/redirectUri";
+import { issueTokens, rotateRefresh } from "../services/tokens";
+import { asyncHandler } from "./asyncHandler";
+
+function bad(res: Response, code: string, description: string): void {
+  res.status(400).json({ error: code, error_description: description });
+}
+
+async function handleAuthorizationCode(
+  config: ResolvedConfig,
+  grant: AuthorizationCodeGrant,
+  res: Response
+): Promise<void> {
+  // Consumed first: a failed attempt still burns the code, so a wrong verifier gets no retry.
+  const record = await consumeCode(config, grant.code);
+  if (!record) return bad(res, "invalid_grant", "code unknown, expired, or already used");
+  if (record.clientId !== grant.client_id) return bad(res, "invalid_grant", "client_id mismatch");
+  if (!redirectUriMatches(record.redirectUri, grant.redirect_uri)) {
+    return bad(res, "invalid_grant", "redirect_uri mismatch");
+  }
+  // The record's method isn't a literal type at rest, so a stored "plain" (or anything but
+  // "S256") is rejected outright rather than falling through to a hash comparison that would
+  // just fail closed today but silently open the door if a "plain" branch is ever added later.
+  if (record.codeChallengeMethod !== "S256") {
+    return bad(res, "invalid_grant", "unsupported code_challenge_method");
+  }
+  if (!verifyS256(grant.code_verifier, record.codeChallenge)) {
+    return bad(res, "invalid_grant", "PKCE verifier failed");
+  }
+
+  const tokens = await issueTokens(config, {
+    shopId: record.shopId,
+    shopDomain: record.shopDomain,
+    clientId: record.clientId,
+    resource: record.resource,
+  });
+  res.status(200).json(serializeTokenBundle(tokens));
+}
+
+async function handleRefreshToken(config: ResolvedConfig, grant: RefreshTokenGrant, res: Response): Promise<void> {
+  const rotated = await rotateRefresh(config, grant.refresh_token, grant.client_id);
+  if (!rotated) return bad(res, "invalid_grant", "refresh_token unknown, expired, or already rotated");
+  res.status(200).json(serializeTokenBundle(rotated));
+}
+
+export function tokenController(config: ResolvedConfig): RequestHandler {
+  return asyncHandler(config.logger, async (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== "object") return bad(res, "invalid_request", "body required");
+
+    const parsed = tokenRequestSchema.safeParse(body);
+    if (!parsed.success) {
+      const grantType = (body as Record<string, unknown>).grant_type;
+      const known = grantType === "authorization_code" || grantType === "refresh_token";
+      if (!known) {
+        return bad(res, "unsupported_grant_type", `grant_type ${String(grantType ?? "(none)")} not supported`);
+      }
+      return bad(res, "invalid_request", parsed.error.issues[0]?.message ?? "invalid request");
+    }
+
+    if (parsed.data.grant_type === "authorization_code") {
+      return handleAuthorizationCode(config, parsed.data, res);
+    }
+    return handleRefreshToken(config, parsed.data, res);
+  });
+}
