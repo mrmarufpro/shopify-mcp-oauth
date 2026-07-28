@@ -304,6 +304,18 @@ coverage/
 packages/create-shopify-mcp/templates/
 ```
 
+`.prettierignore` — without this, the `prettier --check .` lint gate fails on the lockfile,
+generated output, and every markdown file in the repo:
+
+```
+node_modules/
+dist/
+coverage/
+pnpm-lock.yaml
+docs/
+.superpowers/
+```
+
 `LICENSE`: the standard MIT text, copyright the repository owner, year 2026.
 
 - [ ] **Step 4: Create the package files**
@@ -378,7 +390,7 @@ packages/create-shopify-mcp/templates/
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: { index: "src/index.ts", testing: "src/testing/storageContract.ts" },
+  entry: { index: "src/index.ts" },
   format: ["esm", "cjs"],
   dts: true,
   clean: true,
@@ -577,22 +589,24 @@ describe("safeEqual", () => {
 
 ```ts
 import { describe, expect, it } from "vitest";
-import { sha256Base64Url } from "../crypto";
 import { verifyS256 } from "./pkce";
 
-const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+// RFC 7636 Appendix B.1 test vector. Pinning both halves keeps this suite from
+// checking sha256Base64Url against itself.
+const RFC7636_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const RFC7636_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
 describe("verifyS256", () => {
   it("accepts the verifier that produced the challenge", () => {
-    expect(verifyS256(VERIFIER, sha256Base64Url(VERIFIER))).toBe(true);
+    expect(verifyS256(RFC7636_VERIFIER, RFC7636_CHALLENGE)).toBe(true);
   });
 
   it("rejects a different verifier", () => {
-    expect(verifyS256("not-the-verifier", sha256Base64Url(VERIFIER))).toBe(false);
+    expect(verifyS256("not-the-verifier", RFC7636_CHALLENGE)).toBe(false);
   });
 
   it("rejects an empty verifier", () => {
-    expect(verifyS256("", sha256Base64Url(VERIFIER))).toBe(false);
+    expect(verifyS256("", RFC7636_CHALLENGE)).toBe(false);
   });
 });
 ```
@@ -704,6 +718,10 @@ describe("validateRedirectUri", () => {
   it("rejects unparseable input", () => {
     expect(validateRedirectUri("not a url")).toMatch(/valid URL/);
   });
+
+  it("rejects a URI carrying userinfo", () => {
+    expect(validateRedirectUri("https://attacker@client.example/callback")).toMatch(/userinfo/);
+  });
 });
 
 describe("redirectUriMatches", () => {
@@ -726,6 +744,18 @@ describe("redirectUriMatches", () => {
   it("rejects a different host", () => {
     expect(redirectUriMatches(HTTPS_CALLBACK, "https://attacker.example/callback")).toBe(false);
   });
+
+  it("rejects a userinfo prefix that impersonates the registered host", () => {
+    expect(redirectUriMatches(HTTPS_CALLBACK, "https://attacker@client.example/callback")).toBe(false);
+  });
+
+  it("rejects a host that merely ends with the registered host", () => {
+    expect(redirectUriMatches(HTTPS_CALLBACK, "https://client.example.attacker.example/callback")).toBe(false);
+  });
+
+  it("allows any port on a loopback host outside the three canonical literals", () => {
+    expect(redirectUriMatches("http://127.0.0.5:1234/callback", "http://127.0.0.5:55555/callback")).toBe(true);
+  });
 });
 ```
 
@@ -744,8 +774,6 @@ function isLoopbackHost(hostname: string): boolean {
   if (hostname === "localhost" || hostname === "[::1]") return true;
   return /^127(?:\.\d{1,3}){3}$/.test(hostname);
 }
-
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 // RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
 const SCHEME_SHAPE = /^[a-z][a-z0-9+\-.]*$/;
@@ -782,6 +810,11 @@ export function validateRedirectUri(uri: string): string | null {
   } catch {
     return "redirect_uri must be a valid URL";
   }
+  // A userinfo component turns https://client.example@attacker.example/cb into a URL that
+  // reads as the registered host but resolves to the attacker's. Reject it outright.
+  if (url.username !== "" || url.password !== "") {
+    return "redirect_uri must not contain userinfo";
+  }
   const scheme = url.protocol.replace(/:$/, "").toLowerCase();
   if (DANGEROUS_SCHEMES.has(scheme)) {
     return `${url.protocol} redirect_uris are not allowed`;
@@ -813,7 +846,10 @@ export function redirectUriMatches(registered: string, requested: string): boole
   if (left.hostname !== right.hostname) return false;
   if (left.pathname !== right.pathname) return false;
   if (left.search !== right.search) return false;
-  if (!LOOPBACK_HOSTS.has(left.hostname)) return left.port === right.port;
+  // Compared explicitly: without this, a registered https://client.example/cb matches a
+  // requested https://attacker@client.example/cb, because every other component is equal.
+  if (left.username !== right.username || left.password !== right.password) return false;
+  if (!isLoopbackHost(left.hostname)) return left.port === right.port;
   return true;
 }
 ```
