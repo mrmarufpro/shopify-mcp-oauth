@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { authorizeQuerySchema } from "./authorize";
-import { CIMD_MAX_REDIRECT_URIS, cimdDocumentSchema } from "./cimd";
-import { REGISTER_MAX_REDIRECT_URIS, registerRequestSchema } from "./register";
+import {
+  CIMD_MAX_CLIENT_NAME_LENGTH,
+  CIMD_MAX_GRANT_TYPES,
+  CIMD_MAX_REDIRECT_URIS,
+  CIMD_MAX_RESPONSE_TYPES,
+  CIMD_MAX_URI_LENGTH,
+  cimdDocumentSchema,
+} from "./cimd";
+import {
+  REGISTER_MAX_CLIENT_NAME_LENGTH,
+  REGISTER_MAX_GRANT_TYPES,
+  REGISTER_MAX_REDIRECT_URIS,
+  REGISTER_MAX_RESPONSE_TYPES,
+  REGISTER_MAX_URI_LENGTH,
+  registerRequestSchema,
+} from "./register";
 import { revokeRequestSchema } from "./revoke";
 import { shopifyCallbackQuerySchema } from "./shopifyCallback";
 import { tokenRequestSchema } from "./token";
@@ -13,6 +27,11 @@ const DEMO_SHOP = "demo.myshopify.com";
 // so the length- and charset-sensitive fields below accept a genuinely conformant client.
 const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CODE_CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+function buildUriOfExactLength(length: number): string {
+  const prefix = "https://client.example/";
+  return (prefix + "a".repeat(length - prefix.length)).slice(0, length);
+}
 
 const validAuthorizeQuery = {
   response_type: "code",
@@ -139,6 +158,72 @@ describe("registerRequestSchema", () => {
     );
     expect(registerRequestSchema.safeParse({ redirect_uris: redirectUrisOverCap }).success).toBe(false);
   });
+
+  it("accepts a redirect_uris entry at the length cap", () => {
+    const uriAtLengthCap = buildUriOfExactLength(REGISTER_MAX_URI_LENGTH);
+    expect(registerRequestSchema.safeParse({ redirect_uris: [uriAtLengthCap] }).success).toBe(true);
+  });
+
+  it("rejects a redirect_uris entry exceeding the length cap", () => {
+    const uriOverLengthCap = buildUriOfExactLength(REGISTER_MAX_URI_LENGTH + 1);
+    expect(registerRequestSchema.safeParse({ redirect_uris: [uriOverLengthCap] }).success).toBe(false);
+  });
+
+  it("accepts a client_name at the length cap", () => {
+    const clientNameAtCap = "a".repeat(REGISTER_MAX_CLIENT_NAME_LENGTH);
+    expect(
+      registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], client_name: clientNameAtCap }).success
+    ).toBe(true);
+  });
+
+  it("rejects a client_name exceeding the length cap", () => {
+    const clientNameOverCap = "a".repeat(REGISTER_MAX_CLIENT_NAME_LENGTH + 1);
+    expect(
+      registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], client_name: clientNameOverCap }).success
+    ).toBe(false);
+  });
+
+  it("accepts grant_types at the cap", () => {
+    const grantTypesAtCap = Array.from({ length: REGISTER_MAX_GRANT_TYPES }, (_, index) => `grant-${index}`);
+    expect(
+      registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], grant_types: grantTypesAtCap }).success
+    ).toBe(true);
+  });
+
+  it("rejects grant_types exceeding the cap", () => {
+    const grantTypesOverCap = Array.from({ length: REGISTER_MAX_GRANT_TYPES + 1 }, (_, index) => `grant-${index}`);
+    expect(
+      registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], grant_types: grantTypesOverCap }).success
+    ).toBe(false);
+  });
+
+  it("accepts response_types at the cap", () => {
+    const responseTypesAtCap = Array.from({ length: REGISTER_MAX_RESPONSE_TYPES }, (_, index) => `type-${index}`);
+    expect(
+      registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], response_types: responseTypesAtCap }).success
+    ).toBe(true);
+  });
+
+  it("rejects response_types exceeding the cap", () => {
+    const responseTypesOverCap = Array.from({ length: REGISTER_MAX_RESPONSE_TYPES + 1 }, (_, index) => `type-${index}`);
+    expect(
+      registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], response_types: responseTypesOverCap }).success
+    ).toBe(false);
+  });
+
+  it("accepts a logo_uri at the length cap", () => {
+    const logoUriAtCap = buildUriOfExactLength(REGISTER_MAX_URI_LENGTH);
+    expect(registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], logo_uri: logoUriAtCap }).success).toBe(
+      true
+    );
+  });
+
+  it("rejects a logo_uri exceeding the length cap", () => {
+    const logoUriOverCap = buildUriOfExactLength(REGISTER_MAX_URI_LENGTH + 1);
+    expect(registerRequestSchema.safeParse({ redirect_uris: [REDIRECT_URI], logo_uri: logoUriOverCap }).success).toBe(
+      false
+    );
+  });
 });
 
 describe("shopifyCallbackQuerySchema", () => {
@@ -176,7 +261,19 @@ describe("revokeRequestSchema", () => {
     if (!result.success) {
       const message = result.error.issues.map((issue) => issue.message).join(" ");
       expect(message).not.toContain(TOKEN_TYPE_HINT_VALUE);
+      // The message alone isn't enough — zod's own enum issue carries `received` regardless of a
+      // custom message, so any consumer that serializes the whole issue (logging, an API error
+      // body) would still leak the value. Assert it's absent from the full serialized issue too.
+      expect(JSON.stringify(result.error.issues)).not.toContain(TOKEN_TYPE_HINT_VALUE);
     }
+  });
+
+  it("preserves the narrowed token_type_hint literal type", () => {
+    const result = revokeRequestSchema.parse({ token: "the-token", token_type_hint: "refresh_token" });
+    // A type error here (not just a runtime one) would mean the pipe widened token_type_hint back
+    // to a plain string, losing the exhaustiveness a controller relies on when comparing against it.
+    const hint: "access_token" | "refresh_token" | undefined = result.token_type_hint;
+    expect(hint).toBe("refresh_token");
   });
 });
 
@@ -219,5 +316,75 @@ describe("cimdDocumentSchema", () => {
       (_, index) => `https://client.example/callback/${index}`
     );
     expect(cimdDocumentSchema.safeParse({ redirect_uris: redirectUrisOverCap }).success).toBe(false);
+  });
+
+  it("accepts a redirect_uris entry at the length cap", () => {
+    const uriAtLengthCap = buildUriOfExactLength(CIMD_MAX_URI_LENGTH);
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: [uriAtLengthCap] }).success).toBe(true);
+  });
+
+  it("rejects a redirect_uris entry exceeding the length cap", () => {
+    const uriOverLengthCap = buildUriOfExactLength(CIMD_MAX_URI_LENGTH + 1);
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: [uriOverLengthCap] }).success).toBe(false);
+  });
+
+  it("accepts a client_name at the length cap", () => {
+    const clientNameAtCap = "a".repeat(CIMD_MAX_CLIENT_NAME_LENGTH);
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], client_name: clientNameAtCap }).success).toBe(
+      true
+    );
+  });
+
+  it("rejects a client_name exceeding the length cap", () => {
+    const clientNameOverCap = "a".repeat(CIMD_MAX_CLIENT_NAME_LENGTH + 1);
+    expect(
+      cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], client_name: clientNameOverCap }).success
+    ).toBe(false);
+  });
+
+  it("accepts grant_types at the cap, including authorization_code", () => {
+    const grantTypesAtCap = [
+      "authorization_code",
+      ...Array.from({ length: CIMD_MAX_GRANT_TYPES - 1 }, (_, index) => `grant-${index}`),
+    ];
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], grant_types: grantTypesAtCap }).success).toBe(
+      true
+    );
+  });
+
+  it("rejects grant_types exceeding the cap", () => {
+    const grantTypesOverCap = [
+      "authorization_code",
+      ...Array.from({ length: CIMD_MAX_GRANT_TYPES }, (_, index) => `grant-${index}`),
+    ];
+    expect(
+      cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], grant_types: grantTypesOverCap }).success
+    ).toBe(false);
+  });
+
+  it("accepts response_types at the cap", () => {
+    const responseTypesAtCap = Array.from({ length: CIMD_MAX_RESPONSE_TYPES }, (_, index) => `type-${index}`);
+    expect(
+      cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], response_types: responseTypesAtCap }).success
+    ).toBe(true);
+  });
+
+  it("rejects response_types exceeding the cap", () => {
+    const responseTypesOverCap = Array.from({ length: CIMD_MAX_RESPONSE_TYPES + 1 }, (_, index) => `type-${index}`);
+    expect(
+      cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], response_types: responseTypesOverCap }).success
+    ).toBe(false);
+  });
+
+  it("accepts a logo_uri at the length cap", () => {
+    const logoUriAtCap = buildUriOfExactLength(CIMD_MAX_URI_LENGTH);
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], logo_uri: logoUriAtCap }).success).toBe(true);
+  });
+
+  it("rejects a logo_uri exceeding the length cap", () => {
+    const logoUriOverCap = buildUriOfExactLength(CIMD_MAX_URI_LENGTH + 1);
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: [REDIRECT_URI], logo_uri: logoUriOverCap }).success).toBe(
+      false
+    );
   });
 });
