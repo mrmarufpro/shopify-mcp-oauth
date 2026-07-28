@@ -243,13 +243,13 @@ describe("createRateLimiter", () => {
   });
 
   describe("shipping defaults", () => {
-    // Task 20 wires `createRateLimiter({ limit, windowMs })` only -- `maxEntries` and
-    // `sweepIntervalRequests` have no field in the config schema a consumer can override, so these
-    // defaults are the actual production configuration, not just a mechanism demonstrated at a
-    // shrunk-for-testability value. Driving the real default (10,000, or 500) via supertest would
-    // mean thousands of real HTTP round trips per test; calling the returned handler directly with
-    // minimal req/res stubs exercises the exact same code path at the speed of a plain function
-    // call, which is what makes asserting the real default value practical here.
+    // Task 20 wires `createRateLimiter({ limit, windowMs })` only -- `maxEntries` has no field in
+    // the config schema a consumer can override, so this default is the actual production
+    // configuration, not just a mechanism demonstrated at a shrunk-for-testability value. Driving
+    // the real default (10,000) via supertest would mean thousands of real HTTP round trips;
+    // calling the returned handler directly with minimal req/res stubs exercises the exact same
+    // code path at the speed of a plain function call, which is what makes asserting the real
+    // default value practical here.
     function invokeDirectly(handler: RequestHandler, key: string): { allowed: boolean } {
       let allowed = false;
       const req = { headers: { "x-test-key": key } } as unknown as Request;
@@ -285,33 +285,6 @@ describe("createRateLimiter", () => {
       // LIVE_CALLER (the oldest tracked entry).
       invokeDirectly(limiter, "one-key-too-many");
       expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(true);
-    });
-
-    it("runs the periodic sweep at the default interval of 500 requests", () => {
-      vi.useFakeTimers();
-      try {
-        const DEFAULT_SWEEP_INTERVAL_REQUESTS = 500;
-        const limiter = createRateLimiter({
-          limit: 1,
-          windowMs: 1,
-          keyFor: (req) => String(req.headers["x-test-key"]),
-        });
-
-        // Every one of these keys is expired by the time the sweep inspects it (the clock is
-        // advanced past windowMs before the threshold request), so the sweep's delete branch is
-        // genuinely exercised rather than skipped as a no-op scan.
-        for (let requestIndex = 0; requestIndex < DEFAULT_SWEEP_INTERVAL_REQUESTS - 1; requestIndex++) {
-          invokeDirectly(limiter, `swept-caller-${requestIndex}`);
-        }
-        vi.advanceTimersByTime(1000);
-
-        // This call is exactly the 500th -- requestsSinceSweep reaches the shipping default here
-        // and the sweep runs. Nothing catches a throw from inside it, so a broken sweep body
-        // surfaces as this call itself throwing, not as a status-code mismatch.
-        expect(() => invokeDirectly(limiter, "final-caller")).not.toThrow();
-      } finally {
-        vi.useRealTimers();
-      }
     });
   });
 });

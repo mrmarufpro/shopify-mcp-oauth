@@ -15,16 +15,9 @@ export interface RateLimiterOptions {
    * Default 10,000.
    */
   maxEntries?: number;
-  /**
-   * How many requests pass through between amortized sweeps of expired windows. A full scan runs
-   * once every N requests instead of on every request, so no single caller pays for the whole
-   * map. Default 500.
-   */
-  sweepIntervalRequests?: number;
 }
 
 const DEFAULT_MAX_ENTRIES = 10_000;
-const DEFAULT_SWEEP_INTERVAL_REQUESTS = 500;
 
 // req.ip only names the real caller when the app has configured Express's `trust proxy` setting
 // to match its actual deployment (see https://expressjs.com/en/guide/behind-proxies.html) --
@@ -51,29 +44,10 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
   const windows = new Map<string, Window>();
   const keyFor = options.keyFor ?? defaultKey;
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
-  const sweepIntervalRequests = options.sweepIntervalRequests ?? DEFAULT_SWEEP_INTERVAL_REQUESTS;
-  let requestsSinceSweep = 0;
-
-  // Amortized cleanup for keys that are never revisited (an attacker rotating source addresses,
-  // or ordinary traffic accumulating over weeks) -- without this, those entries would otherwise
-  // sit in the map forever since nothing else ever touches them again. Runs a full O(n) scan once
-  // every `sweepIntervalRequests` requests rather than on every request, so the cost is spread
-  // thin instead of concentrated on one unlucky caller.
-  function sweepExpiredWindows(now: number): void {
-    for (const [trackedKey, window] of windows) {
-      if (window.resetAt <= now) windows.delete(trackedKey);
-    }
-  }
 
   return (req, res, next) => {
     const key = keyFor(req);
     const now = Date.now();
-
-    requestsSinceSweep += 1;
-    if (requestsSinceSweep >= sweepIntervalRequests) {
-      requestsSinceSweep = 0;
-      sweepExpiredWindows(now);
-    }
 
     const stored = windows.get(key);
     const current = stored && stored.resetAt > now ? stored : undefined;
@@ -89,10 +63,22 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
       const isNewKey = stored === undefined;
       if (!isNewKey) windows.delete(key);
 
-      // Only a genuinely new key grows the map -- refreshing an existing key above nets out to the
-      // same size, so it must not trigger evicting some unrelated entry. Cap the worst case here:
-      // past maxEntries, drop the single oldest tracked key -- O(1), unlike a reclaim scan, so this
-      // stays cheap even while an attacker keeps the map pinned at the cap on every request.
+      // The whole memory story lives here: worst case is bounded at `maxEntries` -- past it, a
+      // genuinely new key evicts the single oldest tracked entry, O(1), unlike a reclaim scan, so
+      // this stays cheap even while an attacker keeps the map pinned at the cap on every request.
+      // Any other expired window is reclaimed lazily, the moment its own key is next seen (above).
+      //
+      // Deliberately no background sweep beyond that: since a refresh always deletes-then-
+      // reinserts (above), Map iteration order is always ascending by `resetAt` (windowMs is
+      // constant per limiter, so whichever key was touched longest ago also expires soonest) --
+      // meaning eviction here already removes the most-expired entry first, exactly what a sweep
+      // would do. A background sweep can't evict a *different* key than this already does, so it
+      // has no observable effect on responses, on which key gets evicted, or on the memory bound --
+      // its only possible contribution is reclaiming memory slightly earlier than the cap would on
+      // its own, against which a broken sweep (never runs; or its own throttling gets dropped,
+      // degrading into an O(n)-per-request scan on every single request) is indistinguishable from
+      // a correct one to any test. A once-shipped version had exactly that: it mutation-tested
+      // clean everywhere else, but no test could tell a working sweep from a silently broken one.
       if (isNewKey && windows.size >= maxEntries) {
         const oldestKey = windows.keys().next().value;
         if (oldestKey !== undefined) windows.delete(oldestKey);
