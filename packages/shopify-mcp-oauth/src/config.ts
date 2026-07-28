@@ -14,6 +14,12 @@ export interface ShopifyMcpOAuthConfig {
   cache?: CacheStore;
   tokenTtl?: { access?: number; refresh?: number };
   openaiAppsChallengeToken?: string | null;
+  /**
+   * Caps requests to the unauthenticated `/register` endpoint. Counted in process memory, not in
+   * `cache` above — on a multi-instance deployment the effective limit multiplies by the instance
+   * count. That is an acceptable, well-understood shape for a spam brake; see rateLimit.ts for why
+   * a cache-backed counter isn't a safe substitute.
+   */
   registerRateLimit?: { limit: number; windowMs: number };
   logger?: Logger;
   fetchImpl?: typeof fetch;
@@ -35,8 +41,9 @@ export interface ResolvedConfig {
 
 const CACHE_FALLBACK_WARNING =
   "shopify-mcp-oauth: no cache supplied, falling back to an in-memory cache. This cache is single-process, so " +
-  "authorization codes and rate-limit counters written by one instance are invisible to the others and login " +
-  "will fail intermittently across multiple instances — supply a shared cache such as redisCache in production.";
+  "authorization codes written by one instance are invisible to the others and login will fail intermittently " +
+  "across multiple instances — supply a shared cache such as redisCache in production. (The /register rate " +
+  "limiter is separate from this cache and always process-local — see registerRateLimit.)";
 
 // A prefix regex only checks the string starts with a scheme; new URL() also catches a missing
 // hostname, a query string, or a fragment, none of which are valid in the resource identifier
