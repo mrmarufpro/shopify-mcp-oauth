@@ -250,7 +250,11 @@ describe("resolveCimdClient", () => {
     expect(warnSpy).toHaveBeenCalledTimes(1);
     const loggedMessage = warnSpy.mock.calls[0]?.[0] as string;
     expect(loggedMessage).toContain("localhost");
-    expect(loggedMessage).toMatch(/private|loopback/);
+    // Either form, not "private|loopback" alone -- that text is fixed regardless of whether the
+    // resolved address actually made it into the log, so it wouldn't catch the address being
+    // dropped. "localhost" resolves to ::1 first on some systems (this one included) and to
+    // 127.0.0.1 first on others, so pinning one order would be flaky.
+    expect(loggedMessage).toMatch(/127\.0\.0\.1|::1/);
   });
 
   describe("SSRF guard: private, loopback, and reserved address families", () => {
