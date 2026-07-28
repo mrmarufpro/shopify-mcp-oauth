@@ -19,8 +19,10 @@ export function redisCache(client: RedisLikeClient): CacheStore {
       await client.del(key);
     },
     async getdel(key) {
-      // GETDEL needs Redis 6.2+. Older servers fall back to GET then DEL, which is not atomic;
-      // a concurrent redemption of the same authorization code could read it twice.
+      // This branches on client capability, not server version: a client that exposes getDel
+      // against a pre-6.2 Redis surfaces the server's error rather than falling back. The
+      // fallback itself is not atomic — two concurrent redemptions of one authorization code
+      // could both read it before either delete lands.
       if (client.getDel) return client.getDel(key);
       const value = await client.get(key);
       await client.del(key);
