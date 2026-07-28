@@ -25,7 +25,14 @@ const tokenTypeHintSchema = z
   .pipe(z.enum(TOKEN_TYPE_HINTS));
 
 export const revokeRequestSchema = z.object({
-  token: z.string({ required_error: "token is required" }).min(1, "token is required"),
+  // Defaulting the missing key to "" inside preprocess (rather than a `required_error` on
+  // z.string) keeps this message the same across zod majors: zod 4 folded required_error and
+  // invalid_type_error into a single `error` param and silently ignores the old keys, so
+  // required_error alone would only fire this message under zod 3.
+  token: z.preprocess((value) => value ?? "", z.string().min(1, "token is required")),
   token_type_hint: tokenTypeHintSchema.optional(),
+  // RFC 7009 §2.1 has clients send client_id, so it's accepted here rather than rejected as an
+  // unknown field — but every client is public (no secret to authenticate), so this value is
+  // self-asserted and deliberately not checked against the token's owning client.
   client_id: z.string().optional(),
 });
