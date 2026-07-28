@@ -5,6 +5,7 @@ import type { NewOAuthClient, NewToken } from "../types";
 const DEMO_SHOP = "demo.myshopify.com";
 const CLIENT_ID = "prisma-client-id";
 const TOKEN_ID = "token-1";
+const LAST_USED_AT = new Date("2026-01-15T12:00:00.000Z");
 
 function buildPrisma(overrides: Record<string, unknown> = {}): PrismaLikeClient {
   return {
@@ -157,6 +158,17 @@ describe("prismaStorage", () => {
       mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany: undefined },
     });
     await expect(prismaStorage(prisma).touchToken(TOKEN_ID, new Date())).resolves.toBeUndefined();
+  });
+
+  it("touchToken sends the id and lastUsedAt to updateMany", async () => {
+    const updateMany = vi.fn().mockResolvedValue({ count: 1 });
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany },
+    });
+    await prismaStorage(prisma).touchToken(TOKEN_ID, LAST_USED_AT);
+    const call = updateMany.mock.calls[0]?.[0];
+    expect(call.where).toEqual({ id: TOKEN_ID });
+    expect(call.data.lastUsedAt).toBe(LAST_USED_AT);
   });
 
   it("looks the shop up through the configured mapping", async () => {
