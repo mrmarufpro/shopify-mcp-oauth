@@ -7378,17 +7378,26 @@ git commit -m "feat: add /token with PKCE verification and refresh rotation"
 
 **Files:**
 - Create: `packages/shopify-mcp-oauth/src/middlewares/requireAuth.ts`
+- Create: `packages/shopify-mcp-oauth/src/vitestSetup.ts`
+- Modify: `packages/shopify-mcp-oauth/vitest.config.ts` (register `setupFiles`)
 - Test: `packages/shopify-mcp-oauth/src/middlewares/requireAuth.test.ts`
 
 **Interfaces:**
-- Consumes: `ResolvedConfig`; `sha256Hex`; `McpAuthContext` from `../types`
+- Consumes: `ResolvedConfig`; `sha256Hex`; `McpAuthContext` from `../types`; `asyncHandler`
 - Produces:
   - `requireAuth(config: ResolvedConfig): RequestHandler`
-  - `declare module "express-serve-static-core" { interface Request { mcp?: McpAuthContext } }`
+  - `declare global { namespace Express { interface Request { mcp?: McpAuthContext } } }` — augments
+    the global namespace directly rather than `declare module "express-serve-static-core"`: that
+    module is only a transitive dependency of `@types/express`, not one of this package's own, so it
+    doesn't resolve from here under pnpm's strict `node_modules` and `tsc` fails with TS2664.
 
 This is the Resource Server half. Every 401 carries an RFC 9728 `WWW-Authenticate` header naming the
 protected-resource metadata document — that header is how a client discovers where to start the login
 flow, so omitting it strands clients that have never seen the server before.
+
+This task's review also surfaced a rate-dependent race between this suite's many ephemeral supertest
+servers (see `src/vitestSetup.ts` below) — unrelated to `requireAuth` itself, but fixed here because
+it was destabilizing this task's own test run.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -7397,101 +7406,340 @@ flow, so omitting it strands clients that have never seen the server before.
 ```ts
 import express from "express";
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
 import { sha256Hex } from "../crypto";
 import { issueTokens } from "../services/tokens";
+import type { Logger } from "../types";
 import { requireAuth } from "./requireAuth";
 
 const HOST = "https://mcp.example.com";
 const DEMO_SHOP = "demo.myshopify.com";
 const DEMO_SHOP_ID = "shop_1";
 const CLIENT_ID = "test-client-id";
+const API_SECRET_CANARY = "test-api-secret";
+const STATE_SECRET_CANARY = "test-state-secret-at-least-32-bytes-long";
+// Deliberately not `${HOST}/mcp` (what resolveConfig derives as config.resource) -- a fixture
+// that coincided with the default would pass even if the audience check were deleted entirely.
+const OTHER_TENANT_RESOURCE = `${HOST}/mcp/other-tenant`;
+// A shop row id distinct from DEMO_SHOP_ID, simulating a shop that uninstalled and reinstalled
+// under a new row id while keeping the same domain -- see "binds shopId from the stored token"
+// below. A fixture equal to DEMO_SHOP_ID couldn't tell stored.shopId and shop.id apart.
+const REINSTALLED_SHOP_ID = "shop_1_after_reinstall";
+// A canary distinctive enough that it can't coincidentally appear in any real header or body.
+const PRESENTED_TOKEN_CANARY = "presented-token-canary-should-never-be-echoed";
 
-function buildConfig(): ResolvedConfig {
+// Only the "generic 500" test needs this -- it deliberately triggers asyncHandler's error log,
+// and the default console logger would print a stack trace on every full-suite run otherwise.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+function buildConfig(
+  overrides: { logger?: Logger; tokenTtl?: { access?: number; refresh?: number } } = {}
+): ResolvedConfig {
   return resolveConfig({
     host: HOST,
-    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
-    stateSecret: "test-state-secret-at-least-32-bytes-long",
+    shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+    stateSecret: STATE_SECRET_CANARY,
     storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
+    ...overrides,
   });
 }
 
-function buildApp(config: ResolvedConfig) {
+// `downstream` stands in for the protected MCP handler this middleware guards. Every rejection
+// test passes its own spy and asserts it was never called -- a 401 that still lets the request
+// reach the handler underneath is a real auth bypass, not a cosmetic response-shape bug.
+function buildApp(config: ResolvedConfig, downstream: () => void = () => {}) {
   const app = express();
   app.use(express.json());
   app.post("/mcp", requireAuth(config), (req, res) => {
+    downstream();
     res.status(200).json(req.mcp);
   });
   return app;
 }
 
 describe("requireAuth", () => {
-  it("passes a live token through and exposes the shop", async () => {
+  it("passes a live token through, exposes the shop identity and token id, and reaches the protected handler", async () => {
     const config = buildConfig();
     const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
-    const response = await request(buildApp(config))
+    const stored = await config.storage.findTokenByAccessHash(sha256Hex(tokens.access_token));
+    const downstream = vi.fn();
+    const response = await request(buildApp(config, downstream))
       .post("/mcp")
       .set("Authorization", `Bearer ${tokens.access_token}`)
       .send({});
 
     expect(response.status).toBe(200);
-    expect(response.body.shopDomain).toBe(DEMO_SHOP);
-    expect(response.body.shopId).toBe(DEMO_SHOP_ID);
+    // Asserting the whole body (not just shopDomain/shopId) means an extra or renamed key would
+    // fail this too, not just a forged value.
+    expect(response.body).toEqual({ shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, tokenId: stored?.id });
+    expect(downstream).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects a request with no Authorization header", async () => {
-    const response = await request(buildApp(buildConfig())).post("/mcp").send({});
+  it("rejects a request with no Authorization header, and never reaches the protected handler", async () => {
+    const downstream = vi.fn();
+    const response = await request(buildApp(buildConfig(), downstream)).post("/mcp").send({});
     expect(response.status).toBe(401);
+    expect(downstream).not.toHaveBeenCalled();
   });
 
-  it("rejects a non-Bearer scheme", async () => {
-    const response = await request(buildApp(buildConfig()))
+  it("rejects a non-Bearer scheme, and never reaches the protected handler", async () => {
+    const downstream = vi.fn();
+    const response = await request(buildApp(buildConfig(), downstream))
       .post("/mcp")
       .set("Authorization", "Basic dXNlcjpwYXNz")
       .send({});
     expect(response.status).toBe(401);
+    // Asserting the specific error code (not just the status) so this fails on its own scheme
+    // check rather than passing incidentally because the garbage credential also happens to miss
+    // the unknown-token lookup below.
+    expect(response.body).toEqual({ error: "missing_bearer" });
+    expect(downstream).not.toHaveBeenCalled();
   });
 
-  it("rejects an unknown token", async () => {
-    const response = await request(buildApp(buildConfig()))
+  it("rejects a scheme with no space delimiter after it, and never reaches the protected handler", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const downstream = vi.fn();
+    // "Bearer" without a trailing space isn't the scheme this middleware accepts, even though the
+    // rest of the header text looks like a real token glued onto the end of the word.
+    const response = await request(buildApp(config, downstream))
+      .post("/mcp")
+      .set("Authorization", `Bearer${tokens.access_token}`)
+      .send({});
+    expect(response.status).toBe(401);
+    // Asserting the specific error code, not just the status: without the space, slicing off the
+    // (wrong) prefix length still hands the unknown-token lookup a garbage string that legitimately
+    // misses, which would return 401 with error "invalid_token" for an unrelated reason even if
+    // this check's space requirement were silently dropped. "missing_bearer" pins that this test
+    // fails on its own scheme check.
+    expect(response.body).toEqual({ error: "missing_bearer" });
+    expect(downstream).not.toHaveBeenCalled();
+  });
+
+  it("accepts a case-insensitive Bearer scheme", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    // RFC 7235 §2.1: the scheme token is case-insensitive.
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `bearer ${tokens.access_token}`)
+      .send({});
+    expect(response.status).toBe(200);
+  });
+
+  it("rejects an unknown token, and never reaches the protected handler", async () => {
+    const downstream = vi.fn();
+    const response = await request(buildApp(buildConfig(), downstream))
       .post("/mcp")
       .set("Authorization", "Bearer never-issued")
       .send({});
     expect(response.status).toBe(401);
+    expect(downstream).not.toHaveBeenCalled();
   });
 
-  it("rejects a revoked token", async () => {
+  it("rejects a revoked token, and never reaches the protected handler", async () => {
     const config = buildConfig();
     const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
     const stored = await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token));
     await config.storage.revokeToken(stored!.id);
 
-    const response = await request(buildApp(config))
+    const downstream = vi.fn();
+    const response = await request(buildApp(config, downstream))
       .post("/mcp")
       .set("Authorization", `Bearer ${tokens.access_token}`)
       .send({});
     expect(response.status).toBe(401);
+    expect(downstream).not.toHaveBeenCalled();
   });
 
-  it("points a 401 at the protected-resource metadata document", async () => {
-    const response = await request(buildApp(buildConfig())).post("/mcp").send({});
-    expect(response.headers["www-authenticate"]).toContain(`${HOST}/.well-known/oauth-protected-resource`);
+  it("rejects an access token past its expiry, and never reaches the protected handler", async () => {
+    vi.useFakeTimers();
+    try {
+      const config = buildConfig({ tokenTtl: { access: 1 } });
+      const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+      vi.advanceTimersByTime(2_000);
+
+      const downstream = vi.fn();
+      const response = await request(buildApp(config, downstream))
+        .post("/mcp")
+        .set("Authorization", `Bearer ${tokens.access_token}`)
+        .send({});
+      expect(response.status).toBe(401);
+      expect(downstream).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("rejects a token whose shop has since been uninstalled", async () => {
+  it("rejects a token minted for a different resource server, and never reaches the protected handler", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, {
+      shopId: DEMO_SHOP_ID,
+      shopDomain: DEMO_SHOP,
+      clientId: CLIENT_ID,
+      resource: OTHER_TENANT_RESOURCE,
+    });
+    const downstream = vi.fn();
+    const response = await request(buildApp(config, downstream))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({ error: "invalid_token" });
+    expect(downstream).not.toHaveBeenCalled();
+  });
+
+  it("rejects a token whose stored resource is null, and never reaches the protected handler", async () => {
+    const config = buildConfig();
+    const rawToken = "raw-null-resource-token";
+    // Written directly through storage.createToken, not issueTokens -- issueTokens always
+    // defaults resource to config.resource, so it can never produce this row. A storage adapter
+    // populated by a hand migration or an older schema version could still hold one.
+    await config.storage.createToken({
+      shopId: DEMO_SHOP_ID,
+      shopDomain: DEMO_SHOP,
+      clientId: CLIENT_ID,
+      accessTokenHash: sha256Hex(rawToken),
+      refreshTokenHash: null,
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      refreshTokenExpiresAt: null,
+      scope: "mcp:*",
+      resource: null,
+      rotatedFromId: null,
+    });
+
+    const downstream = vi.fn();
+    const response = await request(buildApp(config, downstream))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${rawToken}`)
+      .send({});
+    expect(response.status).toBe(401);
+    expect(downstream).not.toHaveBeenCalled();
+  });
+
+  it("rejects a token whose shop has since been uninstalled, and never reaches the protected handler", async () => {
     const config = buildConfig();
     const tokens = await issueTokens(config, {
       shopId: "shop_gone",
       shopDomain: "uninstalled.myshopify.com",
       clientId: CLIENT_ID,
     });
-    const response = await request(buildApp(config))
+    const downstream = vi.fn();
+    const response = await request(buildApp(config, downstream))
       .post("/mcp")
       .set("Authorization", `Bearer ${tokens.access_token}`)
       .send({});
     expect(response.status).toBe(401);
+    expect(downstream).not.toHaveBeenCalled();
+  });
+
+  it("rejects a token whose shopId doesn't match the row currently owning that domain (a stale, pre-reinstall token), and never reaches the protected handler", async () => {
+    // The seeded shop row's id differs from the id the token itself carries -- simulating a shop
+    // that uninstalled and reinstalled under a new row id after this token was minted. The token
+    // names a *previous* installation and must not authenticate against the fresh one, even
+    // though the domain (the lookup key one line up) still matches.
+    const config = resolveConfig({
+      host: HOST,
+      shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+      stateSecret: STATE_SECRET_CANARY,
+      storage: memoryStorage({ shops: [{ id: REINSTALLED_SHOP_ID, domain: DEMO_SHOP }] }),
+    });
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+
+    const downstream = vi.fn();
+    const response = await request(buildApp(config, downstream))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+
+    expect(response.status).toBe(401);
+    expect(downstream).not.toHaveBeenCalled();
+  });
+
+  it("accepts a token whose shopId is a number when the shop row's id is the equivalent string", async () => {
+    // The String() coercion in the ownership check exists exactly for this: an adapter that
+    // stores shopId as a number on the token but returns it as a string from the row lookup (or
+    // vice versa, see the next test) is still the same shop -- a raw !== would lock it out.
+    const NUMERIC_SHOP_ID = 4242;
+    const config = resolveConfig({
+      host: HOST,
+      shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+      stateSecret: STATE_SECRET_CANARY,
+      storage: memoryStorage({ shops: [{ id: String(NUMERIC_SHOP_ID), domain: DEMO_SHOP }] }),
+    });
+    const tokens = await issueTokens(config, { shopId: NUMERIC_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+
+    expect(response.status).toBe(200);
+  });
+
+  it("accepts a token whose shopId is a string when the shop row's id is the equivalent number", async () => {
+    const NUMERIC_SHOP_ID = 4242;
+    const config = resolveConfig({
+      host: HOST,
+      shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+      stateSecret: STATE_SECRET_CANARY,
+      storage: memoryStorage({ shops: [{ id: NUMERIC_SHOP_ID, domain: DEMO_SHOP }] }),
+    });
+    const tokens = await issueTokens(config, {
+      shopId: String(NUMERIC_SHOP_ID),
+      shopDomain: DEMO_SHOP,
+      clientId: CLIENT_ID,
+    });
+
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+
+    expect(response.status).toBe(200);
+  });
+
+  it("points a 401 at the protected-resource metadata document when the header is missing", async () => {
+    const response = await request(buildApp(buildConfig())).post("/mcp").send({});
+    expect(response.headers["www-authenticate"]).toContain(`${HOST}/.well-known/oauth-protected-resource`);
+    expect(response.headers["www-authenticate"]).toContain('error="missing_bearer"');
+  });
+
+  it("points a 401 at the protected-resource metadata document when the token is invalid", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .post("/mcp")
+      .set("Authorization", "Bearer never-issued")
+      .send({});
+    expect(response.headers["www-authenticate"]).toContain(`${HOST}/.well-known/oauth-protected-resource`);
+    expect(response.headers["www-authenticate"]).toContain('error="invalid_token"');
+  });
+
+  it("never echoes the presented token into the WWW-Authenticate header", async () => {
+    const response = await request(buildApp(buildConfig()))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${PRESENTED_TOKEN_CANARY}`)
+      .send({});
+    expect(response.headers["www-authenticate"]).not.toContain(PRESENTED_TOKEN_CANARY);
+  });
+
+  it("returns a generic 500 without leaking storage error details when the token store fails", async () => {
+    const config = buildConfig({ logger: silentLogger });
+    vi.spyOn(config.storage, "findTokenByAccessHash").mockRejectedValue(
+      new Error("storage unavailable: connection to db.internal.example refused")
+    );
+    const response = await request(buildApp(config)).post("/mcp").set("Authorization", "Bearer some-token").send({});
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    // Checked against the raw response text, not JSON.stringify(response.body): a leak that
+    // escapes asyncHandler (e.g. Express's own default error handler rendering an HTML stack
+    // trace when nothing wraps the failing handler) leaves response.body as {} for a non-JSON
+    // content type, which would make a body-based assertion pass trivially while the secret is
+    // still on the wire.
+    expect(response.text).not.toContain("db.internal.example");
+    expect(response.text).not.toContain(API_SECRET_CANARY);
+    expect(response.text).not.toContain(STATE_SECRET_CANARY);
   });
 });
 ```
@@ -7504,57 +7752,163 @@ Expected: FAIL — cannot resolve `./requireAuth`.
 - [ ] **Step 3: Write `src/middlewares/requireAuth.ts`**
 
 ```ts
-import type { RequestHandler } from "express";
+import type { RequestHandler, Response } from "express";
+import { asyncHandler } from "../controllers/asyncHandler";
 import type { ResolvedConfig } from "../config";
 import { sha256Hex } from "../crypto";
 import type { McpAuthContext } from "../types";
 
-declare module "express-serve-static-core" {
-  interface Request {
-    mcp?: McpAuthContext;
+// Declared against the global Express namespace, not `declare module "express-serve-static-core"`:
+// that module is only a transitive dependency of @types/express, not one of this package's own,
+// so under pnpm's strict node_modules it doesn't resolve from here and tsc fails with TS2664. The
+// module-scoped `Request<...>` type (what RequestHandler's `req` actually is) extends
+// `Express.Request`, so augmenting the namespace below reaches it the same way.
+declare global {
+  namespace Express {
+    interface Request {
+      mcp?: McpAuthContext;
+    }
   }
 }
 
 export function requireAuth(config: ResolvedConfig): RequestHandler {
   const resourceMetadata = `${config.host}/.well-known/oauth-protected-resource`;
 
-  return async (req, res, next) => {
-    // RFC 9728: the header is how a client that has never seen this server discovers where to
-    // begin the login flow. Every 401 carries it.
-    function unauthorized(error: string): void {
-      res.setHeader("WWW-Authenticate", `Bearer error="${error}", resource_metadata="${resourceMetadata}"`);
-      res.status(401).json({ error });
-    }
+  // RFC 9728: the header is how a client that has never seen this server discovers where to
+  // begin the login flow. Every 401 carries it.
+  function unauthorized(res: Response, error: string): void {
+    res.setHeader("WWW-Authenticate", `Bearer error="${error}", resource_metadata="${resourceMetadata}"`);
+    res.status(401).json({ error });
+  }
 
+  // A storage failure here must become a controlled 401/500, not an unhandled rejection --
+  // asyncHandler is the seam that already owns that translation for every other handler.
+  return asyncHandler(config.logger, async (req, res, next) => {
     const header = req.headers.authorization;
-    if (!header || !header.startsWith("Bearer ")) {
-      return unauthorized("missing_bearer");
+    // RFC 7235 §2.1: the scheme token is case-insensitive ("Bearer", "bearer", "BEARER" all
+    // name the same scheme), so this must not reject a client that sent a lowercase scheme.
+    const BEARER_PREFIX_LENGTH = "Bearer ".length;
+    if (!header || header.slice(0, BEARER_PREFIX_LENGTH).toLowerCase() !== "bearer ") {
+      return unauthorized(res, "missing_bearer");
     }
 
-    const token = header.slice("Bearer ".length).trim();
+    const token = header.slice(BEARER_PREFIX_LENGTH).trim();
     const stored = await config.storage.findTokenByAccessHash(sha256Hex(token));
-    if (!stored) return unauthorized("invalid_token");
+    if (!stored) return unauthorized(res, "invalid_token");
+
+    // RFC 8707: this authorization server only ever mints tokens scoped to its own resource
+    // today, but the resource server must enforce the audience itself rather than trust that --
+    // a storage adapter shared across multiple resource-server deployments must not let one
+    // accept a token scoped to another. Strict `!==`, not a null-safe narrowing: a token whose
+    // stored resource is null must fail this too, not slip through as "no claim to check".
+    if (stored.resource !== config.resource) return unauthorized(res, "invalid_token");
 
     // A token outlives an uninstall, so confirm the shop is still known on every request.
     const shop = await config.storage.findShopByDomain(stored.shopDomain);
-    if (!shop) return unauthorized("invalid_token");
+    if (!shop) return unauthorized(res, "invalid_token");
+
+    // A shop that uninstalls and reinstalls can get a fresh row id under the same domain. A
+    // token minted before the reinstall names the *old* row's id in stored.shopId; downstream
+    // code (this middleware's own check above included) keys lookups by shopDomain, so without
+    // this comparison such a token would authenticate fine against the new installation --
+    // stored.shopId is the only thing that still tells the two apart. Stringified: shopId is
+    // typed `string | number`, and the stored and freshly-looked-up values may come from
+    // different adapters/columns that don't agree on which. (An adapter that reuses the same id
+    // across a reinstall -- e.g. an upsert keyed on domain -- will still accept here; that's the
+    // adapter's own choice, not a gap in this check.)
+    if (String(stored.shopId) !== String(shop.id)) return unauthorized(res, "invalid_token");
 
     req.mcp = { shopId: stored.shopId, shopDomain: stored.shopDomain, tokenId: stored.id };
     config.storage.touchToken(stored.id, new Date()).catch(() => {});
     next();
-  };
+  });
 }
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/requireAuth.test.ts`
-Expected: PASS, 7 tests.
+Expected: PASS, 18 tests.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Write `src/vitestSetup.ts` and wire it into `vitest.config.ts`**
+
+This task's review found a rate-dependent race between this suite's many ephemeral supertest
+servers — reproduced in complete isolation (a bare express+supertest loop with no application
+code) and eliminated there across 30 runs / ~12,000 requests. Full-suite A/B testing across 130+
+runs and four configs (cool-down alone, file-parallelism disabled alone, both, neither) could not
+detect a difference between them at this suite's ~1-3% base failure rate — that comparison is
+underpowered for an effect this size, not evidence the cool-down does nothing. Disabling file
+parallelism was tried and dropped: no additional benefit over the cool-down alone, for a real
+~4.5x wall-time tax. The provably-complete fix — one shared server per test file instead of one
+per test — would need to touch every supertest-based file in this package and has not been
+attempted. State this honestly; do not let a later edit "tidy" it into a claim that the race is
+eliminated.
+
+`src/vitestSetup.ts`:
+
+```ts
+import { afterEach } from "vitest";
+
+// Captured once, at module load -- before any test in this file has had a chance to call
+// vi.useFakeTimers() -- so this cool-down is immune to fake-timer state a test leaves active.
+// Five files in this package fake timers (middlewares/requireAuth.test.ts,
+// testing/cacheContract.ts, controllers/revoke.test.ts, services/cimd.test.ts,
+// services/tokens.test.ts) and all restore real timers before their own test body returns, but
+// relying on afterEach hook ordering between this file and a test file's own afterEach to
+// guarantee that would be fragile; a real setTimeout reference sidesteps the question entirely.
+const realSetTimeout = globalThis.setTimeout;
+
+// Node + this machine's networking stack can occasionally cross-wire a response between two of
+// this suite's own ephemeral supertest servers when many get created and torn down back-to-back
+// with no gap at all. Verified in complete isolation, outside any of this package's own code: a
+// plain express + supertest loop with no application logic involved still misattributes roughly
+// 1 response in every few hundred requests when hundreds of `listen(0)`/`close()` cycles run
+// back-to-back with zero delay between them -- and the effect did not reproduce even once across
+// 30 runs (12,000 requests total) once each cycle was given a few milliseconds to settle before
+// the next one started. This is rate-dependent, not something a retry papers over: the race is in
+// how fast this suite recycles ephemeral ports, so slowing that down is the actual fix, not a
+// workaround for a flaky assertion.
+//
+// A handful of ms per test is cheap next to what it protects: every controller/middleware test
+// in this package builds its own supertest app, and a misattributed response here doesn't just
+// fail a test -- it can silently invalidate a mutation-testing verdict (a real defect looking
+// fixed, or a real fix looking broken), which is the whole point of this suite's review process.
+afterEach(async () => {
+  await new Promise((resolve) => realSetTimeout(resolve, 15));
+});
+```
+
+`packages/shopify-mcp-oauth/vitest.config.ts`:
+
+```ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    include: ["src/**/*.test.ts"],
+    // See src/vitestSetup.ts: a small per-test cool-down for a confirmed, rate-dependent race
+    // between this suite's many ephemeral supertest servers -- reproduced in complete isolation
+    // (a bare express+supertest loop with no application code) and eliminated there across 30
+    // runs / ~12,000 requests. What full-suite A/B testing across 130+ runs and four configs
+    // (cool-down alone, file-parallelism disabled alone, both, neither) could NOT do is detect a
+    // difference between them at this suite's ~1-3% base failure rate -- that comparison is
+    // underpowered for an effect this size, not evidence the cool-down does nothing. Disabling
+    // file parallelism was tried and dropped: it measured no additional benefit over the
+    // cool-down alone while costing a real ~4.5x wall-time tax (10.9s vs 2.4s), so only the
+    // cool-down ships. The provably-complete fix -- one shared server per test file instead of
+    // one per test, cutting total listen()/close() cycles from ~200+ to ~29 -- would need to
+    // touch every supertest-based file in this package and hasn't been attempted.
+    setupFiles: ["./src/vitestSetup.ts"],
+  },
+});
+```
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add packages/shopify-mcp-oauth/src/middlewares/requireAuth.ts packages/shopify-mcp-oauth/src/middlewares/requireAuth.test.ts
+git add packages/shopify-mcp-oauth/src/middlewares/requireAuth.ts packages/shopify-mcp-oauth/src/middlewares/requireAuth.test.ts \
+  packages/shopify-mcp-oauth/src/vitestSetup.ts packages/shopify-mcp-oauth/vitest.config.ts
 git commit -m "feat: add the resource-server bearer middleware"
 ```
 
