@@ -31,6 +31,14 @@ describe("serializeAuthorizationServerMetadata", () => {
     expect(serializeAuthorizationServerMetadata(buildConfig()).code_challenge_methods_supported).toEqual(["S256"]);
   });
 
+  it("advertises none as the revocation endpoint auth method, since every client is public", () => {
+    // RFC 8414 §2 defaults this field to client_secret_basic when absent — omitting it would tell
+    // a spec-following client that /revoke needs HTTP Basic auth, which it never checks.
+    expect(serializeAuthorizationServerMetadata(buildConfig()).revocation_endpoint_auth_methods_supported).toEqual([
+      "none",
+    ]);
+  });
+
   it("declares CIMD support so clients skip registration", () => {
     expect(serializeAuthorizationServerMetadata(buildConfig()).client_id_metadata_document_supported).toBe(true);
   });

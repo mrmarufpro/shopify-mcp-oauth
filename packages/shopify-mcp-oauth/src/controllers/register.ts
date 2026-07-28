@@ -3,9 +3,10 @@ import type { ResolvedConfig } from "../config";
 import { registerRequestSchema } from "../schemas/register";
 import { serializeClientRegistration } from "../serializers/register";
 import { createDcrClient } from "../services/clients";
+import { asyncHandler } from "./asyncHandler";
 
 export function registerController(config: ResolvedConfig): RequestHandler {
-  return async (req, res) => {
+  return asyncHandler(config.logger, async (req, res) => {
     const parsed = registerRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -16,5 +17,5 @@ export function registerController(config: ResolvedConfig): RequestHandler {
     }
     const client = await createDcrClient(config, parsed.data);
     res.status(201).json(serializeClientRegistration(client));
-  };
+  });
 }

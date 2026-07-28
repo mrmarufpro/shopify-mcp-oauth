@@ -25,7 +25,7 @@ const tokenTypeHintSchema = z
   .pipe(z.enum(TOKEN_TYPE_HINTS));
 
 export const revokeRequestSchema = z.object({
-  token: z.string().min(1, "token is required"),
+  token: z.string({ required_error: "token is required" }).min(1, "token is required"),
   token_type_hint: tokenTypeHintSchema.optional(),
   client_id: z.string().optional(),
 });

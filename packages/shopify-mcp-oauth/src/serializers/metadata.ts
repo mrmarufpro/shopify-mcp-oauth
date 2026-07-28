@@ -10,6 +10,9 @@ export function serializeAuthorizationServerMetadata(config: ResolvedConfig): Re
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     token_endpoint_auth_methods_supported: ["none"],
+    // RFC 8414 §2 defaults this to client_secret_basic when omitted, which would misdescribe
+    // /revoke as requiring HTTP Basic auth — every client here is public and unauthenticated.
+    revocation_endpoint_auth_methods_supported: ["none"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: ["mcp:*"],
     client_id_metadata_document_supported: true,

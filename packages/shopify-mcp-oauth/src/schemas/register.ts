@@ -17,7 +17,9 @@ export const registerRequestSchema = z.object({
   redirect_uris: z.preprocess(
     (value) => capOversizedArray(value, REGISTER_MAX_REDIRECT_URIS),
     z
-      .array(z.string().max(REGISTER_MAX_URI_LENGTH, "redirect_uris entry is too long"))
+      .array(z.string().max(REGISTER_MAX_URI_LENGTH, "redirect_uris entry is too long"), {
+        required_error: "redirect_uris must contain at least one entry",
+      })
       .min(1, "redirect_uris must contain at least one entry")
       .max(REGISTER_MAX_REDIRECT_URIS, "redirect_uris has too many entries")
       .refine(

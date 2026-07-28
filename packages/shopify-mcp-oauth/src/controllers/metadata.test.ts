@@ -42,6 +42,8 @@ describe("metadata controllers", () => {
 
   it("echoes the configured challenge token", async () => {
     const response = await request(buildApp()).get("/.well-known/openai-apps-challenge");
+    expect(response.status).toBe(200);
+    expect(response.type).toBe("text/plain");
     expect(response.text).toBe(CHALLENGE_TOKEN);
   });
 });

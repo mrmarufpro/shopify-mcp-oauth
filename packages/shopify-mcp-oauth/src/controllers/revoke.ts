@@ -2,9 +2,10 @@ import type { RequestHandler } from "express";
 import type { ResolvedConfig } from "../config";
 import { revokeRequestSchema } from "../schemas/revoke";
 import { revokeByAccessToken, revokeByRefreshToken } from "../services/tokens";
+import { asyncHandler } from "./asyncHandler";
 
 export function revokeController(config: ResolvedConfig): RequestHandler {
-  return async (req, res) => {
+  return asyncHandler(config.logger, async (req, res) => {
     const parsed = revokeRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -22,5 +23,5 @@ export function revokeController(config: ResolvedConfig): RequestHandler {
       await revokeByRefreshToken(config, parsed.data.token);
     }
     res.status(200).json({});
-  };
+  });
 }

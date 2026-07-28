@@ -1,0 +1,25 @@
+import type { NextFunction, Request, RequestHandler, Response } from "express";
+import type { Logger } from "../types";
+
+type AsyncControllerHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>;
+
+const GENERIC_SERVER_ERROR_BODY = { error: "server_error", error_description: "An unexpected error occurred" };
+
+// Express 4 drops a route handler's rejected promise on the floor — the request hangs, and
+// Node's default unhandled-rejection policy then kills the process. Express 5 forwards the
+// rejection to next(err) on its own, but this package can't assume the consumer mounted a
+// terminal error handler downstream, so this wrapper owns the response itself rather than
+// leaving an unauthenticated caller to whatever (if anything) Express's own default handler
+// would have sent — including a stack trace, which it prints outside of NODE_ENV=production.
+export function asyncHandler(logger: Logger, handler: AsyncControllerHandler): RequestHandler {
+  return (req, res, next) => {
+    handler(req, res, next).catch((err: unknown) => {
+      if (res.headersSent) {
+        next(err);
+        return;
+      }
+      logger.error("shopify-mcp-oauth: unhandled controller error", err);
+      res.status(500).json(GENERIC_SERVER_ERROR_BODY);
+    });
+  };
+}
