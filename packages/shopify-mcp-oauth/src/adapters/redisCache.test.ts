@@ -35,6 +35,10 @@ function buildStatefulFakeRedis(): RedisLikeClient {
       return read(key);
     },
     async set(key, value, opts) {
+      // Mirrors real Redis's "ERR invalid expire time in 'set' command" — a fake that's more
+      // permissive than production here would let the contract's rejection clause pass for the
+      // wrong reason.
+      if (opts.EX <= 0) throw new Error("ERR invalid expire time in 'set' command");
       entries.set(key, { value, expiresAt: Date.now() + opts.EX * 1000 });
     },
     async del(key) {

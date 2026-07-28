@@ -23,6 +23,9 @@ export function memoryCache(): CacheStore {
       return read(key);
     },
     async set(key, value, ttlSeconds) {
+      // Matches real Redis's "ERR invalid expire time" rather than silently storing an
+      // already-expired entry, so a caller's own positive-ttl guard is load-bearing, not decorative.
+      if (ttlSeconds <= 0) throw new Error("memoryCache.set: ttlSeconds must be positive");
       entries.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
     },
     async del(key) {

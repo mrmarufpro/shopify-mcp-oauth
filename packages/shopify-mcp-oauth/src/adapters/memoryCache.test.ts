@@ -17,10 +17,10 @@ describe("memoryCache", () => {
     expect(await cache.get(KEY)).toBe("stored-value");
   });
 
-  it("expires a value once its TTL has passed", async () => {
+  it("rejects a non-positive ttl", async () => {
     const cache = memoryCache();
-    await cache.set(KEY, "stored-value", -1);
-    expect(await cache.get(KEY)).toBeNull();
+    await expect(cache.set(KEY, "stored-value", 0)).rejects.toThrow();
+    await expect(cache.set(KEY, "stored-value", -1)).rejects.toThrow();
   });
 
   it("deletes a value", async () => {
