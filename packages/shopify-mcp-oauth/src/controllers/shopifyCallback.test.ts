@@ -16,6 +16,9 @@ const DEMO_SHOP_ID = "shop_1";
 const CLIENT_ID = "test-client-id";
 const REDIRECT_URI = "https://client.example/callback";
 const CLIENT_STATE = "client-state-value";
+const CODE_CHALLENGE = "challenge-value";
+const CODE_CHALLENGE_METHOD = "S256";
+const RESOURCE = `${HOST}/mcp`;
 const SHOPIFY_ACCESS_TOKEN = "shpua_exchanged_token";
 
 // Only the "generic 500" tests need this -- they deliberately trigger asyncHandler's error log,
@@ -66,9 +69,9 @@ function buildState(overrides: Record<string, string> = {}): string {
       clientId: CLIENT_ID,
       redirectUri: REDIRECT_URI,
       clientState: CLIENT_STATE,
-      codeChallenge: "challenge-value",
-      codeChallengeMethod: "S256",
-      resource: `${HOST}/mcp`,
+      codeChallenge: CODE_CHALLENGE,
+      codeChallengeMethod: CODE_CHALLENGE_METHOD,
+      resource: RESOURCE,
       nonce: "nonce-value",
       ...overrides,
     },
@@ -97,10 +100,18 @@ describe("shopifyCallbackController", () => {
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
 
     const code = new URL(redirectLocation(response)).searchParams.get("code") ?? "";
+    // Every field carried over from the verified state, not just the shop/client identity: these
+    // are exactly what /token (Task 17) will check against the PKCE verifier, the redirect_uri a
+    // client presents, and the resource it asks for -- a drift here is invisible until then, so
+    // pin all of it here, where it's written.
     expect(await consumeCode(config, code)).toMatchObject({
       shopId: DEMO_SHOP_ID,
       shopDomain: DEMO_SHOP,
       clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      codeChallenge: CODE_CHALLENGE,
+      codeChallengeMethod: CODE_CHALLENGE_METHOD,
+      resource: RESOURCE,
     });
   });
 
@@ -132,9 +143,9 @@ describe("shopifyCallbackController", () => {
         clientId: CLIENT_ID,
         redirectUri: "https://attacker.example/callback",
         clientState: CLIENT_STATE,
-        codeChallenge: "challenge-value",
-        codeChallengeMethod: "S256",
-        resource: `${HOST}/mcp`,
+        codeChallenge: CODE_CHALLENGE,
+        codeChallengeMethod: CODE_CHALLENGE_METHOD,
+        resource: RESOURCE,
         nonce: "nonce-value",
       },
       "an-entirely-different-state-secret",
@@ -167,7 +178,16 @@ describe("shopifyCallbackController", () => {
   });
 
   it("fails when Shopify's exchange returns an error status", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 401 })) as unknown as typeof fetch;
+    // The body is valid JSON carrying a real access_token, on purpose: this pins the exchange.ok
+    // gate itself, not the access-token gate below it. The previous fixture's body ("nope") wasn't
+    // valid JSON, so exchange.json() threw and the *access-token* check produced this test's 400
+    // -- deleting the exchange.ok check entirely left the whole suite green. With a parseable body
+    // that would otherwise satisfy every check downstream, only exchange.ok can still fail this.
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ access_token: SHOPIFY_ACCESS_TOKEN }), { status: 401 })
+      ) as unknown as typeof fetch;
     const response = await request(buildApp(buildConfig({ fetchImpl })))
       .get("/oauth/shopify-callback")
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });

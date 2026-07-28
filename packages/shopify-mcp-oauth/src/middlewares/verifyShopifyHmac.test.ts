@@ -64,6 +64,24 @@ describe("verifyShopifyHmac", () => {
     const hmac = crypto.createHmac("sha256", API_SECRET).update(sortedBase).digest("hex");
     expect(verifyShopifyHmac(`${rawOutOfOrder}&hmac=${hmac}`, API_SECRET)).toBe(true);
   });
+
+  it("rejects a query carrying more than one hmac parameter", () => {
+    // Shopify never sends two. Every "hmac=" pair is stripped from the signing base regardless of
+    // count, so a query smuggling a bogus extra one alongside the genuine value must not be
+    // accepted just because *some* pair happens to carry the right digest.
+    const message = `shop=${DEMO_SHOP}`;
+    const validHmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
+    expect(verifyShopifyHmac(`hmac=deadbeef&${message}&hmac=${validHmac}`, API_SECRET)).toBe(false);
+  });
+
+  it("rejects a digest that is a correct prefix of the real one, truncated by one character", () => {
+    // Pins that the comparison checks the whole digest, not merely a prefix -- safeEqual already
+    // rejects on a length mismatch, but nothing in this suite asserted that until now.
+    const message = `shop=${DEMO_SHOP}`;
+    const fullHmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
+    const truncatedHmac = fullHmac.slice(0, -1);
+    expect(verifyShopifyHmac(`${message}&hmac=${truncatedHmac}`, API_SECRET)).toBe(false);
+  });
 });
 
 describe("requireShopifyHmac", () => {
@@ -107,5 +125,30 @@ describe("requireShopifyHmac", () => {
     const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
     const response = await request(buildApp()).get(`/oauth/shopify-callback?${rawQueryWithoutHmac}&hmac=${hmac}`);
     expect(response.status).toBe(200);
+  });
+
+  it("verifies a raw query whose signed value contains a literal '?' (legal per RFC 3986)", async () => {
+    // RFC 3986's query component allows an unescaped "?" -- it's just another character of the
+    // query, not a delimiter, and Express's own req.query is built from everything after the
+    // *first* "?" regardless. Sourcing the signing base with String.prototype.split("?") instead
+    // of slicing from the first occurrence would truncate at this literal "?", losing the hmac
+    // param entirely and wrongly rejecting a legitimate callback.
+    const rawQueryWithoutHmac = `shop=${DEMO_SHOP}&state=a?b`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${rawQueryWithoutHmac}&hmac=${hmac}`);
+    expect(response.status).toBe(200);
+  });
+
+  it("rejects a query with unsigned parameters appended after a second '?' in the URL", async () => {
+    // The dangerous direction of the same gap: if requireShopifyHmac split on "?" instead of
+    // slicing from the first occurrence, an attacker-appended "?&shop=evil.myshopify.com" would
+    // sit entirely after the truncation point, so the signature would still verify against only
+    // the genuine prefix -- while Express's own req.query (parsed from everything after the
+    // *first* "?") would see a duplicated "shop" key this check never looked at.
+    const legitimateMessage = `code=abc&shop=${DEMO_SHOP}`;
+    const validHmac = crypto.createHmac("sha256", API_SECRET).update(legitimateMessage).digest("hex");
+    const maliciousQuery = `${legitimateMessage}&hmac=${validHmac}?&shop=evil.myshopify.com`;
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${maliciousQuery}`);
+    expect(response.status).toBe(400);
   });
 });

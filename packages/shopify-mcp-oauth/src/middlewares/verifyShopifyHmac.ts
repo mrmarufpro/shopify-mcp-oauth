@@ -28,9 +28,11 @@ function pairKey(pair: string): string {
 export function verifyShopifyHmac(queryString: string, secret: string): boolean {
   const pairs = queryString.split("&").filter(Boolean);
   let provided: string | undefined;
+  let hmacPairCount = 0;
   const rest: string[] = [];
   for (const pair of pairs) {
     if (pair.startsWith("hmac=")) {
+      hmacPairCount += 1;
       try {
         provided = decodeURIComponent(pair.slice("hmac=".length));
       } catch {
@@ -42,7 +44,11 @@ export function verifyShopifyHmac(queryString: string, secret: string): boolean 
       rest.push(pair);
     }
   }
-  if (!provided) return false;
+  // Shopify never sends more than one hmac parameter. Every "hmac=" pair is stripped from the
+  // signing base regardless of how many there are, so a query smuggling a second one would
+  // otherwise still hash correctly as long as *some* pair happens to carry the genuine value --
+  // reject outright instead of silently picking one (the loop above keeps the last).
+  if (hmacPairCount !== 1 || !provided) return false;
 
   // Sort by key, not by the whole "key=value" string: the documented algorithm sorts
   // parameters, and sorting whole pairs only coincidentally agrees once values differ in ways
@@ -65,7 +71,17 @@ export function verifyShopifyHmac(queryString: string, secret: string): boolean 
 
 export function requireShopifyHmac(secret: string): RequestHandler {
   return (req, res, next) => {
-    const queryString = req.originalUrl.split("?")[1] ?? "";
+    // req.originalUrl can legally contain more than one "?": RFC 3986's query component allows
+    // an unescaped "?", so a signed value like state=a?b puts a second "?" in the URL that isn't
+    // a delimiter. String.prototype.split("?") doesn't know that -- it splits on *every* "?", and
+    // [1] only ever returns the segment between the first and second one. That's wrong in both
+    // directions: it truncates (and so rejects) a legitimate callback whose value contains "?",
+    // and it lets an attacker append unsigned parameters after an injected second "?" that this
+    // check then never sees, even though Express's own req.query -- built from everything after
+    // the *first* "?" -- parses them anyway. Slicing from the first occurrence is the only way to
+    // recover the exact same query string Express itself parses.
+    const separatorIndex = req.originalUrl.indexOf("?");
+    const queryString = separatorIndex === -1 ? "" : req.originalUrl.slice(separatorIndex + 1);
     if (!verifyShopifyHmac(queryString, secret)) {
       res.status(400).type("text/plain").send("invalid hmac");
       return;
