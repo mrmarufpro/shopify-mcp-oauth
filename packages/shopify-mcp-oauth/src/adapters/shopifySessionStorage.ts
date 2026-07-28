@@ -14,12 +14,13 @@ export function shopifySessionStorage(sessionStorage: ShopifySessionStorageLike)
   return async (domain: string): Promise<ShopRef | null> => {
     try {
       const sessions = await sessionStorage.findSessionsByShop(domain);
-      // Validate the response is an array before using array methods.
+      // ShopifySessionStorageLike is structural, so the return type is not enforced at runtime.
       if (!Array.isArray(sessions)) {
         return null;
       }
-      // Only an offline session proves an app-level grant; online sessions are per-staff-member.
-      // Verify the session belongs to the queried domain.
+      // The shop check is not redundant with querying by domain: a custom session-store wrapper
+      // that filters loosely would otherwise let one shop's grant authorize another's. Only an
+      // offline session proves an app-level grant — online sessions are per-staff-member.
       const offline = sessions.find(
         (session) => session.shop === domain && !session.isOnline && Boolean(session.accessToken)
       );
