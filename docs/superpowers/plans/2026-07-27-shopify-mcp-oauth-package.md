@@ -987,6 +987,7 @@ git commit -m "feat: add HS256 state JWT for the Shopify round trip"
 - Create: `packages/shopify-mcp-oauth/src/adapters/memoryStorage.ts`
 - Create: `packages/shopify-mcp-oauth/src/adapters/memoryCache.ts`
 - Create: `packages/shopify-mcp-oauth/src/testing/storageContract.ts`
+- Modify: `packages/shopify-mcp-oauth/tsup.config.ts` (add the `testing` entry), `packages/shopify-mcp-oauth/package.json` (vitest as an optional peer dependency)
 - Test: `packages/shopify-mcp-oauth/src/adapters/memoryStorage.test.ts`, `packages/shopify-mcp-oauth/src/adapters/memoryCache.test.ts`
 
 **Interfaces:**
@@ -1130,7 +1131,7 @@ export function runStorageContractTests(
     });
 
     it("round-trips a created client", async () => {
-      await storage.createClient(buildClient({ clientName: "Contract Client" }));
+      await storage.createClient(buildClient({ clientName: "Contract Client", redirectUris: [CONTRACT_REDIRECT_URI] }));
       const found = await storage.findClient(CONTRACT_CLIENT_ID);
       expect(found?.clientName).toBe("Contract Client");
       expect(found?.redirectUris).toEqual([CONTRACT_REDIRECT_URI]);
@@ -1144,7 +1145,7 @@ export function runStorageContractTests(
     });
 
     it("finds a token by its access hash", async () => {
-      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "lookup-me" }));
+      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "lookup-me", clientId: CONTRACT_CLIENT_ID }));
       const found = await storage.findTokenByAccessHash("lookup-me");
       expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
     });
@@ -1166,7 +1167,7 @@ export function runStorageContractTests(
     });
 
     it("finds a token by its refresh hash", async () => {
-      await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup" }));
+      await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup", clientId: CONTRACT_CLIENT_ID }));
       const found = await storage.findTokenByRefreshHash("refresh-lookup");
       expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
     });
@@ -1241,11 +1242,37 @@ export interface MemoryStorage extends OAuthStorage {
   addShop(shop: ShopRef): void;
 }
 
+// Every read and write below goes through these clones so the Map never shares an array,
+// Date, or ShopRef instance with a caller — a caller mutating a returned or passed-in object
+// must never corrupt what's stored, and vice versa.
+function cloneShop(shop: ShopRef): ShopRef {
+  return { ...shop };
+}
+
+function cloneClient(client: OAuthClient): OAuthClient {
+  return {
+    ...client,
+    redirectUris: [...client.redirectUris],
+    grantTypes: client.grantTypes ? [...client.grantTypes] : null,
+    responseTypes: client.responseTypes ? [...client.responseTypes] : null,
+    revokedAt: client.revokedAt ? new Date(client.revokedAt) : null,
+  };
+}
+
+function cloneToken(token: StoredToken): StoredToken {
+  return {
+    ...token,
+    accessTokenExpiresAt: new Date(token.accessTokenExpiresAt),
+    refreshTokenExpiresAt: token.refreshTokenExpiresAt ? new Date(token.refreshTokenExpiresAt) : null,
+    revokedAt: token.revokedAt ? new Date(token.revokedAt) : null,
+  };
+}
+
 export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
   const clients = new Map<string, OAuthClient>();
   const tokens = new Map<string, StoredToken>();
   const shops = new Map<string, ShopRef>();
-  for (const shop of seed.shops ?? []) shops.set(shop.domain, shop);
+  for (const shop of seed.shops ?? []) shops.set(shop.domain, cloneShop(shop));
 
   function isUsable(token: StoredToken): boolean {
     return token.revokedAt === null && token.accessTokenExpiresAt.getTime() > Date.now();
@@ -1253,36 +1280,37 @@ export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
 
   return {
     addShop(shop) {
-      shops.set(shop.domain, shop);
+      shops.set(shop.domain, cloneShop(shop));
     },
 
     async findClient(clientId) {
-      return clients.get(clientId) ?? null;
+      const found = clients.get(clientId);
+      return found ? cloneClient(found) : null;
     },
 
     async createClient(client) {
-      const row: OAuthClient = { ...client, revokedAt: null };
+      const row: OAuthClient = cloneClient({ ...client, revokedAt: null });
       clients.set(row.clientId, row);
-      return row;
+      return cloneClient(row);
     },
 
     async upsertClient(client: NewOAuthClient) {
       const existing = clients.get(client.clientId);
-      if (existing) return existing;
-      const row: OAuthClient = { ...client, revokedAt: null };
+      if (existing) return cloneClient(existing);
+      const row: OAuthClient = cloneClient({ ...client, revokedAt: null });
       clients.set(row.clientId, row);
-      return row;
+      return cloneClient(row);
     },
 
     async createToken(token: NewToken) {
-      const row: StoredToken = { ...token, id: randomBase64Url(12), revokedAt: null };
+      const row: StoredToken = cloneToken({ ...token, id: randomBase64Url(12), revokedAt: null });
       tokens.set(row.id, row);
-      return row;
+      return cloneToken(row);
     },
 
     async findTokenByAccessHash(hash) {
       for (const token of tokens.values()) {
-        if (token.accessTokenHash === hash && isUsable(token)) return token;
+        if (token.accessTokenHash === hash && isUsable(token)) return cloneToken(token);
       }
       return null;
     },
@@ -1292,7 +1320,7 @@ export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
         if (token.refreshTokenHash !== hash) continue;
         if (token.revokedAt !== null) continue;
         if (token.refreshTokenExpiresAt && token.refreshTokenExpiresAt.getTime() <= Date.now()) continue;
-        return token;
+        return cloneToken(token);
       }
       return null;
     },
@@ -1300,7 +1328,7 @@ export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
     async revokeToken(id) {
       const token = tokens.get(id);
       if (!token || token.revokedAt !== null) return false;
-      tokens.set(id, { ...token, revokedAt: new Date() });
+      tokens.set(id, { ...cloneToken(token), revokedAt: new Date() });
       return true;
     },
 
@@ -1309,21 +1337,68 @@ export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
     },
 
     async findShopByDomain(domain) {
-      return shops.get(domain) ?? null;
+      const found = shops.get(domain);
+      return found ? cloneShop(found) : null;
     },
   };
 }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+Without these clones the adapter hands out live references to its own `Map` rows: mutating a
+returned client, or the array passed into `createClient`, silently corrupts the store with no
+second write. No SQL-backed adapter can behave that way — rows are deserialized fresh on every
+read — so a bug of that shape would surface only against this adapter, as action-at-a-distance.
+Reference-isolation tests belong in `memoryStorage.test.ts`, **not** in the shared contract
+suite: identity is a property of this adapter, and asserting it in the contract would wrongly
+constrain the Prisma adapter in Task 8.
+
+- [ ] **Step 6: Publish the `./testing` subpath and externalize vitest**
+
+`src/testing/storageContract.ts` is the first file to enter the build, so wire its entry here —
+Task 1 built the index alone because this file did not exist yet.
+
+`packages/shopify-mcp-oauth/tsup.config.ts` — add the second entry:
+
+```ts
+  entry: { index: "src/index.ts", testing: "src/testing/storageContract.ts" },
+```
+
+`packages/shopify-mcp-oauth/package.json` — vitest must become an **optional peer dependency**:
+
+```json
+  "peerDependencies": {
+    "express": ">=4.18",
+    "zod": ">=3.23",
+    "vitest": ">=2.0"
+  },
+  "peerDependenciesMeta": {
+    "vitest": { "optional": true }
+  }
+```
+
+Keep `vitest` in `devDependencies` as well — this package still runs its own suite.
+
+This is not bookkeeping. tsup externalizes `dependencies` and `peerDependencies` but **bundles**
+`devDependencies`, so with vitest listed only as a dev dependency the build inlines a private
+copy of it into `dist/testing.js` — roughly 545KB, and worse, the `describe`/`it`/`expect` an
+adopter imports would be a different module instance from the vitest actually running their
+suite, so the contract tests would never register. Optional, because an adopter who imports only
+the main entry never needs vitest installed.
+
+Verify: `pnpm --filter shopify-mcp-oauth build`, then confirm `dist/testing.js` is a few KB and
+contains an `import ... from "vitest"` rather than a bundled definition of `describe`.
+
+- [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `pnpm --filter shopify-mcp-oauth test src/adapters`
-Expected: PASS — 11 contract tests plus 2 memoryStorage tests plus 5 memoryCache tests.
+Expected: PASS — the contract suite runs once against `memoryStorage`, plus the `memoryCache`
+tests and the `memoryStorage` reference-isolation tests.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add packages/shopify-mcp-oauth/src/adapters packages/shopify-mcp-oauth/src/testing
+git add packages/shopify-mcp-oauth/src/adapters packages/shopify-mcp-oauth/src/testing \
+  packages/shopify-mcp-oauth/tsup.config.ts packages/shopify-mcp-oauth/package.json
 git commit -m "feat: add memory storage and cache adapters with a storage contract suite"
 ```
 
