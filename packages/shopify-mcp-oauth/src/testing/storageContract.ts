@@ -91,6 +91,24 @@ export function runStorageContractTests(
       expect(await storage.findTokenByAccessHash("revoke-me")).toBeNull();
     });
 
+    it("round-trips a token's resource field", async () => {
+      // Deliberately not buildToken's own default resource -- a fixture that coincided with it
+      // would pass even if an adapter silently dropped the field and fell back to some default.
+      const DISTINCT_RESOURCE = "https://mcp.example.com/mcp/reports";
+      const created = await storage.createToken(
+        buildToken(opts.seedShop, { accessTokenHash: "resource-roundtrip-hash", resource: DISTINCT_RESOURCE })
+      );
+      expect(created.resource).toBe(DISTINCT_RESOURCE);
+      const found = await storage.findTokenByAccessHash("resource-roundtrip-hash");
+      expect(found?.resource).toBe(DISTINCT_RESOURCE);
+    });
+
+    it("does not match an access hash by prefix or superset", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "full-access-hash-1234567890" }));
+      expect(await storage.findTokenByAccessHash("full-access-hash-123456789")).toBeNull();
+      expect(await storage.findTokenByAccessHash("full-access-hash-1234567890-extra")).toBeNull();
+    });
+
     it("findTokenByAccessHashIgnoringExpiry finds an expired-but-unrevoked token", async () => {
       await storage.createToken(
         buildToken(opts.seedShop, {

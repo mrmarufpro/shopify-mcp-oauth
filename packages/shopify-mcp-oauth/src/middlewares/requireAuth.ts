@@ -31,24 +31,33 @@ export function requireAuth(config: ResolvedConfig): RequestHandler {
   // asyncHandler is the seam that already owns that translation for every other handler.
   return asyncHandler(config.logger, async (req, res, next) => {
     const header = req.headers.authorization;
-    if (!header || !header.startsWith("Bearer ")) {
+    // RFC 7235 §2.1: the scheme token is case-insensitive ("Bearer", "bearer", "BEARER" all
+    // name the same scheme), so this must not reject a client that sent a lowercase scheme.
+    const BEARER_PREFIX_LENGTH = "Bearer ".length;
+    if (!header || header.slice(0, BEARER_PREFIX_LENGTH).toLowerCase() !== "bearer ") {
       return unauthorized(res, "missing_bearer");
     }
 
-    const token = header.slice("Bearer ".length).trim();
+    const token = header.slice(BEARER_PREFIX_LENGTH).trim();
     const stored = await config.storage.findTokenByAccessHash(sha256Hex(token));
     if (!stored) return unauthorized(res, "invalid_token");
 
     // RFC 8707: this authorization server only ever mints tokens scoped to its own resource
     // today, but the resource server must enforce the audience itself rather than trust that --
     // a storage adapter shared across multiple resource-server deployments must not let one
-    // accept a token scoped to another.
+    // accept a token scoped to another. Strict `!==`, not a null-safe narrowing: a token whose
+    // stored resource is null must fail this too, not slip through as "no claim to check".
     if (stored.resource !== config.resource) return unauthorized(res, "invalid_token");
 
     // A token outlives an uninstall, so confirm the shop is still known on every request.
     const shop = await config.storage.findShopByDomain(stored.shopDomain);
     if (!shop) return unauthorized(res, "invalid_token");
 
+    // Bound to the token's own shopId, not `shop.id` from the lookup above: if a shop uninstalls
+    // and reinstalls, the fresh row can get a new id while keeping the same domain. A token
+    // minted before the reinstall must not silently gain access to the new installation --
+    // binding to stored.shopId fails closed (a downstream lookup keyed on the stale id finds
+    // nothing), while binding to the freshly-looked-up shop.id would fail open.
     req.mcp = { shopId: stored.shopId, shopDomain: stored.shopDomain, tokenId: stored.id };
     config.storage.touchToken(stored.id, new Date()).catch(() => {});
     next();
