@@ -118,6 +118,13 @@ export interface OAuthStorage {
   upsertClient(client: NewOAuthClient): Promise<OAuthClient>;
   createToken(token: NewToken): Promise<StoredToken>;
   findTokenByAccessHash(hash: string): Promise<StoredToken | null>;
+  /**
+   * Same match as findTokenByAccessHash, but ignores accessTokenExpiresAt — an expired access
+   * token still names a real grant, and /revoke must be able to kill that grant (including its
+   * still-live refresh token) after the access token has expired. Still excludes an already-
+   * revoked row, so this can't resurrect a dead grant.
+   */
+  findTokenByAccessHashIgnoringExpiry(hash: string): Promise<StoredToken | null>;
   findTokenByRefreshHash(hash: string): Promise<StoredToken | null>;
   /** Returns false when the row was already revoked. Rotation relies on this for one-time use. */
   revokeToken(id: string): Promise<boolean>;
@@ -129,8 +136,13 @@ export interface CacheStore {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ttlSeconds: number): Promise<void>;
   del(key: string): Promise<void>;
-  /** Atomic read-and-delete when the backend supports it. Falls back to get+del. */
-  getdel?(key: string): Promise<string | null>;
+  /**
+   * Read and delete in a single atomic step: of two concurrent callers on the same key, exactly
+   * one may see the value. This is what makes an authorization code single-use, so a get-then-del
+   * implementation is not a valid substitute — required, not optional, so a non-atomic cache is
+   * rejected at the type level instead of silently allowing a code to be redeemed twice.
+   */
+  getdel(key: string): Promise<string | null>;
 }
 
 export interface Logger {
