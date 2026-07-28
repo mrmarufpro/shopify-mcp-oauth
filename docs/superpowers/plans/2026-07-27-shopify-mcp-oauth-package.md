@@ -6032,7 +6032,12 @@ const API_SECRET = "test-api-secret";
 const DEMO_SHOP = "demo.myshopify.com";
 
 function signQuery(params: Record<string, string>): string {
-  const message = new URLSearchParams(params).toString();
+  // Sorted by key, mirroring the algorithm verifyShopifyHmac itself applies (and the one
+  // Shopify's docs document for the sibling installation-request HMAC) -- this is what makes
+  // signQuery an accurate stand-in for "how Shopify signs a callback", not just "any string this
+  // suite's own signer and verifier happen to agree on".
+  const sortedEntries = Object.entries(params).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  const message = new URLSearchParams(sortedEntries).toString();
   const hmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
   return `${message}&hmac=${hmac}`;
 }
@@ -6054,6 +6059,53 @@ describe("verifyShopifyHmac", () => {
   it("rejects a signature made with a different secret", () => {
     expect(verifyShopifyHmac(signQuery({ shop: DEMO_SHOP }), "a-different-secret")).toBe(false);
   });
+
+  it("fails closed instead of throwing when the hmac value is malformed percent-encoding", () => {
+    // decodeURIComponent throws a URIError on a lone "%"; this pins the guard's own failure mode
+    // (return false) rather than letting that throw escape into an unhandled middleware crash.
+    expect(() => verifyShopifyHmac(`shop=${DEMO_SHOP}&hmac=%`, API_SECRET)).not.toThrow();
+    expect(verifyShopifyHmac(`shop=${DEMO_SHOP}&hmac=%`, API_SECRET)).toBe(false);
+  });
+
+  it("verifies a raw %20-encoded space, which a decode/re-encode round trip would turn into a +", () => {
+    // A space is %20 in a raw query string but re-serializes as + under URLSearchParams (or
+    // querystring.stringify) once it has been decoded -- so a signed message built from the raw
+    // bytes and one rebuilt from the decoded value diverge for this exact byte, and only the raw
+    // one is what Shopify actually signed.
+    const rawQueryWithoutHmac = `shop=${DEMO_SHOP}&state=a%20b`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
+    expect(verifyShopifyHmac(`${rawQueryWithoutHmac}&hmac=${hmac}`, API_SECRET)).toBe(true);
+  });
+
+  it("verifies a query whose parameters were received out of alphabetical order", () => {
+    // Shopify's own callback field set (code, hmac, host, shop, state, timestamp) already arrives
+    // in alphabetical order in practice, which is exactly the coincidence that let an
+    // un-sorted implementation pass every other test in this file. Reorder deliberately, and sign
+    // over the *sorted* base string per the documented algorithm: this only holds if
+    // verifyShopifyHmac actually sorts before hashing, not merely joins whatever order it received.
+    const rawOutOfOrder = `timestamp=1700000000&shop=${DEMO_SHOP}&code=abc`;
+    const sortedBase = `code=abc&shop=${DEMO_SHOP}&timestamp=1700000000`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(sortedBase).digest("hex");
+    expect(verifyShopifyHmac(`${rawOutOfOrder}&hmac=${hmac}`, API_SECRET)).toBe(true);
+  });
+
+  it("rejects a query carrying more than one hmac parameter", () => {
+    // Shopify never sends two. Every "hmac=" pair is stripped from the signing base regardless of
+    // count, so a query smuggling a bogus extra one alongside the genuine value must not be
+    // accepted just because *some* pair happens to carry the right digest.
+    const message = `shop=${DEMO_SHOP}`;
+    const validHmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
+    expect(verifyShopifyHmac(`hmac=deadbeef&${message}&hmac=${validHmac}`, API_SECRET)).toBe(false);
+  });
+
+  it("rejects a digest that is a correct prefix of the real one, truncated by one character", () => {
+    // Pins that the comparison checks the whole digest, not merely a prefix -- safeEqual already
+    // rejects on a length mismatch, but nothing in this suite asserted that until now.
+    const message = `shop=${DEMO_SHOP}`;
+    const fullHmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
+    const truncatedHmac = fullHmac.slice(0, -1);
+    expect(verifyShopifyHmac(`${message}&hmac=${truncatedHmac}`, API_SECRET)).toBe(false);
+  });
 });
 
 describe("requireShopifyHmac", () => {
@@ -6074,6 +6126,55 @@ describe("requireShopifyHmac", () => {
     const response = await request(buildApp()).get(`/oauth/shopify-callback?shop=${DEMO_SHOP}`);
     expect(response.status).toBe(400);
   });
+
+  it("blocks a request whose parameter was tampered with after signing, with 400", async () => {
+    const signed = signQuery({ shop: DEMO_SHOP, code: "abc" });
+    const tampered = signed.replace("code=abc", "code=xyz");
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${tampered}`);
+    expect(response.status).toBe(400);
+    expect(response.text).toBe("invalid hmac");
+  });
+
+  it("verifies against the raw query string Express received, not a rebuild from req.query", async () => {
+    // This is the binding constraint of this whole module: the message must come from
+    // req.originalUrl, never be reconstructed from req.query. A %20-encoded space is the vector
+    // that exposes a rebuild -- Express decodes it to a literal space in req.query, and
+    // re-serializing that (via URLSearchParams, querystring.stringify, or an object) turns it back
+    // into "+", not "%20", producing a different base string and therefore a different digest. If
+    // requireShopifyHmac is ever changed to source its queryString from req.query instead of
+    // req.originalUrl, this test goes red even though every other test in this file -- whose
+    // signed values never contain a character with more than one valid percent-encoding -- stays
+    // green.
+    const rawQueryWithoutHmac = `shop=${DEMO_SHOP}&state=a%20b`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${rawQueryWithoutHmac}&hmac=${hmac}`);
+    expect(response.status).toBe(200);
+  });
+
+  it("verifies a raw query whose signed value contains a literal '?' (legal per RFC 3986)", async () => {
+    // RFC 3986's query component allows an unescaped "?" -- it's just another character of the
+    // query, not a delimiter, and Express's own req.query is built from everything after the
+    // *first* "?" regardless. Sourcing the signing base with String.prototype.split("?") instead
+    // of slicing from the first occurrence would truncate at this literal "?", losing the hmac
+    // param entirely and wrongly rejecting a legitimate callback.
+    const rawQueryWithoutHmac = `shop=${DEMO_SHOP}&state=a?b`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${rawQueryWithoutHmac}&hmac=${hmac}`);
+    expect(response.status).toBe(200);
+  });
+
+  it("rejects a query with unsigned parameters appended after a second '?' in the URL", async () => {
+    // The dangerous direction of the same gap: if requireShopifyHmac split on "?" instead of
+    // slicing from the first occurrence, an attacker-appended "?&shop=evil.myshopify.com" would
+    // sit entirely after the truncation point, so the signature would still verify against only
+    // the genuine prefix -- while Express's own req.query (parsed from everything after the
+    // *first* "?") would see a duplicated "shop" key this check never looked at.
+    const legitimateMessage = `code=abc&shop=${DEMO_SHOP}`;
+    const validHmac = crypto.createHmac("sha256", API_SECRET).update(legitimateMessage).digest("hex");
+    const maliciousQuery = `${legitimateMessage}&hmac=${validHmac}?&shop=evil.myshopify.com`;
+    const response = await request(buildApp()).get(`/oauth/shopify-callback?${maliciousQuery}`);
+    expect(response.status).toBe(400);
+  });
 });
 ```
 
@@ -6087,18 +6188,29 @@ import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
 import { consumeCode } from "../services/codes";
 import { signOuterState } from "../services/stateJwt";
+import type { Logger } from "../types";
 import { shopifyCallbackController } from "./shopifyCallback";
 
 const HOST = "https://mcp.example.com";
 const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
+const API_SECRET_CANARY = "test-api-secret";
 const DEMO_SHOP = "demo.myshopify.com";
 const DEMO_SHOP_ID = "shop_1";
 const CLIENT_ID = "test-client-id";
 const REDIRECT_URI = "https://client.example/callback";
 const CLIENT_STATE = "client-state-value";
+const CODE_CHALLENGE = "challenge-value";
+const CODE_CHALLENGE_METHOD = "S256";
+const RESOURCE = `${HOST}/mcp`;
 const SHOPIFY_ACCESS_TOKEN = "shpua_exchanged_token";
 
-function buildConfig(overrides: { installed?: boolean; fetchImpl?: typeof fetch } = {}): ResolvedConfig {
+// Only the "generic 500" tests need this -- they deliberately trigger asyncHandler's error log,
+// and the default console logger would print a stack trace on every full-suite run otherwise.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+function buildConfig(
+  overrides: { installed?: boolean; fetchImpl?: typeof fetch; logger?: Logger } = {}
+): ResolvedConfig {
   const installed = overrides.installed ?? true;
   const storage = memoryStorage({ shops: installed ? [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] : [] });
   const fetchImpl =
@@ -6112,10 +6224,11 @@ function buildConfig(overrides: { installed?: boolean; fetchImpl?: typeof fetch 
 
   return resolveConfig({
     host: HOST,
-    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
+    shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
     stateSecret: STATE_SECRET,
     storage,
     fetchImpl,
+    logger: overrides.logger,
   });
 }
 
@@ -6126,15 +6239,22 @@ function buildApp(config: ResolvedConfig) {
   return app;
 }
 
+// supertest/superagent types response.headers as a plain string-keyed record, so
+// noUncheckedIndexedAccess widens response.headers.location to string | undefined even though a
+// 302 always sets it -- every caller here already depends on that redirect having happened.
+function redirectLocation(response: request.Response): string {
+  return response.headers.location ?? "";
+}
+
 function buildState(overrides: Record<string, string> = {}): string {
   return signOuterState(
     {
       clientId: CLIENT_ID,
       redirectUri: REDIRECT_URI,
       clientState: CLIENT_STATE,
-      codeChallenge: "challenge-value",
-      codeChallengeMethod: "S256",
-      resource: `${HOST}/mcp`,
+      codeChallenge: CODE_CHALLENGE,
+      codeChallengeMethod: CODE_CHALLENGE_METHOD,
+      resource: RESOURCE,
       nonce: "nonce-value",
       ...overrides,
     },
@@ -6150,7 +6270,7 @@ describe("shopifyCallbackController", () => {
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
 
     expect(response.status).toBe(302);
-    const location = new URL(response.headers.location);
+    const location = new URL(redirectLocation(response));
     expect(`${location.origin}${location.pathname}`).toBe(REDIRECT_URI);
     expect(location.searchParams.get("state")).toBe(CLIENT_STATE);
     expect(location.searchParams.get("code")).toBeTruthy();
@@ -6162,14 +6282,28 @@ describe("shopifyCallbackController", () => {
       .get("/oauth/shopify-callback")
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
 
-    const code = new URL(response.headers.location).searchParams.get("code") ?? "";
-    expect(await consumeCode(config, code)).toMatchObject({ shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const code = new URL(redirectLocation(response)).searchParams.get("code") ?? "";
+    // Every field carried over from the verified state, not just the shop/client identity: these
+    // are exactly what /token (Task 17) will check against the PKCE verifier, the redirect_uri a
+    // client presents, and the resource it asks for -- a drift here is invisible until then, so
+    // pin all of it here, where it's written.
+    expect(await consumeCode(config, code)).toMatchObject({
+      shopId: DEMO_SHOP_ID,
+      shopDomain: DEMO_SHOP,
+      clientId: CLIENT_ID,
+      redirectUri: REDIRECT_URI,
+      codeChallenge: CODE_CHALLENGE,
+      codeChallengeMethod: CODE_CHALLENGE_METHOD,
+      resource: RESOURCE,
+    });
   });
 
   it("exchanges the Shopify code against the shop's own domain", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ access_token: SHOPIFY_ACCESS_TOKEN }), { status: 200 })
-    ) as unknown as typeof fetch;
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ access_token: SHOPIFY_ACCESS_TOKEN }), { status: 200 })
+      ) as unknown as typeof fetch;
     await request(buildApp(buildConfig({ fetchImpl })))
       .get("/oauth/shopify-callback")
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
@@ -6192,9 +6326,9 @@ describe("shopifyCallbackController", () => {
         clientId: CLIENT_ID,
         redirectUri: "https://attacker.example/callback",
         clientState: CLIENT_STATE,
-        codeChallenge: "challenge-value",
-        codeChallengeMethod: "S256",
-        resource: `${HOST}/mcp`,
+        codeChallenge: CODE_CHALLENGE,
+        codeChallengeMethod: CODE_CHALLENGE_METHOD,
+        resource: RESOURCE,
         nonce: "nonce-value",
       },
       "an-entirely-different-state-secret",
@@ -6216,7 +6350,9 @@ describe("shopifyCallbackController", () => {
   });
 
   it("fails when Shopify's exchange returns no access token", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })) as unknown as typeof fetch;
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })) as unknown as typeof fetch;
     const response = await request(buildApp(buildConfig({ fetchImpl })))
       .get("/oauth/shopify-callback")
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
@@ -6225,12 +6361,74 @@ describe("shopifyCallbackController", () => {
   });
 
   it("fails when Shopify's exchange returns an error status", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 401 })) as unknown as typeof fetch;
+    // The body is valid JSON carrying a real access_token, on purpose: this pins the exchange.ok
+    // gate itself, not the access-token gate below it. The previous fixture's body ("nope") wasn't
+    // valid JSON, so exchange.json() threw and the *access-token* check produced this test's 400
+    // -- deleting the exchange.ok check entirely left the whole suite green. With a parseable body
+    // that would otherwise satisfy every check downstream, only exchange.ok can still fail this.
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ access_token: SHOPIFY_ACCESS_TOKEN }), { status: 401 })
+      ) as unknown as typeof fetch;
     const response = await request(buildApp(buildConfig({ fetchImpl })))
       .get("/oauth/shopify-callback")
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
 
     expect(response.status).toBe(400);
+  });
+
+  it("classifies a network-level exchange failure as 400 with fixed text, never the raw error", async () => {
+    // A connection-refused-style rejection from fetchImpl itself (not a Shopify response) is
+    // server-side detail about how *we* tried to reach Shopify, not a judgment about the
+    // merchant's request -- it must not ride the caught error's .message into the response body,
+    // the same leak that cost the CIMD resolver (services/cimd.ts) a fixed-text rule of its own.
+    const canaryMessage = "connect ECONNREFUSED 10.1.2.3:443";
+    const fetchImpl = vi.fn().mockRejectedValue(new TypeError(canaryMessage)) as unknown as typeof fetch;
+    const response = await request(buildApp(buildConfig({ fetchImpl })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(400);
+    expect(response.text).not.toContain(canaryMessage);
+    expect(response.text).not.toContain("10.1.2.3");
+  });
+
+  it("returns a generic 500 without leaking internal detail when the shop lookup fails", async () => {
+    // findShopByDomain is our own storage, not a statement about the merchant's request -- an
+    // outage there must propagate as an ordinary Error and reach asyncHandler's generic 500,
+    // never be reflected into a 4xx body.
+    const config = buildConfig({ logger: silentLogger });
+    vi.spyOn(config.storage, "findShopByDomain").mockRejectedValue(
+      new Error("storage unavailable: connection to db.internal.example refused")
+    );
+    const response = await request(buildApp(config))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    const raw = JSON.stringify(response.body);
+    expect(raw).not.toContain("db.internal.example");
+    expect(raw).not.toContain(API_SECRET_CANARY);
+    expect(raw).not.toContain(STATE_SECRET);
+  });
+
+  it("returns a generic 500 without leaking internal detail when issuing the code fails", async () => {
+    // issueCode's cache write is our own infrastructure too (see services/codes.ts); a failure
+    // there is symmetric with the storage case above and must land on the same generic 500 path.
+    const config = buildConfig({ logger: silentLogger });
+    vi.spyOn(config.cache, "set").mockRejectedValue(new Error("cache unavailable: redis.internal.example timed out"));
+    const response = await request(buildApp(config))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    const raw = JSON.stringify(response.body);
+    expect(raw).not.toContain("redis.internal.example");
+    expect(raw).not.toContain(API_SECRET_CANARY);
+    expect(raw).not.toContain(STATE_SECRET);
   });
 });
 ```
@@ -6249,26 +6447,84 @@ import { safeEqual } from "../crypto";
 
 // Shopify signs the raw, URL-encoded query string it sent. Rebuilding the message from decoded
 // values (req.query) re-encodes reserved characters differently and produces a mismatched base
-// string for parameters like redirect_uri.
+// string, so this always works from the raw string Express received (req.originalUrl), never
+// from req.query.
+//
+// The remaining parameters are sorted by key before hashing. Shopify's docs state this
+// explicitly for the *installation-request* HMAC ("the remaining parameters must be sorted
+// alphabetically as strings, in the format parameter_name=parameter_value") but this module
+// verifies the *OAuth callback* HMAC, a different request whose own doc section only says "the
+// hmac is valid and signed by Shopify" and defers to a library -- it doesn't restate an
+// algorithm. Shopify's own shopify-api-js library uses one shared, always-sorted code path for
+// both requests, and there's no separate order-preserving scheme documented or implemented
+// anywhere, so this reads the callback's terse wording as shorthand for the installation
+// request's algorithm, not an unspecified alternative -- and sorts here too. For this endpoint's
+// fixed field set (code, hmac, host, shop, state, timestamp), Shopify's actual send order already
+// is alphabetical, so this has no effect on real traffic today -- but that's a property of this
+// field set, not something documented, so don't rely on it: sort explicitly rather than trust
+// received order to keep coinciding as fields change.
+function pairKey(pair: string): string {
+  const separatorIndex = pair.indexOf("=");
+  return separatorIndex === -1 ? pair : pair.slice(0, separatorIndex);
+}
+
 export function verifyShopifyHmac(queryString: string, secret: string): boolean {
   const pairs = queryString.split("&").filter(Boolean);
   let provided: string | undefined;
+  let hmacPairCount = 0;
   const rest: string[] = [];
   for (const pair of pairs) {
     if (pair.startsWith("hmac=")) {
-      provided = decodeURIComponent(pair.slice("hmac=".length));
+      hmacPairCount += 1;
+      try {
+        provided = decodeURIComponent(pair.slice("hmac=".length));
+      } catch {
+        // A malformed percent-encoding in the hmac param can't be a digest Shopify produced;
+        // fail closed rather than letting decodeURIComponent's throw escape this function.
+        return false;
+      }
     } else {
       rest.push(pair);
     }
   }
-  if (!provided) return false;
-  const computed = crypto.createHmac("sha256", secret).update(rest.join("&")).digest("hex");
+  // Shopify never sends more than one hmac parameter. Every "hmac=" pair is stripped from the
+  // signing base regardless of how many there are, so a query smuggling a second one would
+  // otherwise still hash correctly as long as *some* pair happens to carry the genuine value --
+  // reject outright instead of silently picking one (the loop above keeps the last).
+  if (hmacPairCount !== 1 || !provided) return false;
+
+  // Sort by key, not by the whole "key=value" string: the documented algorithm sorts
+  // parameters, and sorting whole pairs only coincidentally agrees once values differ in ways
+  // that could shift the comparison. The key is sliced off with indexOf("=") -- never decoded --
+  // so the sort itself never re-encodes a byte of what it's ordering. A plain code-unit
+  // comparison, not localeCompare: localeCompare's result depends on the host's ICU/locale data,
+  // which has no business affecting a signature check that must agree byte-for-byte with a
+  // remote party. For Shopify's ASCII parameter names the two agree, so this is strictly safer
+  // with no behavioral downside. Array.prototype.sort is spec-guaranteed stable, so pairs sharing
+  // a key keep their received relative order.
+  const sorted = [...rest].sort((left, right) => {
+    const leftKey = pairKey(left);
+    const rightKey = pairKey(right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+
+  const computed = crypto.createHmac("sha256", secret).update(sorted.join("&")).digest("hex");
   return safeEqual(provided, computed);
 }
 
 export function requireShopifyHmac(secret: string): RequestHandler {
   return (req, res, next) => {
-    const queryString = req.originalUrl.split("?")[1] ?? "";
+    // req.originalUrl can legally contain more than one "?": RFC 3986's query component allows
+    // an unescaped "?", so a signed value like state=a?b puts a second "?" in the URL that isn't
+    // a delimiter. String.prototype.split("?") doesn't know that -- it splits on *every* "?", and
+    // [1] only ever returns the segment between the first and second one. That's wrong in both
+    // directions: it truncates (and so rejects) a legitimate callback whose value contains "?",
+    // and it lets an attacker append unsigned parameters after an injected second "?" that this
+    // check then never sees, even though Express's own req.query -- built from everything after
+    // the *first* "?" -- parses them anyway. Slicing from the first occurrence is the only way to
+    // recover the exact same query string Express itself parses.
+    const separatorIndex = req.originalUrl.indexOf("?");
+    const queryString = separatorIndex === -1 ? "" : req.originalUrl.slice(separatorIndex + 1);
     if (!verifyShopifyHmac(queryString, secret)) {
       res.status(400).type("text/plain").send("invalid hmac");
       return;
@@ -6319,11 +6575,13 @@ export function shopifyCallbackController(config: ResolvedConfig): RequestHandle
           code: query.code,
         }),
       });
-    } catch (error) {
-      res
-        .status(400)
-        .type("text/plain")
-        .send(`shopify exchange failed: ${(error as Error).message}`);
+    } catch {
+      // Fixed text, not the caught error's message: a raw network error can carry connection-
+      // level detail about how *we* tried to reach Shopify, not a judgment about the merchant's
+      // own request. Classifying it as a 400 here still matches how resolveCimdClient treats its
+      // own fetch failures (see services/cimd.ts) -- "we couldn't complete the exchange" is as
+      // safe to say as any of the checks below.
+      res.status(400).type("text/plain").send("shopify token exchange could not be completed");
       return;
     }
     if (!exchange.ok) {
