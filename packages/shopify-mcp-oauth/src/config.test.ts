@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { memoryCache } from "./adapters/memoryCache";
 import { memoryStorage } from "./adapters/memoryStorage";
 import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
 
@@ -48,6 +49,22 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig(buildConfig({ host: "mcp.example.com" }))).toThrow(/host/);
   });
 
+  it("rejects a host with a query string", () => {
+    expect(() => resolveConfig(buildConfig({ host: `${HOST}?x=1` }))).toThrow(/host/);
+  });
+
+  it("rejects a host with a fragment", () => {
+    expect(() => resolveConfig(buildConfig({ host: `${HOST}#frag` }))).toThrow(/host/);
+  });
+
+  it("rejects a host with no hostname", () => {
+    expect(() => resolveConfig(buildConfig({ host: "https:///" }))).toThrow(/host/);
+  });
+
+  it("keeps a base path when deriving the resource", () => {
+    expect(resolveConfig(buildConfig({ host: `${HOST}/base` })).resource).toBe(`${HOST}/base/mcp`);
+  });
+
   it("rejects a state secret shorter than 32 characters", () => {
     expect(() => resolveConfig(buildConfig({ stateSecret: "too-short" }))).toThrow(/stateSecret/);
   });
@@ -57,7 +74,27 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig(config)).toThrow(/apiSecret/);
   });
 
+  it("reports every invalid field, not just the first", () => {
+    const config = buildConfig({ host: "not-a-host", stateSecret: "too-short" });
+    expect(() => resolveConfig(config)).toThrow(/host/);
+    expect(() => resolveConfig(config)).toThrow(/stateSecret/);
+  });
+
   it("defaults the openai challenge token to null", () => {
     expect(resolveConfig(buildConfig()).openaiAppsChallengeToken).toBeNull();
+  });
+
+  it("warns when no cache is supplied", () => {
+    const warn = vi.fn();
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() } }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("single-process"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("redisCache"));
+  });
+
+  it("does not warn when a cache is supplied", () => {
+    const warn = vi.fn();
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, cache: memoryCache() }));
+    expect(warn).not.toHaveBeenCalled();
   });
 });

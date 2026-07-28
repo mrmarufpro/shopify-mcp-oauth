@@ -33,11 +33,41 @@ export interface ResolvedConfig {
   fetchImpl: typeof fetch;
 }
 
+const CACHE_FALLBACK_WARNING =
+  "shopify-mcp-oauth: no cache supplied, falling back to an in-memory cache. This cache is single-process, so " +
+  "authorization codes and rate-limit counters written by one instance are invisible to the others and login " +
+  "will fail intermittently across multiple instances — supply a shared cache such as redisCache in production.";
+
+// A prefix regex only checks the string starts with a scheme; new URL() also catches a missing
+// hostname, a query string, or a fragment, none of which are valid in the resource identifier
+// this host is used to derive.
+function validateHost(value: string, ctx: z.RefinementCtx): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must be an absolute http(s) URL" });
+    return;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must use the http or https protocol" });
+    return;
+  }
+  if (!url.hostname) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must include a hostname" });
+    return;
+  }
+  if (url.search) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a query string" });
+    return;
+  }
+  if (url.hash) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a fragment" });
+  }
+}
+
 const configSchema = z.object({
-  host: z
-    .string()
-    .min(1, "host is required")
-    .refine((value) => /^https?:\/\//.test(value), "host must be an absolute http(s) URL"),
+  host: z.string().min(1, "host is required").superRefine(validateHost),
   shopify: z.object({
     apiKey: z.string().min(1, "shopify.apiKey is required"),
     apiSecret: z.string().min(1, "shopify.apiSecret is required"),
@@ -54,13 +84,17 @@ const configSchema = z.object({
 export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
   const parsed = configSchema.safeParse(input);
   if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    const path = issue?.path.join(".") ?? "config";
-    throw new Error(`shopify-mcp-oauth config invalid at "${path}": ${issue?.message ?? "unknown error"}`);
+    const details = parsed.error.issues
+      .map((issue) => `"${issue.path.join(".") || "config"}": ${issue.message}`)
+      .join("; ");
+    throw new Error(`shopify-mcp-oauth config invalid at ${details}`);
   }
   if (!input.storage) throw new Error('shopify-mcp-oauth config invalid at "storage": storage is required');
 
   const host = parsed.data.host.replace(/\/+$/, "");
+  const logger = input.logger ?? console;
+
+  if (!input.cache) logger.warn(CACHE_FALLBACK_WARNING);
 
   return {
     host,
@@ -75,7 +109,7 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
     },
     openaiAppsChallengeToken: parsed.data.openaiAppsChallengeToken ?? null,
     registerRateLimit: parsed.data.registerRateLimit ?? DEFAULT_REGISTER_RATE_LIMIT,
-    logger: input.logger ?? console,
+    logger,
     fetchImpl: input.fetchImpl ?? fetch,
   };
 }
