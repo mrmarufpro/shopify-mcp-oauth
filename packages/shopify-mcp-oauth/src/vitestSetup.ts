@@ -2,8 +2,9 @@ import { afterEach } from "vitest";
 
 // Captured once, at module load -- before any test in this file has had a chance to call
 // vi.useFakeTimers() -- so this cool-down is immune to fake-timer state a test leaves active.
-// A few tests in this package fake timers (services/tokens.test.ts, services/cimd.test.ts,
-// controllers/revoke.test.ts) and all restore real timers before their own test body returns, but
+// Five files in this package fake timers (middlewares/requireAuth.test.ts,
+// testing/cacheContract.ts, controllers/revoke.test.ts, services/cimd.test.ts,
+// services/tokens.test.ts) and all restore real timers before their own test body returns, but
 // relying on afterEach hook ordering between this file and a test file's own afterEach to
 // guarantee that would be fragile; a real setTimeout reference sidesteps the question entirely.
 const realSetTimeout = globalThis.setTimeout;

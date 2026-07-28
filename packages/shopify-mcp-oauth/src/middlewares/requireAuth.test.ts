@@ -252,6 +252,49 @@ describe("requireAuth", () => {
     expect(downstream).not.toHaveBeenCalled();
   });
 
+  it("accepts a token whose shopId is a number when the shop row's id is the equivalent string", async () => {
+    // The String() coercion in the ownership check exists exactly for this: an adapter that
+    // stores shopId as a number on the token but returns it as a string from the row lookup (or
+    // vice versa, see the next test) is still the same shop -- a raw !== would lock it out.
+    const NUMERIC_SHOP_ID = 4242;
+    const config = resolveConfig({
+      host: HOST,
+      shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+      stateSecret: STATE_SECRET_CANARY,
+      storage: memoryStorage({ shops: [{ id: String(NUMERIC_SHOP_ID), domain: DEMO_SHOP }] }),
+    });
+    const tokens = await issueTokens(config, { shopId: NUMERIC_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+
+    expect(response.status).toBe(200);
+  });
+
+  it("accepts a token whose shopId is a string when the shop row's id is the equivalent number", async () => {
+    const NUMERIC_SHOP_ID = 4242;
+    const config = resolveConfig({
+      host: HOST,
+      shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
+      stateSecret: STATE_SECRET_CANARY,
+      storage: memoryStorage({ shops: [{ id: NUMERIC_SHOP_ID, domain: DEMO_SHOP }] }),
+    });
+    const tokens = await issueTokens(config, {
+      shopId: String(NUMERIC_SHOP_ID),
+      shopDomain: DEMO_SHOP,
+      clientId: CLIENT_ID,
+    });
+
+    const response = await request(buildApp(config))
+      .post("/mcp")
+      .set("Authorization", `Bearer ${tokens.access_token}`)
+      .send({});
+
+    expect(response.status).toBe(200);
+  });
+
   it("points a 401 at the protected-resource metadata document when the header is missing", async () => {
     const response = await request(buildApp(buildConfig())).post("/mcp").send({});
     expect(response.headers["www-authenticate"]).toContain(`${HOST}/.well-known/oauth-protected-resource`);
