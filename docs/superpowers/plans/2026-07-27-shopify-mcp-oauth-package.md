@@ -2249,6 +2249,28 @@ describe("resolveConfig", () => {
     expect(resolveConfig(buildConfig({ host: `${HOST}/base` })).resource).toBe(`${HOST}/base/mcp`);
   });
 
+  it("rejects a host with a username and password", () => {
+    expect(() => resolveConfig(buildConfig({ host: "https://user:pass@mcp.example.com" }))).toThrow(/host/);
+  });
+
+  it("rejects a host with just a username", () => {
+    expect(() => resolveConfig(buildConfig({ host: "https://attacker@mcp.example.com" }))).toThrow(/host/);
+  });
+
+  it("lowercases an uppercase host", () => {
+    expect(resolveConfig(buildConfig({ host: "HTTPS://MCP.EXAMPLE.COM" })).resource).toBe(`${HOST}/mcp`);
+  });
+
+  it("drops an explicit default port", () => {
+    expect(resolveConfig(buildConfig({ host: `${HOST}:443` })).resource).toBe(`${HOST}/mcp`);
+  });
+
+  it("produces a single slash before mcp for a plain host with no path", () => {
+    const resolved = resolveConfig(buildConfig({ host: HOST }));
+    expect(resolved.host).toBe(HOST);
+    expect(resolved.resource).toBe(`${HOST}/mcp`);
+  });
+
   it("reports every invalid field, not just the first", () => {
     const config = buildConfig({ host: "not-a-url", stateSecret: "too-short" });
     expect(() => resolveConfig(config)).toThrow(/host/);
@@ -2337,6 +2359,12 @@ function validateHost(value: string, ctx: z.RefinementCtx): void {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must include a hostname" });
     return;
   }
+  // `resource` is published in the protected-resource metadata document and written into every
+  // token's audience, so credentials embedded in the host would reach a public endpoint.
+  if (url.username || url.password) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a username or password" });
+    return;
+  }
   if (url.search) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a query string" });
     return;
@@ -2373,9 +2401,12 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
   }
   if (!input.storage) throw new Error('shopify-mcp-oauth config invalid at "storage": storage is required');
 
-  // Strip before deriving `resource`, or a host given with a trailing slash yields a double slash
-  // in the identifier that later tasks compare against token audience values.
-  const host = parsed.data.host.replace(/\/+$/, "");
+  // Derive from the parsed URL, not the raw string, so the scheme and hostname lowercase and a
+  // default port drops. Token-audience matching against `resource` is plain string equality, so an
+  // unnormalized host fails it silently. Strip trailing slashes after, or a host written with one
+  // yields a double slash — note `pathname` is "/" even when the adopter wrote no path.
+  const parsedHost = new URL(parsed.data.host);
+  const host = `${parsedHost.protocol}//${parsedHost.host}${parsedHost.pathname}`.replace(/\/+$/, "");
   const logger = input.logger ?? console;
 
   if (!input.cache) logger.warn(CACHE_FALLBACK_WARNING);
