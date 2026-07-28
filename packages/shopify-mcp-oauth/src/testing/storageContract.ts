@@ -50,7 +50,7 @@ export function runStorageContractTests(
     });
 
     it("round-trips a created client", async () => {
-      await storage.createClient(buildClient({ clientName: "Contract Client" }));
+      await storage.createClient(buildClient({ clientName: "Contract Client", redirectUris: [CONTRACT_REDIRECT_URI] }));
       const found = await storage.findClient(CONTRACT_CLIENT_ID);
       expect(found?.clientName).toBe("Contract Client");
       expect(found?.redirectUris).toEqual([CONTRACT_REDIRECT_URI]);
@@ -64,7 +64,9 @@ export function runStorageContractTests(
     });
 
     it("finds a token by its access hash", async () => {
-      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "lookup-me" }));
+      await storage.createToken(
+        buildToken(opts.seedShop, { accessTokenHash: "lookup-me", clientId: CONTRACT_CLIENT_ID })
+      );
       const found = await storage.findTokenByAccessHash("lookup-me");
       expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
     });
@@ -90,7 +92,9 @@ export function runStorageContractTests(
     });
 
     it("finds a token by its refresh hash", async () => {
-      await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup" }));
+      await storage.createToken(
+        buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup", clientId: CONTRACT_CLIENT_ID })
+      );
       const found = await storage.findTokenByRefreshHash("refresh-lookup");
       expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
     });
@@ -127,6 +131,8 @@ export function runStorageContractTests(
 
     it("touchToken does not throw for an existing token", async () => {
       const token = await storage.createToken(buildToken(opts.seedShop));
+      // No expect(): StoredToken has no lastUsedAt field, so resolving without throwing
+      // is the only behavior this interface exposes for touchToken.
       await storage.touchToken(token.id, new Date());
     });
 
