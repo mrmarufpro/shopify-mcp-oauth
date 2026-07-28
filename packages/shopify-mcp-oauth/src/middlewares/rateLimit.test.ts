@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type Request, type RequestHandler, type Response } from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createRateLimiter, type RateLimiterOptions } from "./rateLimit";
@@ -90,6 +90,10 @@ describe("createRateLimiter", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     const stillBlocked = await request(app).post("/register");
     expect(stillBlocked.status).toBe(429);
+    // ceil(remaining-ms / 1000) is 1 for any remaining time in (0, 1000] -- true regardless of the
+    // exact elapsed time, so this doesn't need precise timing. A `floor` in place of `ceil` here
+    // would instead read "0" (remaining ~280ms out of the 300ms window).
+    expect(stillBlocked.headers["retry-after"]).toBe("1");
   });
 
   it("allows again once the window has passed", async () => {
@@ -187,6 +191,127 @@ describe("createRateLimiter", () => {
       // entry was dropped, so EVICTED_CALLER is treated as a fresh caller.
       const evictedCallerTreatedAsFresh = await request(app).post("/register").set("x-test-key", EVICTED_CALLER);
       expect(evictedCallerTreatedAsFresh.status).toBe(201);
+    });
+
+    it("does not evict a live, just-refreshed key in place of a genuinely stale one", async () => {
+      // `Map#set` on an existing key updates it in place without moving its iteration position --
+      // so refreshing a lapsed key that's still in the map (not deleting it first) would let
+      // whichever key was seen first stay parked at the head forever, no matter how recently it
+      // was actually refreshed. Eviction reads head position as "oldest", so that pinned key
+      // becomes a wrongful eviction target the moment the cap is hit, while a truly stale key
+      // sitting behind it is spared just because it happens to occupy a later slot.
+      const LIMIT = 1;
+      const MAX_ENTRIES = 3;
+      const WINDOW_MS = 300;
+      const FIRST_CALLER = "first-caller";
+      const SECOND_CALLER = "second-caller";
+      const THIRD_CALLER = "third-caller";
+      const FOURTH_CALLER = "fourth-caller";
+      const app = express();
+      app.post(
+        "/register",
+        createRateLimiter({
+          limit: LIMIT,
+          windowMs: WINDOW_MS,
+          maxEntries: MAX_ENTRIES,
+          keyFor: (req) => String(req.headers["x-test-key"]),
+        }),
+        (_req, res) => res.status(201).json({ ok: true })
+      );
+
+      // FIRST_CALLER is the very first key ever tracked -- exactly the one a position-based bug
+      // would pin at the head.
+      expect((await request(app).post("/register").set("x-test-key", FIRST_CALLER)).status).toBe(201);
+      expect((await request(app).post("/register").set("x-test-key", SECOND_CALLER)).status).toBe(201);
+
+      // Let both windows lapse, then refresh FIRST_CALLER while it's still tracked-but-expired.
+      // SECOND_CALLER is left untouched from here on, so it stays genuinely stale.
+      await new Promise((resolve) => setTimeout(resolve, WINDOW_MS + 50));
+      expect((await request(app).post("/register").set("x-test-key", FIRST_CALLER)).status).toBe(201);
+
+      // THIRD_CALLER (new key) brings the map to MAX_ENTRIES; FOURTH_CALLER (new key) then pushes
+      // past it, forcing an eviction. The only correct victim is SECOND_CALLER -- long expired and
+      // never revisited -- not FIRST_CALLER, which was just refreshed and is still live.
+      expect((await request(app).post("/register").set("x-test-key", THIRD_CALLER)).status).toBe(201);
+      expect((await request(app).post("/register").set("x-test-key", FOURTH_CALLER)).status).toBe(201);
+
+      // FIRST_CALLER's refreshed window is nowhere near elapsed -- it must still be blocked. If it
+      // were wrongly evicted instead of SECOND_CALLER, this would read 201.
+      const firstCallerStillBlocked = await request(app).post("/register").set("x-test-key", FIRST_CALLER);
+      expect(firstCallerStillBlocked.status).toBe(429);
+    });
+  });
+
+  describe("shipping defaults", () => {
+    // Task 20 wires `createRateLimiter({ limit, windowMs })` only -- `maxEntries` and
+    // `sweepIntervalRequests` have no field in the config schema a consumer can override, so these
+    // defaults are the actual production configuration, not just a mechanism demonstrated at a
+    // shrunk-for-testability value. Driving the real default (10,000, or 500) via supertest would
+    // mean thousands of real HTTP round trips per test; calling the returned handler directly with
+    // minimal req/res stubs exercises the exact same code path at the speed of a plain function
+    // call, which is what makes asserting the real default value practical here.
+    function invokeDirectly(handler: RequestHandler, key: string): { allowed: boolean } {
+      let allowed = false;
+      const req = { headers: { "x-test-key": key } } as unknown as Request;
+      const res = {
+        setHeader: () => {},
+        status: () => ({ json: () => undefined }),
+      } as unknown as Response;
+      handler(req, res, () => {
+        allowed = true;
+      });
+      return { allowed };
+    }
+
+    it("defaults maxEntries to 10,000, evicting only once more than that many distinct keys are tracked", () => {
+      const DEFAULT_MAX_ENTRIES = 10_000;
+      const LIVE_CALLER = "live-caller";
+      const limiter = createRateLimiter({
+        limit: 1,
+        windowMs: 60_000,
+        keyFor: (req) => String(req.headers["x-test-key"]),
+      });
+
+      // Spend LIVE_CALLER's one allowed request; it stays live for the next 60 seconds absent eviction.
+      expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(true);
+
+      // Fill up to (but not past) the default cap with other distinct keys -- LIVE_CALLER must survive.
+      for (let fillerIndex = 0; fillerIndex < DEFAULT_MAX_ENTRIES - 1; fillerIndex++) {
+        invokeDirectly(limiter, `filler-caller-${fillerIndex}`);
+      }
+      expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(false);
+
+      // One more distinct key pushes the tracked-key count past the default cap, which must evict
+      // LIVE_CALLER (the oldest tracked entry).
+      invokeDirectly(limiter, "one-key-too-many");
+      expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(true);
+    });
+
+    it("runs the periodic sweep at the default interval of 500 requests", () => {
+      vi.useFakeTimers();
+      try {
+        const DEFAULT_SWEEP_INTERVAL_REQUESTS = 500;
+        const limiter = createRateLimiter({
+          limit: 1,
+          windowMs: 1,
+          keyFor: (req) => String(req.headers["x-test-key"]),
+        });
+
+        // Every one of these keys is expired by the time the sweep inspects it (the clock is
+        // advanced past windowMs before the threshold request), so the sweep's delete branch is
+        // genuinely exercised rather than skipped as a no-op scan.
+        for (let requestIndex = 0; requestIndex < DEFAULT_SWEEP_INTERVAL_REQUESTS - 1; requestIndex++) {
+          invokeDirectly(limiter, `swept-caller-${requestIndex}`);
+        }
+        vi.advanceTimersByTime(1000);
+
+        // This call is exactly the 500th -- requestsSinceSweep reaches the shipping default here
+        // and the sweep runs. Nothing catches a throw from inside it, so a broken sweep body
+        // surfaces as this call itself throwing, not as a status-code mismatch.
+        expect(() => invokeDirectly(limiter, "final-caller")).not.toThrow();
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

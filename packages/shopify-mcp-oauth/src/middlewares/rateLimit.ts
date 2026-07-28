@@ -79,10 +79,21 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
     const current = stored && stored.resetAt > now ? stored : undefined;
 
     if (!current) {
-      // A never-seen (or lapsed) key is about to add an entry. Cap the worst case here: past
-      // maxEntries, drop the single oldest tracked key -- O(1), unlike a reclaim scan, so this
+      // A lapsed key that's still in the map is being refreshed, not newly added. `Map#set` on a
+      // key that already exists updates its value in place *without* moving it in iteration order
+      // -- deleting first forces the re-`set` below to re-append it at the tail. Skipping this
+      // would let whichever key happened to be seen first squat on the head slot forever: eviction
+      // below reads position as a proxy for staleness, so a head-pinned-but-just-refreshed key
+      // would become BOTH a wrongful eviction target (it's live, not stale) AND a shield for
+      // genuinely stale keys sitting behind it (which never surface to the front to be reclaimed).
+      const isNewKey = stored === undefined;
+      if (!isNewKey) windows.delete(key);
+
+      // Only a genuinely new key grows the map -- refreshing an existing key above nets out to the
+      // same size, so it must not trigger evicting some unrelated entry. Cap the worst case here:
+      // past maxEntries, drop the single oldest tracked key -- O(1), unlike a reclaim scan, so this
       // stays cheap even while an attacker keeps the map pinned at the cap on every request.
-      if (windows.size >= maxEntries) {
+      if (isNewKey && windows.size >= maxEntries) {
         const oldestKey = windows.keys().next().value;
         if (oldestKey !== undefined) windows.delete(oldestKey);
       }
@@ -92,8 +103,9 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
 
     if (current.count >= options.limit) {
       // No floor needed: `current` is only ever truthy when `stored.resetAt > now` (see above),
-      // using this same `now` -- so resetAt - now is always a positive integer of milliseconds,
-      // and ceil-ing anything in (0, 1000] to seconds always lands on at least 1.
+      // using this same `now` -- so resetAt - now is always strictly positive here, and ceiling
+      // any positive number of milliseconds to whole seconds always lands on at least 1 (that
+      // holds for any positive value, not because milliseconds happen to be integers).
       res.setHeader("Retry-After", Math.ceil((current.resetAt - now) / 1000));
       res.status(429).json({ error: "too_many_requests", error_description: "rate limit exceeded" });
       return;

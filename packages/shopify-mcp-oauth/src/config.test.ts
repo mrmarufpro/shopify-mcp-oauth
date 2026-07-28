@@ -119,6 +119,18 @@ describe("resolveConfig", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("redisCache"));
   });
 
+  it("does not claim the fallback cache holds rate-limit counters -- those are process-local, not cached", () => {
+    // The /register rate limiter (rateLimit.ts) never touches `cache` at all -- it's an
+    // in-process Map, independent of whichever CacheStore resolveConfig picks. An earlier
+    // version of this warning said otherwise; this pins the correction.
+    const warn = vi.fn();
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() } }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    const warningMessage = warn.mock.calls[0]![0];
+    expect(warningMessage).not.toContain("rate-limit counters");
+    expect(warningMessage).toContain("registerRateLimit");
+  });
+
   it("does not warn when a cache is supplied", () => {
     const warn = vi.fn();
     resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, cache: memoryCache() }));
