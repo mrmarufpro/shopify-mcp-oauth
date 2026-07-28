@@ -160,6 +160,9 @@ function neverHitCache(): CacheStore {
     },
     async set() {},
     async del() {},
+    async getdel() {
+      return null;
+    },
   };
 }
 

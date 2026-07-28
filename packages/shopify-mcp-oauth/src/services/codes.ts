@@ -38,15 +38,15 @@ export async function issueCode(
 
 export async function consumeCode(config: ResolvedConfig, code: string): Promise<CodeRecord | null> {
   const key = `${CODE_PREFIX}${sha256Hex(code)}`;
-  // getdel is atomic where the backend supports it; that's what keeps a code single-use when two
-  // /token requests race on it concurrently.
-  const raw = config.cache.getdel
-    ? await config.cache.getdel(key)
-    : await (async () => {
-        const value = await config.cache.get(key);
-        await config.cache.del(key);
-        return value;
-      })();
+  // getdel is atomic on every CacheStore; that's what keeps a code single-use when two /token
+  // requests race on it concurrently.
+  const raw = await config.cache.getdel(key);
   if (!raw) return null;
-  return JSON.parse(raw) as CodeRecord;
+  try {
+    return JSON.parse(raw) as CodeRecord;
+  } catch {
+    // A cache entry that isn't valid JSON can't be a code this package wrote; treat it the same
+    // as "not found" rather than letting a corrupt entry crash the /token request.
+    return null;
+  }
 }

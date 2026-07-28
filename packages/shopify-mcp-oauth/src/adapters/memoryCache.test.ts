@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { runCacheContractTests } from "../testing/cacheContract";
 import { memoryCache } from "./memoryCache";
 
 const KEY = "mcp:oauth:code:abc";
+
+runCacheContractTests(() => memoryCache());
 
 describe("memoryCache", () => {
   it("returns null for a key it never stored", async () => {
@@ -30,7 +33,7 @@ describe("memoryCache", () => {
   it("reads and deletes atomically via getdel", async () => {
     const cache = memoryCache();
     await cache.set(KEY, "stored-value", 60);
-    expect(await cache.getdel?.(KEY)).toBe("stored-value");
+    expect(await cache.getdel(KEY)).toBe("stored-value");
     expect(await cache.get(KEY)).toBeNull();
   });
 });
