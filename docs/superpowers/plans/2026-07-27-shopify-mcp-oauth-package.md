@@ -1548,9 +1548,12 @@ The adapter is typed against a minimal structural `PrismaLikeClient` so the pack
 ```ts
 import { describe, expect, it, vi } from "vitest";
 import { prismaStorage, type PrismaLikeClient } from "./prismaStorage";
+import type { NewOAuthClient, NewToken } from "../types";
 
 const DEMO_SHOP = "demo.myshopify.com";
 const CLIENT_ID = "prisma-client-id";
+const TOKEN_ID = "token-1";
+const LAST_USED_AT = new Date("2026-01-15T12:00:00.000Z");
 
 function buildPrisma(overrides: Record<string, unknown> = {}): PrismaLikeClient {
   return {
@@ -1603,26 +1606,118 @@ describe("prismaStorage", () => {
     expect(where.accessTokenExpiresAt.gt).toBeInstanceOf(Date);
   });
 
-  it("revokeToken reports false when no unrevoked row matched", async () => {
+  it("passes client fields through to create and maps the returned row back", async () => {
+    const newClient: NewOAuthClient = {
+      clientId: CLIENT_ID,
+      clientName: "Created Client",
+      redirectUris: ["https://created.example/callback"],
+      grantTypes: ["authorization_code"],
+      responseTypes: ["code"],
+      logoUri: null,
+      clientUri: null,
+      tokenEndpointAuthMethod: "none",
+    };
+    const create = vi.fn().mockResolvedValue({ ...newClient, revokedAt: null });
     const prisma = buildPrisma({
-      mcpOAuthToken: {
-        findFirst: vi.fn(),
-        create: vi.fn(),
-        updateMany: vi.fn().mockResolvedValue({ count: 0 }),
-      },
+      mcpOAuthClient: { findFirst: vi.fn(), create, upsert: vi.fn() },
     });
-    expect(await prismaStorage(prisma).revokeToken("token-1")).toBe(false);
+    const created = await prismaStorage(prisma).createClient(newClient);
+    expect(create).toHaveBeenCalledWith({ data: newClient });
+    expect(created.clientId).toBe(CLIENT_ID);
+  });
+
+  it("upsertClient sends an empty update, matching insert-if-absent semantics", async () => {
+    const newClient: NewOAuthClient = {
+      clientId: CLIENT_ID,
+      clientName: "Upserted Client",
+      redirectUris: ["https://client.example/callback"],
+      grantTypes: ["authorization_code"],
+      responseTypes: ["code"],
+      logoUri: null,
+      clientUri: null,
+      tokenEndpointAuthMethod: "none",
+    };
+    const upsert = vi.fn().mockResolvedValue({ ...newClient, revokedAt: null });
+    const prisma = buildPrisma({
+      mcpOAuthClient: { findFirst: vi.fn(), create: vi.fn(), upsert },
+    });
+    await prismaStorage(prisma).upsertClient(newClient);
+    const call = upsert.mock.calls[0]?.[0];
+    expect(call.where).toEqual({ clientId: CLIENT_ID });
+    // The empty update IS the insert-if-absent semantics: a second write returns the existing
+    // row rather than overwriting it, matching memoryStorage and the shared contract test.
+    expect(call.update).toEqual({});
+  });
+
+  it("passes token fields through to create and maps the returned row back", async () => {
+    const newToken: NewToken = {
+      shopId: "shop_1",
+      shopDomain: DEMO_SHOP,
+      clientId: CLIENT_ID,
+      accessTokenHash: "access-hash-created",
+      refreshTokenHash: "refresh-hash-created",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      refreshTokenExpiresAt: new Date(Date.now() + 86_400_000),
+      scope: "mcp:*",
+      resource: "https://mcp.example.com/mcp",
+      rotatedFromId: null,
+    };
+    const create = vi.fn().mockResolvedValue({ ...newToken, id: TOKEN_ID, revokedAt: null });
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst: vi.fn(), create, updateMany: vi.fn() },
+    });
+    const created = await prismaStorage(prisma).createToken(newToken);
+    expect(create).toHaveBeenCalledWith({ data: newToken });
+    expect(created.clientId).toBe(CLIENT_ID);
+  });
+
+  it("filters expired and revoked rows in the refresh-hash lookup", async () => {
+    const findFirst = vi.fn().mockResolvedValue(null);
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst, create: vi.fn(), updateMany: vi.fn() },
+    });
+    await prismaStorage(prisma).findTokenByRefreshHash("some-refresh-hash");
+    const where = findFirst.mock.calls[0]?.[0]?.where;
+    expect(where.refreshTokenHash).toBe("some-refresh-hash");
+    expect(where.revokedAt).toBeNull();
+  });
+
+  it("revokeToken reports false when no unrevoked row matched", async () => {
+    const updateMany = vi.fn().mockResolvedValue({ count: 0 });
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany },
+    });
+    expect(await prismaStorage(prisma).revokeToken(TOKEN_ID)).toBe(false);
+    expect(updateMany.mock.calls[0]?.[0]?.where).toEqual({ id: TOKEN_ID, revokedAt: null });
   });
 
   it("revokeToken reports true when one row flipped", async () => {
+    const updateMany = vi.fn().mockResolvedValue({ count: 1 });
     const prisma = buildPrisma({
-      mcpOAuthToken: {
-        findFirst: vi.fn(),
-        create: vi.fn(),
-        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-      },
+      mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany },
     });
-    expect(await prismaStorage(prisma).revokeToken("token-1")).toBe(true);
+    expect(await prismaStorage(prisma).revokeToken(TOKEN_ID)).toBe(true);
+    const call = updateMany.mock.calls[0]?.[0];
+    expect(call.where).toEqual({ id: TOKEN_ID, revokedAt: null });
+    expect(call.data.revokedAt).toBeInstanceOf(Date);
+  });
+
+  it("touchToken sends the id and lastUsedAt to updateMany", async () => {
+    const updateMany = vi.fn().mockResolvedValue({ count: 1 });
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany },
+    });
+    await prismaStorage(prisma).touchToken(TOKEN_ID, LAST_USED_AT);
+    const call = updateMany.mock.calls[0]?.[0];
+    expect(call.where).toEqual({ id: TOKEN_ID });
+    expect(call.data.lastUsedAt).toBe(LAST_USED_AT);
+  });
+
+  it("touchToken does not throw when the delegate has no updateMany", async () => {
+    const prisma = buildPrisma({
+      mcpOAuthToken: { findFirst: vi.fn(), create: vi.fn(), updateMany: undefined },
+    });
+    await expect(prismaStorage(prisma).touchToken(TOKEN_ID, LAST_USED_AT)).resolves.toBeUndefined();
   });
 
   it("looks the shop up through the configured mapping", async () => {
@@ -1807,30 +1902,39 @@ export function prismaStorage(
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `pnpm --filter shopify-mcp-oauth test src/adapters/prismaStorage.test.ts`
-Expected: PASS, 6 tests.
+Expected: PASS, 12 tests.
 
-- [ ] **Step 5: Verify the overload actually blocks the unmapped case**
+- [ ] **Step 5: Pin the overload with a permanent type-only guard**
 
-Create a scratch file `packages/shopify-mcp-oauth/src/adapters/overload-check.ts`:
+The two-overload signature is the point of this task: it turns a missing shop mapping into a
+compile error instead of a runtime failure part-way through an OAuth flow. A guarantee nothing
+re-checks is a comment, so the check belongs in the committed test file — not in a scratch file
+that gets deleted.
+
+Append to `src/adapters/prismaStorage.test.ts`, outside the `describe` block:
 
 ```ts
-import { prismaStorage, type PrismaLikeClient } from "./prismaStorage";
-import type { OAuthStorage } from "../types";
-
-declare const prisma: PrismaLikeClient;
-// @ts-expect-error prismaStorage without a shop mapping is missing findShopByDomain
-export const incomplete: OAuthStorage = prismaStorage(prisma);
+// Type-only regression guard: `prismaStorage` without a shop mapping must not expose
+// `findShopByDomain`. Declared but never called — it exists solely for `pnpm typecheck` to catch a
+// regression in the overload. If the overload's enforcement is ever lost, the line below stops
+// producing a real error and typecheck fails on "Unused '@ts-expect-error' directive."
+function unmappedStorageHasNoShopLookup(prisma: PrismaLikeClient): void {
+  const storageWithoutShopMapping = prismaStorage(prisma);
+  // @ts-expect-error findShopByDomain is intentionally absent without a shop mapping
+  const lookup = storageWithoutShopMapping.findShopByDomain;
+  void lookup;
+}
+void unmappedStorageHasNoShopLookup;
 ```
 
 Run: `pnpm --filter shopify-mcp-oauth typecheck`
-Expected: PASS. If it reports "Unused '@ts-expect-error' directive", the overload is not enforcing —
-fix `prismaStorage` before continuing.
+Expected: exit 0.
 
-Then delete the scratch file:
-
-```bash
-rm packages/shopify-mcp-oauth/src/adapters/overload-check.ts
-```
+Then confirm the directive is catching something real, because a passing typecheck alone does not
+prove it. Delete the `@ts-expect-error` line and re-run: typecheck must fail with
+`TS2339: Property 'findShopByDomain' does not exist on type 'Omit<OAuthStorage, "findShopByDomain">'`.
+Restore the line and confirm clean again. A directive that suppresses nothing passes just as
+quietly as one that works.
 
 - [ ] **Step 6: Commit**
 
