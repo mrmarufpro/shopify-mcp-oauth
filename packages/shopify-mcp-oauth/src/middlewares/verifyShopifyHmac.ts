@@ -6,6 +6,25 @@ import { safeEqual } from "../crypto";
 // values (req.query) re-encodes reserved characters differently and produces a mismatched base
 // string, so this always works from the raw string Express received (req.originalUrl), never
 // from req.query.
+//
+// The remaining parameters are sorted by key before hashing. Shopify's docs state this
+// explicitly for the *installation-request* HMAC ("the remaining parameters must be sorted
+// alphabetically as strings, in the format parameter_name=parameter_value") but this module
+// verifies the *OAuth callback* HMAC, a different request whose own doc section only says "the
+// hmac is valid and signed by Shopify" and defers to a library -- it doesn't restate an
+// algorithm. Shopify's own shopify-api-js library uses one shared, always-sorted code path for
+// both requests, and there's no separate order-preserving scheme documented or implemented
+// anywhere, so this reads the callback's terse wording as shorthand for the installation
+// request's algorithm, not an unspecified alternative -- and sorts here too. For this endpoint's
+// fixed field set (code, hmac, host, shop, state, timestamp), Shopify's actual send order already
+// is alphabetical, so this has no effect on real traffic today -- but that's a property of this
+// field set, not something documented, so don't rely on it: sort explicitly rather than trust
+// received order to keep coinciding as fields change.
+function pairKey(pair: string): string {
+  const separatorIndex = pair.indexOf("=");
+  return separatorIndex === -1 ? pair : pair.slice(0, separatorIndex);
+}
+
 export function verifyShopifyHmac(queryString: string, secret: string): boolean {
   const pairs = queryString.split("&").filter(Boolean);
   let provided: string | undefined;
@@ -24,7 +43,23 @@ export function verifyShopifyHmac(queryString: string, secret: string): boolean 
     }
   }
   if (!provided) return false;
-  const computed = crypto.createHmac("sha256", secret).update(rest.join("&")).digest("hex");
+
+  // Sort by key, not by the whole "key=value" string: the documented algorithm sorts
+  // parameters, and sorting whole pairs only coincidentally agrees once values differ in ways
+  // that could shift the comparison. The key is sliced off with indexOf("=") -- never decoded --
+  // so the sort itself never re-encodes a byte of what it's ordering. A plain code-unit
+  // comparison, not localeCompare: localeCompare's result depends on the host's ICU/locale data,
+  // which has no business affecting a signature check that must agree byte-for-byte with a
+  // remote party. For Shopify's ASCII parameter names the two agree, so this is strictly safer
+  // with no behavioral downside. Array.prototype.sort is spec-guaranteed stable, so pairs sharing
+  // a key keep their received relative order.
+  const sorted = [...rest].sort((left, right) => {
+    const leftKey = pairKey(left);
+    const rightKey = pairKey(right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+
+  const computed = crypto.createHmac("sha256", secret).update(sorted.join("&")).digest("hex");
   return safeEqual(provided, computed);
 }
 

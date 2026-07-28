@@ -8,7 +8,12 @@ const API_SECRET = "test-api-secret";
 const DEMO_SHOP = "demo.myshopify.com";
 
 function signQuery(params: Record<string, string>): string {
-  const message = new URLSearchParams(params).toString();
+  // Sorted by key, mirroring the algorithm verifyShopifyHmac itself applies (and the one
+  // Shopify's docs document for the sibling installation-request HMAC) -- this is what makes
+  // signQuery an accurate stand-in for "how Shopify signs a callback", not just "any string this
+  // suite's own signer and verifier happen to agree on".
+  const sortedEntries = Object.entries(params).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  const message = new URLSearchParams(sortedEntries).toString();
   const hmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
   return `${message}&hmac=${hmac}`;
 }
@@ -46,6 +51,18 @@ describe("verifyShopifyHmac", () => {
     const rawQueryWithoutHmac = `shop=${DEMO_SHOP}&state=a%20b`;
     const hmac = crypto.createHmac("sha256", API_SECRET).update(rawQueryWithoutHmac).digest("hex");
     expect(verifyShopifyHmac(`${rawQueryWithoutHmac}&hmac=${hmac}`, API_SECRET)).toBe(true);
+  });
+
+  it("verifies a query whose parameters were received out of alphabetical order", () => {
+    // Shopify's own callback field set (code, hmac, host, shop, state, timestamp) already arrives
+    // in alphabetical order in practice, which is exactly the coincidence that let an
+    // un-sorted implementation pass every other test in this file. Reorder deliberately, and sign
+    // over the *sorted* base string per the documented algorithm: this only holds if
+    // verifyShopifyHmac actually sorts before hashing, not merely joins whatever order it received.
+    const rawOutOfOrder = `timestamp=1700000000&shop=${DEMO_SHOP}&code=abc`;
+    const sortedBase = `code=abc&shop=${DEMO_SHOP}&timestamp=1700000000`;
+    const hmac = crypto.createHmac("sha256", API_SECRET).update(sortedBase).digest("hex");
+    expect(verifyShopifyHmac(`${rawOutOfOrder}&hmac=${hmac}`, API_SECRET)).toBe(true);
   });
 });
 
