@@ -8,11 +8,13 @@ export interface ShopifyMcpOAuth {
   router: Router;
   requireAuth: RequestHandler;
   /**
-   * Mount this LAST in your app -- after your own body-parsers and after `router` -- to catch
-   * anything that throws before a request ever reaches this package's routes (e.g. malformed JSON
-   * in your own `express.json()`). Without it, such an error falls through to Express's own
-   * default handler, which answers with an HTML stack trace instead of a safe JSON body. See
-   * src/middlewares/errorHandler.ts for why this can't be wired automatically by `router` alone.
+   * Mount this as the LAST `app.use(...)` call on YOUR OWN top-level Express app -- after your
+   * own body-parsers (e.g. `express.json()`) AND after `app.use(router)` -- never inside a
+   * router of your own. An error thrown by a parent-level middleware (your body-parser included)
+   * never enters this package's router at all, so mounting this anywhere other than your app's
+   * own final middleware cannot catch it. Get the placement wrong and such an error falls through
+   * to Express's own default handler instead, which answers with an HTML stack trace on an
+   * unauthenticated endpoint. See src/middlewares/errorHandler.ts for the full mechanics.
    */
   errorHandler: ErrorRequestHandler;
 }
