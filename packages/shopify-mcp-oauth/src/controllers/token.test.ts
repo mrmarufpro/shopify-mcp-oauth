@@ -24,13 +24,18 @@ const DEFAULT_SCOPE = "mcp:*";
 // dropped `resource: record.resource` and just let issueTokens default to config.resource, using
 // the default value here would still pass by coincidence. This constant makes that impossible.
 const DISTINCT_RESOURCE = `${HOST}/mcp/reports`;
+// Deliberately different from the server's default access TTL (3600s), same trap as
+// DISTINCT_RESOURCE above: a hardcoded expires_in in the response would happen to match the
+// default, so a test that never configures a non-default TTL can't catch it.
+const NON_DEFAULT_ACCESS_TTL_SECONDS = 900;
 
-function buildConfig(): ResolvedConfig {
+function buildConfig(overrides: { tokenTtl?: { access?: number; refresh?: number } } = {}): ResolvedConfig {
   return resolveConfig({
     host: HOST,
     shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
     stateSecret: "test-state-secret-at-least-32-bytes-long",
     storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
+    ...overrides,
   });
 }
 
@@ -133,6 +138,22 @@ describe("tokenController — authorization_code", () => {
     expect(stored?.shopDomain).toBe(DEMO_SHOP);
     expect(stored?.clientId).toBe(CLIENT_ID);
     expect(stored?.resource).toBe(DISTINCT_RESOURCE);
+  });
+
+  it("reports the configured access token lifetime in expires_in, not a hardcoded default", async () => {
+    const config = buildConfig({ tokenTtl: { access: NON_DEFAULT_ACCESS_TTL_SECONDS } });
+    const response = await request(buildApp(config))
+      .post("/token")
+      .send({
+        grant_type: "authorization_code",
+        code: await issueTestCode(config),
+        redirect_uri: REDIRECT_URI,
+        client_id: CLIENT_ID,
+        code_verifier: CODE_VERIFIER,
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.expires_in).toBe(NON_DEFAULT_ACCESS_TTL_SECONDS);
   });
 
   it("lets only one of two concurrent redemptions of the same code win", async () => {
@@ -367,6 +388,25 @@ describe("tokenController — bad requests", () => {
     // RFC 6749 §5.2: a missing required parameter is invalid_request. unsupported_grant_type is
     // only for a grant_type that was actually presented and just isn't one this server supports.
     const response = await request(buildApp(buildConfig())).post("/token").send({ code: "the-code" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_request");
+  });
+
+  it("reports invalid_request for an empty-string grant_type, what a bare form field sends", async () => {
+    // A form-encoded `grant_type=` with nothing after the `=` — the encoding most OAuth clients
+    // actually use — parses to an empty string, not an absent key. "Missing" has to cover this.
+    const response = await request(buildApp(buildConfig()))
+      .post("/token")
+      .type("form")
+      .send({ grant_type: "", code: "the-code" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_request");
+  });
+
+  it("reports invalid_request for a null grant_type", async () => {
+    const response = await request(buildApp(buildConfig())).post("/token").send({ grant_type: null, code: "the-code" });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toBe("invalid_request");

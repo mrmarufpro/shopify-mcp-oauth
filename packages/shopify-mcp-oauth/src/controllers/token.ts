@@ -69,7 +69,9 @@ export function tokenController(config: ResolvedConfig): RequestHandler {
       const grantType = (body as Record<string, unknown>).grant_type;
       // RFC 6749 §5.2: a missing required parameter is invalid_request; unsupported_grant_type is
       // only for a grant_type that was actually presented and isn't one this server implements.
-      if (grantType === undefined) {
+      // "Missing" covers null and "" too, not just an absent key — a bare `grant_type=` in a
+      // form-encoded body (the encoding most OAuth clients use) parses to an empty string.
+      if (grantType === undefined || grantType === null || grantType === "") {
         return bad(res, "invalid_request", "grant_type is required");
       }
       const known = grantType === "authorization_code" || grantType === "refresh_token";
