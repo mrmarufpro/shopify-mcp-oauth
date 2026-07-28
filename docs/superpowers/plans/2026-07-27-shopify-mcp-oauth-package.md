@@ -4805,12 +4805,13 @@ git commit -m "feat: add single-use authorization codes and rotating tokens"
 
 **Files:**
 - Create: `packages/shopify-mcp-oauth/src/serializers/metadata.ts`, `register.ts`, `token.ts`
-- Create: `packages/shopify-mcp-oauth/src/controllers/metadata.ts`, `register.ts`, `revoke.ts`, `openaiAppsChallenge.ts`
-- Test: `packages/shopify-mcp-oauth/src/serializers/metadata.test.ts`, `packages/shopify-mcp-oauth/src/controllers/metadata.test.ts`, `packages/shopify-mcp-oauth/src/controllers/register.test.ts`, `packages/shopify-mcp-oauth/src/controllers/revoke.test.ts`
+- Create: `packages/shopify-mcp-oauth/src/controllers/asyncHandler.ts`, `metadata.ts`, `register.ts`, `revoke.ts`, `openaiAppsChallenge.ts`
+- Test: `packages/shopify-mcp-oauth/src/serializers/metadata.test.ts`, `packages/shopify-mcp-oauth/src/controllers/asyncHandler.test.ts`, `packages/shopify-mcp-oauth/src/controllers/metadata.test.ts`, `packages/shopify-mcp-oauth/src/controllers/register.test.ts`, `packages/shopify-mcp-oauth/src/controllers/revoke.test.ts`
 
 **Interfaces:**
-- Consumes: `ResolvedConfig`; `createDcrClient`; `revokeByAccessToken`, `revokeByRefreshToken`; `registerRequestSchema`; `revokeRequestSchema`
+- Consumes: `ResolvedConfig`; `createDcrClient`; `revokeByAccessToken`, `revokeByRefreshToken`; `registerRequestSchema`; `revokeRequestSchema`; `Logger`
 - Produces:
+  - `asyncHandler(logger: Logger, handler): RequestHandler` — wraps a controller so a rejected promise (or synchronous throw) becomes a generic 500 instead of hanging the request or crashing the process. Express 4 does not forward a route handler's rejected promise to its error middleware on its own; every controller from here on is wrapped in this.
   - `serializeAuthorizationServerMetadata(config: ResolvedConfig): Record<string, unknown>`
   - `serializeProtectedResourceMetadata(config: ResolvedConfig): Record<string, unknown>`
   - `serializeClientRegistration(client: OAuthClient): Record<string, unknown>`
@@ -4825,6 +4826,98 @@ Revocation always answers 200, even for a token we have never seen. RFC 7009 req
 distinguishable 404 would turn the endpoint into an oracle for guessing valid tokens.
 
 - [ ] **Step 1: Write the failing tests**
+
+`src/controllers/asyncHandler.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it, vi } from "vitest";
+import type { Logger } from "../types";
+import { asyncHandler } from "./asyncHandler";
+
+function buildApp(logger: Logger, handler: Parameters<typeof asyncHandler>[1]) {
+  const app = express();
+  app.get("/probe", asyncHandler(logger, handler));
+  return app;
+}
+
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+describe("asyncHandler", () => {
+  it("runs the wrapped handler and lets it respond normally", async () => {
+    const app = buildApp(silentLogger, async (_req, res) => {
+      res.status(201).json({ ok: true });
+    });
+    const response = await request(app).get("/probe");
+    expect(response.status).toBe(201);
+    expect(response.body).toEqual({ ok: true });
+  });
+
+  it("turns a rejected promise into a generic 500 instead of hanging or crashing", async () => {
+    const app = buildApp(silentLogger, async () => {
+      throw new Error("storage unavailable: connection to db.internal.example refused");
+    });
+    const response = await request(app).get("/probe");
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+  });
+
+  it("never lets the original error message or stack reach the response body", async () => {
+    const app = buildApp(silentLogger, async () => {
+      throw new Error("storage unavailable: connection to db.internal.example refused");
+    });
+    const response = await request(app).get("/probe");
+    expect(JSON.stringify(response.body)).not.toContain("db.internal.example");
+    expect(JSON.stringify(response.body)).not.toContain(".ts:");
+  });
+
+  it("logs the failure instead of swallowing it silently", async () => {
+    const errorLog = vi.fn();
+    const app = buildApp({ info: () => {}, warn: () => {}, error: errorLog }, async () => {
+      throw new Error("boom");
+    });
+    await request(app).get("/probe");
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards to next(err) instead of double-responding once headers are already sent", async () => {
+    const nextSpy = vi.fn();
+    const app = express();
+    app.get(
+      "/probe",
+      asyncHandler(silentLogger, async (_req, res) => {
+        res.status(200).json({ ok: true });
+        throw new Error("failure after the response was already flushed");
+      })
+    );
+    app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+      nextSpy(err);
+      next(err);
+    });
+    const response = await request(app).get("/probe");
+    expect(response.status).toBe(200);
+    expect(nextSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("catches a synchronous throw from a handler that violates its own Promise<void> contract", async () => {
+    // The signature promises a Promise, but nothing at runtime stops a caller from passing a
+    // plain function that throws before ever returning one — the cast below is exactly that
+    // violation, constructed on purpose to prove the wrapper survives it.
+    const throwingHandler = ((_req: unknown, _res: unknown) => {
+      throw new Error("sync boom");
+    }) as unknown as Parameters<typeof asyncHandler>[1];
+    const errorLog = vi.fn();
+    const app = buildApp({ info: () => {}, warn: () => {}, error: errorLog }, throwingHandler);
+
+    const response = await request(app).get("/probe");
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+});
+```
 
 `src/serializers/metadata.test.ts`:
 
@@ -5266,6 +5359,45 @@ export function serializeTokenBundle(tokens: IssuedTokens): Record<string, unkno
 
 - [ ] **Step 4: Write the controllers**
 
+`src/controllers/asyncHandler.ts`:
+
+```ts
+import type { NextFunction, Request, RequestHandler, Response } from "express";
+import type { Logger } from "../types";
+
+type AsyncControllerHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>;
+
+const GENERIC_SERVER_ERROR_BODY = { error: "server_error", error_description: "An unexpected error occurred" };
+
+// Express 4 drops a route handler's rejected promise on the floor — the request hangs, and
+// Node's default unhandled-rejection policy then kills the process. Express 5 forwards the
+// rejection to next(err) on its own, but this package can't assume the consumer mounted a
+// terminal error handler downstream, so this wrapper owns the response itself rather than
+// leaving an unauthenticated caller to whatever (if anything) Express's own default handler
+// would have sent — including a stack trace, which it prints outside of NODE_ENV=production.
+export function asyncHandler(logger: Logger, handler: AsyncControllerHandler): RequestHandler {
+  return (req, res, next) => {
+    // The type says handler always returns a Promise, and a genuinely `async` function can't
+    // violate that — but nothing at the type level stops a caller from passing a plain function
+    // that throws before ever returning one, and this seam is about to carry several more
+    // controllers (Tasks 15-17). Routing the call through Promise.resolve().then(...) means a
+    // synchronous throw lands in the same .catch() as a real rejection, so it still gets this
+    // package's generic response instead of whatever Express's own default handler would have
+    // sent. Not a live bug today — every controller built so far is a true async function.
+    Promise.resolve()
+      .then(() => handler(req, res, next))
+      .catch((err: unknown) => {
+        if (res.headersSent) {
+          next(err);
+          return;
+        }
+        logger.error("shopify-mcp-oauth: unhandled controller error", err);
+        res.status(500).json(GENERIC_SERVER_ERROR_BODY);
+      });
+  };
+}
+```
+
 `src/controllers/metadata.ts`:
 
 ```ts
@@ -5365,7 +5497,7 @@ export function openaiAppsChallengeController(token: string | null): RequestHand
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `pnpm --filter shopify-mcp-oauth test src/serializers src/controllers`
-Expected: PASS, 19 tests.
+Expected: PASS, 34 tests.
 
 - [ ] **Step 6: Commit**
 
