@@ -63,7 +63,7 @@ describe("shopifySessionStorage", () => {
     return expect(lookup(DEMO_SHOP)).resolves.toBeNull();
   });
 
-  it("resolves the first qualifying session when multiple sessions exist", async () => {
+  it("resolves a qualifying session when non-qualifying ones are present", async () => {
     const lookup = shopifySessionStorage(
       buildSessionStorage([
         { shop: DEMO_SHOP, isOnline: true, accessToken: OFFLINE_TOKEN },

@@ -1870,6 +1870,7 @@ import { describe, expect, it, vi } from "vitest";
 import { shopifySessionStorage, type ShopifySessionLike } from "./shopifySessionStorage";
 
 const DEMO_SHOP = "demo.myshopify.com";
+const OTHER_SHOP = "other.myshopify.com";
 const OFFLINE_TOKEN = "shpua_offline_token";
 
 function buildSessionStorage(sessions: ShopifySessionLike[]) {
@@ -1906,6 +1907,35 @@ describe("shopifySessionStorage", () => {
       findSessionsByShop: vi.fn().mockRejectedValue(new Error("redis down")),
     });
     expect(await lookup(DEMO_SHOP)).toBeNull();
+  });
+
+  it("ignores an offline session with an empty-string access token", async () => {
+    const lookup = shopifySessionStorage(buildSessionStorage([{ shop: DEMO_SHOP, isOnline: false, accessToken: "" }]));
+    expect(await lookup(DEMO_SHOP)).toBeNull();
+  });
+
+  it("returns null when a session belongs to a different shop", async () => {
+    const lookup = shopifySessionStorage(
+      buildSessionStorage([{ shop: OTHER_SHOP, isOnline: false, accessToken: OFFLINE_TOKEN }])
+    );
+    expect(await lookup(DEMO_SHOP)).toBeNull();
+  });
+
+  it("returns null when the session storage resolves a non-array", () => {
+    const lookup = shopifySessionStorage({ findSessionsByShop: vi.fn().mockResolvedValue(undefined) });
+    // Returned, not awaited: a rejected promise must fail this test rather than pass it.
+    return expect(lookup(DEMO_SHOP)).resolves.toBeNull();
+  });
+
+  it("resolves a qualifying session when non-qualifying ones are present", async () => {
+    const lookup = shopifySessionStorage(
+      buildSessionStorage([
+        { shop: DEMO_SHOP, isOnline: true, accessToken: OFFLINE_TOKEN },
+        { shop: OTHER_SHOP, isOnline: false, accessToken: OFFLINE_TOKEN },
+        { shop: DEMO_SHOP, isOnline: false, accessToken: OFFLINE_TOKEN },
+      ])
+    );
+    expect(await lookup(DEMO_SHOP)).toEqual({ id: DEMO_SHOP, domain: DEMO_SHOP });
   });
 });
 ```
@@ -1949,19 +1979,39 @@ export function shopifySessionStorage(
   sessionStorage: ShopifySessionStorageLike
 ): OAuthStorage["findShopByDomain"] {
   return async (domain: string): Promise<ShopRef | null> => {
-    let sessions: ShopifySessionLike[];
     try {
-      sessions = await sessionStorage.findSessionsByShop(domain);
+      const sessions = await sessionStorage.findSessionsByShop(domain);
+      // ShopifySessionStorageLike is structural, so the return type is not enforced at runtime.
+      if (!Array.isArray(sessions)) {
+        return null;
+      }
+      // The shop check is not redundant with querying by domain: a custom session-store wrapper
+      // that filters loosely would otherwise let one shop's grant authorize another's. Only an
+      // offline session proves an app-level grant — online sessions are per-staff-member.
+      const offline = sessions.find(
+        (session) => session.shop === domain && !session.isOnline && Boolean(session.accessToken)
+      );
+      return offline ? { id: domain, domain } : null;
     } catch {
       // A session-store outage must read as "not installed", never as "installed".
       return null;
     }
-    // Only an offline session proves an app-level grant; online sessions are per-staff-member.
-    const offline = sessions.find((session) => !session.isOnline && Boolean(session.accessToken));
-    return offline ? { id: domain, domain } : null;
   };
 }
 ```
+
+Two things here are load-bearing and were both wrong in an earlier draft of this plan.
+
+`session.shop === domain` looks redundant beside a query that already takes the domain, which is
+exactly how it gets deleted. It is not redundant: `ShopifySessionStorageLike` is a **structural**
+interface, so any adopter object with a matching method shape satisfies it — including a wrapper
+that filters loosely or caches by prefix. Without the check, a session belonging to shop B
+authorizes shop A. This function is the package's authorization boundary; it must verify identity
+rather than inherit it from its caller.
+
+The whole lookup sits inside the `try` for the same reason. If `findSessionsByShop` *resolves* a
+non-array rather than rejecting, calling `.find` on it throws, and the function returns a rejected
+promise instead of `null` — breaking the fail-closed guarantee the comment claims.
 
 - [ ] **Step 4: Write `src/adapters/allowAnyShop.ts`**
 
