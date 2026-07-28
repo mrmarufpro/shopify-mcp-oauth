@@ -73,9 +73,83 @@ function buildPrivateAddressBlockList(): net.BlockList {
 
 const privateAddressBlockList = buildPrivateAddressBlockList();
 
+// Expands any valid IPv6 literal (net.isIPv6 must already be true) to its 8 constituent 16-bit
+// groups, handling "::" compression and an embedded IPv4 dotted-quad tail (e.g. "::ffff:1.2.3.4").
+// Used only to pull specific groups out at fixed offsets for NAT64/6to4 detection below -- this is
+// not a general-purpose formatter.
+function expandIpv6Groups(addr: string): number[] | null {
+  const lastColonIndex = addr.lastIndexOf(":");
+  const tail = addr.slice(lastColonIndex + 1);
+  const normalized = net.isIPv4(tail) ? `${addr.slice(0, lastColonIndex + 1)}${ipv4ToHexGroups(tail).join(":")}` : addr;
+
+  let groups: string[];
+  if (normalized.includes("::")) {
+    const [head = "", tailPart = ""] = normalized.split("::");
+    const headGroups = head ? head.split(":").filter((group) => group.length > 0) : [];
+    const tailGroups = tailPart ? tailPart.split(":").filter((group) => group.length > 0) : [];
+    const missing = 8 - headGroups.length - tailGroups.length;
+    if (missing < 0) return null;
+    groups = [...headGroups, ...Array(missing).fill("0"), ...tailGroups];
+  } else {
+    groups = normalized.split(":");
+  }
+  if (groups.length !== 8) return null;
+
+  const result: number[] = [];
+  for (const group of groups) {
+    const value = parseInt(group === "" ? "0" : group, 16);
+    if (Number.isNaN(value) || value < 0 || value > 0xffff) return null;
+    result.push(value);
+  }
+  return result;
+}
+
+function ipv4ToHexGroups(ipv4: string): [string, string] {
+  const octets = ipv4.split(".").map(Number);
+  const hi = (((octets[0] ?? 0) << 8) | (octets[1] ?? 0)) >>> 0;
+  const lo = (((octets[2] ?? 0) << 8) | (octets[3] ?? 0)) >>> 0;
+  return [hi.toString(16), lo.toString(16)];
+}
+
+function groupsToIpv4(high: number, low: number): string {
+  return [(high >>> 8) & 0xff, high & 0xff, (low >>> 8) & 0xff, low & 0xff].join(".");
+}
+
+// NAT64 (RFC 6052, "64:ff9b::/96") and 6to4 (RFC 3056, "2002::/16") both carry a plain IPv4 address
+// at a fixed bit offset rather than being private ranges in their own right. A blanket BlockList
+// rule over either whole prefix can't tell an embedded private address from an embedded public one
+// (verified: it blocks 8.8.8.8's NAT64/6to4 forms exactly as readily as 169.254.169.254's -- the
+// same "::/96 can't discriminate" problem already documented above for IPv4-compatible notation,
+// just relocated to these prefixes). So instead of adding table rows for these notations, extract
+// the embedded IPv4 and reclassify *that* through the one set of ipv4 rules already above --
+// there's nothing to keep in sync if a twelfth ipv4 range is ever added, because there's no second
+// list of ranges written in these notations to forget to update.
+//
+// Teredo ("2001::/32") is deliberately not handled the same way: its embedded bits are the
+// tunneling client's own obfuscated public address/port for a specific peer-to-peer session, not
+// an arbitrary routable target the way NAT64/6to4 embed one -- there's no "the real destination" to
+// extract. It's also disabled by default on effectively every current platform, so it doesn't carry
+// NAT64's "real, deployed gateway" justification for accepting any residual risk here.
+function extractEmbeddedIpv4(addr: string): string | null {
+  const groups = expandIpv6Groups(addr);
+  if (!groups) return null;
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
+  if (g0 === 0x64 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+    return groupsToIpv4(g6 ?? 0, g7 ?? 0);
+  }
+  if (g0 === 0x2002) {
+    return groupsToIpv4(g1 ?? 0, g2 ?? 0);
+  }
+  return null;
+}
+
 function isPrivateOrLoopbackIp(addr: string): boolean {
   if (net.isIPv4(addr)) return privateAddressBlockList.check(addr, "ipv4");
-  if (net.isIPv6(addr)) return privateAddressBlockList.check(addr, "ipv6");
+  if (net.isIPv6(addr)) {
+    const embeddedIpv4 = extractEmbeddedIpv4(addr);
+    if (embeddedIpv4) return privateAddressBlockList.check(embeddedIpv4, "ipv4");
+    return privateAddressBlockList.check(addr, "ipv6");
+  }
   // Not a recognizable IP literal at all. Unreachable via this file's current call sites (both
   // only ever pass a value net.isIP has already validated) -- kept as defense in depth rather than
   // silently treating an unrecognized value as public.

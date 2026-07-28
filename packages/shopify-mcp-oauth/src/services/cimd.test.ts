@@ -244,6 +244,8 @@ describe("resolveCimdClient", () => {
       ["198.18.0.0/15 (benchmarking)", "https://198.18.0.1/doc.json"],
       ["IPv4-mapped IPv6 loopback (::ffff:127.0.0.1)", "https://[::ffff:127.0.0.1]/doc.json"],
       ["IPv4-mapped IPv6 cloud-metadata address (::ffff:169.254.169.254)", "https://[::ffff:169.254.169.254]/doc.json"],
+      ["NAT64-embedded cloud-metadata address (64:ff9b::a9fe:a9fe)", "https://[64:ff9b::a9fe:a9fe]/doc.json"],
+      ["6to4-embedded loopback address (2002:7f00:1::)", "https://[2002:7f00:1::]/doc.json"],
     ];
 
     it.each(RESERVED_ADDRESS_URLS)("rejects %s", async (_description, url) => {
@@ -260,6 +262,12 @@ describe("resolveCimdClient", () => {
       ["a public IPv4 host", "https://8.8.8.8/doc.json"],
       ["a public IPv6 host", "https://[2001:db8::1]/doc.json"],
       ["a public host in IPv4-mapped IPv6 notation", "https://[::ffff:8.8.8.8]/doc.json"],
+      // These two are the direct regression guard for N2: a blanket rule over the whole
+      // 64:ff9b::/96 or 2002::/16 prefix would reject these, since 8.8.8.8's embedded form is
+      // just as much "inside" that prefix as 169.254.169.254's is. Extracting the embedded
+      // address and reclassifying it is what tells them apart.
+      ["a public host in NAT64 notation (64:ff9b::808:808 = 8.8.8.8)", "https://[64:ff9b::808:808]/doc.json"],
+      ["a public host in 6to4 notation (2002:808:808:: = 8.8.8.8)", "https://[2002:808:808::]/doc.json"],
     ];
 
     it.each(PUBLIC_ADDRESS_URLS)("does not reject %s", async (_description, url) => {
