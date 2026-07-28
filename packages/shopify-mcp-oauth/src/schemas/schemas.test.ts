@@ -22,7 +22,7 @@ import { tokenRequestSchema } from "./token";
 
 const CLIENT_ID = "https://client.example/metadata.json";
 const REDIRECT_URI = "https://client.example/callback";
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 // RFC 7636 Appendix B.1 test vector (same pair used in crypto.test.ts): a real verifier/challenge
 // so the length- and charset-sensitive fields below accept a genuinely conformant client.
 const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";

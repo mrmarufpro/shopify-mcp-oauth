@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { prismaStorage, type PrismaLikeClient } from "./prismaStorage";
 import type { NewOAuthClient, NewToken } from "../types";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const CLIENT_ID = "prisma-client-id";
 const TOKEN_ID = "token-1";
 const LAST_USED_AT = new Date("2026-01-15T12:00:00.000Z");

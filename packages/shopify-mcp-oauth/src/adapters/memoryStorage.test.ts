@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { runStorageContractTests } from "../testing/storageContract";
 import { memoryStorage } from "./memoryStorage";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const DEMO_SHOP_ID = "shop_1";
 const MUTATION_CLIENT_ID = "mutation-test-client";
 const ORIGINAL_REDIRECT_URI = "https://original.example/callback";

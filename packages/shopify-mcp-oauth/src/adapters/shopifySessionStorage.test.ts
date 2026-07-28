@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { shopifySessionStorage, type ShopifySessionLike } from "./shopifySessionStorage";
 
-const DEMO_SHOP = "demo.myshopify.com";
+const DEMO_SHOP = "example.myshopify.com";
 const OTHER_SHOP = "other.myshopify.com";
 const OFFLINE_TOKEN = "shpua_offline_token";
 const EMPTY_TOKEN = "";
