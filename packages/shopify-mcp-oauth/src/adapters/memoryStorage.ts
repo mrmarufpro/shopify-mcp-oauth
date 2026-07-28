@@ -18,6 +18,7 @@ function cloneClient(client: OAuthClient): OAuthClient {
     redirectUris: [...client.redirectUris],
     grantTypes: client.grantTypes ? [...client.grantTypes] : null,
     responseTypes: client.responseTypes ? [...client.responseTypes] : null,
+    revokedAt: client.revokedAt ? new Date(client.revokedAt) : null,
   };
 }
 
