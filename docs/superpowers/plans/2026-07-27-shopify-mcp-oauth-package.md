@@ -489,22 +489,84 @@ Copy the full contents of the **Locked Interfaces** `types.ts` block above verba
 - [ ] **Step 4: Write `src/errors.ts`**
 
 ```ts
-export class OAuthError extends Error {
-  readonly code: string;
-  readonly description: string;
-  readonly status: number;
+export interface ShopRef {
+  id: string | number;
+  domain: string;
+}
 
-  constructor(code: string, description: string, status = 400) {
-    super(`${code}: ${description}`);
-    this.name = "OAuthError";
-    this.code = code;
-    this.description = description;
-    this.status = status;
-  }
+export interface OAuthClient {
+  clientId: string;
+  clientName: string | null;
+  redirectUris: string[];
+  grantTypes: string[] | null;
+  responseTypes: string[] | null;
+  logoUri: string | null;
+  clientUri: string | null;
+  tokenEndpointAuthMethod: string;
+  revokedAt: Date | null;
+}
+export type NewOAuthClient = Omit<OAuthClient, "revokedAt">;
 
-  toBody(): { error: string; error_description: string } {
-    return { error: this.code, error_description: this.description };
-  }
+export interface StoredToken {
+  id: string;
+  shopId: string | number;
+  /** Denormalized so the resource server can name the shop without a reverse lookup by id. */
+  shopDomain: string;
+  clientId: string;
+  accessTokenHash: string;
+  refreshTokenHash: string | null;
+  accessTokenExpiresAt: Date;
+  refreshTokenExpiresAt: Date | null;
+  scope: string | null;
+  resource: string | null;
+  revokedAt: Date | null;
+  rotatedFromId: string | null;
+}
+export type NewToken = Omit<StoredToken, "id" | "revokedAt">;
+
+export interface OAuthStorage {
+  findClient(clientId: string): Promise<OAuthClient | null>;
+  createClient(client: NewOAuthClient): Promise<OAuthClient>;
+  upsertClient(client: NewOAuthClient): Promise<OAuthClient>;
+  createToken(token: NewToken): Promise<StoredToken>;
+  findTokenByAccessHash(hash: string): Promise<StoredToken | null>;
+  /**
+   * Same match as findTokenByAccessHash, but ignores accessTokenExpiresAt — an expired access
+   * token still names a real grant, and /revoke must be able to kill that grant (including its
+   * still-live refresh token) after the access token has expired. Still excludes an already-
+   * revoked row, so this can't resurrect a dead grant.
+   */
+  findTokenByAccessHashIgnoringExpiry(hash: string): Promise<StoredToken | null>;
+  findTokenByRefreshHash(hash: string): Promise<StoredToken | null>;
+  /** Returns false when the row was already revoked. Rotation relies on this for one-time use. */
+  revokeToken(id: string): Promise<boolean>;
+  touchToken(id: string, lastUsedAt: Date): Promise<void>;
+  findShopByDomain(domain: string): Promise<ShopRef | null>;
+}
+
+export interface CacheStore {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, ttlSeconds: number): Promise<void>;
+  del(key: string): Promise<void>;
+  /**
+   * Read and delete in a single atomic step: of two concurrent callers on the same key, exactly
+   * one may see the value. This is what makes an authorization code single-use, so a get-then-del
+   * implementation is not a valid substitute — required, not optional, so a non-atomic cache is
+   * rejected at the type level instead of silently allowing a code to be redeemed twice.
+   */
+  getdel(key: string): Promise<string | null>;
+}
+
+export interface Logger {
+  info(msg: string, meta?: unknown): void;
+  warn(msg: string, meta?: unknown): void;
+  error(msg: string, meta?: unknown): void;
+}
+
+export interface McpAuthContext {
+  shopId: string | number;
+  shopDomain: string;
+  tokenId: string;
 }
 ```
 
@@ -810,8 +872,6 @@ export function validateRedirectUri(uri: string): string | null {
   } catch {
     return "redirect_uri must be a valid URL";
   }
-  // A userinfo component turns https://client.example@attacker.example/cb into a URL that
-  // reads as the registered host but resolves to the attacker's. Reject it outright.
   if (url.username !== "" || url.password !== "") {
     return "redirect_uri must not contain userinfo";
   }
@@ -846,8 +906,6 @@ export function redirectUriMatches(registered: string, requested: string): boole
   if (left.hostname !== right.hostname) return false;
   if (left.pathname !== right.pathname) return false;
   if (left.search !== right.search) return false;
-  // Compared explicitly: without this, a registered https://client.example/cb matches a
-  // requested https://attacker@client.example/cb, because every other component is equal.
   if (left.username !== right.username || left.password !== right.password) return false;
   if (!isLoopbackHost(left.hostname)) return left.port === right.port;
   return true;
@@ -942,28 +1000,33 @@ Expected: FAIL — cannot resolve `./stateJwt`.
 
 ```ts
 import jwt from "jsonwebtoken";
+import { z } from "zod";
 
-export interface OuterStatePayload {
-  clientId: string;
-  redirectUri: string;
-  clientState: string;
-  codeChallenge: string;
-  codeChallengeMethod: string;
-  resource: string;
-  nonce: string;
-}
+const outerStatePayloadSchema = z.object({
+  clientId: z.string(),
+  redirectUri: z.string(),
+  clientState: z.string(),
+  codeChallenge: z.string(),
+  codeChallengeMethod: z.string(),
+  resource: z.string(),
+  nonce: z.string(),
+});
 
-export interface VerifiedOuterState extends OuterStatePayload {
-  iat: number;
-  exp: number;
-}
+const verifiedOuterStateSchema = outerStatePayloadSchema.extend({
+  iat: z.number(),
+  exp: z.number(),
+});
+
+export type OuterStatePayload = z.infer<typeof outerStatePayloadSchema>;
+export type VerifiedOuterState = z.infer<typeof verifiedOuterStateSchema>;
 
 export function signOuterState(payload: OuterStatePayload, secret: string, ttlSeconds: number): string {
   return jwt.sign(payload, secret, { algorithm: "HS256", expiresIn: ttlSeconds });
 }
 
 export function verifyOuterState(token: string, secret: string): VerifiedOuterState {
-  return jwt.verify(token, secret, { algorithms: ["HS256"] }) as VerifiedOuterState;
+  const verified = jwt.verify(token, secret, { algorithms: ["HS256"] });
+  return verifiedOuterStateSchema.parse(verified);
 }
 ```
 
@@ -1145,9 +1208,15 @@ export function runStorageContractTests(
     });
 
     it("finds a token by its access hash", async () => {
-      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "lookup-me", clientId: CONTRACT_CLIENT_ID }));
+      await storage.createToken(
+        buildToken(opts.seedShop, { accessTokenHash: "lookup-me", clientId: CONTRACT_CLIENT_ID })
+      );
       const found = await storage.findTokenByAccessHash("lookup-me");
       expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
+    });
+
+    it("returns null for an access hash that was never stored", async () => {
+      expect(await storage.findTokenByAccessHash("never-stored-access-hash")).toBeNull();
     });
 
     it("does not return an expired access token", async () => {
@@ -1160,22 +1229,78 @@ export function runStorageContractTests(
       expect(await storage.findTokenByAccessHash("expired-hash")).toBeNull();
     });
 
-    it("does not return a revoked token", async () => {
+    it("does not return a revoked token by its access hash", async () => {
       const token = await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "revoke-me" }));
       await storage.revokeToken(token.id);
       expect(await storage.findTokenByAccessHash("revoke-me")).toBeNull();
     });
 
+    it("findTokenByAccessHashIgnoringExpiry finds an expired-but-unrevoked token", async () => {
+      await storage.createToken(
+        buildToken(opts.seedShop, {
+          accessTokenHash: "expired-but-revocable-hash",
+          accessTokenExpiresAt: new Date(Date.now() - 1000),
+        })
+      );
+      const found = await storage.findTokenByAccessHashIgnoringExpiry("expired-but-revocable-hash");
+      expect(found?.accessTokenHash).toBe("expired-but-revocable-hash");
+    });
+
+    it("findTokenByAccessHashIgnoringExpiry does not return a revoked token", async () => {
+      const token = await storage.createToken(
+        buildToken(opts.seedShop, { accessTokenHash: "revoke-me-ignoring-expiry" })
+      );
+      await storage.revokeToken(token.id);
+      expect(await storage.findTokenByAccessHashIgnoringExpiry("revoke-me-ignoring-expiry")).toBeNull();
+    });
+
+    it("findTokenByAccessHashIgnoringExpiry returns null for a hash that was never stored", async () => {
+      expect(await storage.findTokenByAccessHashIgnoringExpiry("never-stored-access-hash")).toBeNull();
+    });
+
     it("finds a token by its refresh hash", async () => {
-      await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup", clientId: CONTRACT_CLIENT_ID }));
+      await storage.createToken(
+        buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup", clientId: CONTRACT_CLIENT_ID })
+      );
       const found = await storage.findTokenByRefreshHash("refresh-lookup");
       expect(found?.clientId).toBe(CONTRACT_CLIENT_ID);
+    });
+
+    it("returns null for a refresh hash that was never stored", async () => {
+      expect(await storage.findTokenByRefreshHash("never-stored-refresh-hash")).toBeNull();
+    });
+
+    it("does not return an expired refresh token", async () => {
+      await storage.createToken(
+        buildToken(opts.seedShop, {
+          refreshTokenHash: "expired-refresh-hash",
+          refreshTokenExpiresAt: new Date(Date.now() - 1000),
+        })
+      );
+      expect(await storage.findTokenByRefreshHash("expired-refresh-hash")).toBeNull();
+    });
+
+    it("does not return a revoked token by its refresh hash", async () => {
+      const token = await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "revoke-refresh-me" }));
+      await storage.revokeToken(token.id);
+      expect(await storage.findTokenByRefreshHash("revoke-refresh-me")).toBeNull();
     });
 
     it("revokeToken returns false the second time, so rotation stays single-use", async () => {
       const token = await storage.createToken(buildToken(opts.seedShop));
       expect(await storage.revokeToken(token.id)).toBe(true);
       expect(await storage.revokeToken(token.id)).toBe(false);
+    });
+
+    it("revokeToken returns false for a token id that was never created", async () => {
+      expect(await storage.revokeToken("never-created-token-id")).toBe(false);
+    });
+
+    it("touchToken does not throw for an existing token", async () => {
+      const token = await storage.createToken(buildToken(opts.seedShop));
+      // No expect(): StoredToken has no lastUsedAt field, so resolving without throwing
+      // is the only behavior this interface exposes for touchToken.
+      await storage.touchToken(token.id, new Date());
     });
 
     it("finds the seeded shop by domain", async () => {
@@ -1218,6 +1343,9 @@ export function memoryCache(): CacheStore {
       return read(key);
     },
     async set(key, value, ttlSeconds) {
+      // Matches real Redis's "ERR invalid expire time" rather than silently storing an
+      // already-expired entry, so a caller's own positive-ttl guard is load-bearing, not decorative.
+      if (ttlSeconds <= 0) throw new Error("memoryCache.set: ttlSeconds must be positive");
       entries.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
     },
     async del(key) {
@@ -1311,6 +1439,13 @@ export function memoryStorage(seed: { shops?: ShopRef[] } = {}): MemoryStorage {
     async findTokenByAccessHash(hash) {
       for (const token of tokens.values()) {
         if (token.accessTokenHash === hash && isUsable(token)) return cloneToken(token);
+      }
+      return null;
+    },
+
+    async findTokenByAccessHashIgnoringExpiry(hash) {
+      for (const token of tokens.values()) {
+        if (token.accessTokenHash === hash && token.revokedAt === null) return cloneToken(token);
       }
       return null;
     },
@@ -1475,11 +1610,18 @@ Expected: FAIL — cannot resolve `./redisCache`.
 ```ts
 import type { CacheStore } from "../types";
 
+/**
+ * Shaped after node-redis v4: `getDel` casing, `set(key, value, { EX })`. `getDel` is required,
+ * not optional — this adapter needs node-redis ≥4 talking to Redis ≥6.2 (the GETDEL command it
+ * wraps), because a get-then-del fallback is not atomic: two concurrent redemptions of one
+ * authorization code could both read it before either delete lands, making the code replayable.
+ * Requiring it here narrows compatibility no further than this interface already does.
+ */
 export interface RedisLikeClient {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, opts: { EX: number }): Promise<unknown>;
   del(key: string): Promise<unknown>;
-  getDel?(key: string): Promise<string | null>;
+  getDel(key: string): Promise<string | null>;
 }
 
 export function redisCache(client: RedisLikeClient): CacheStore {
@@ -1494,14 +1636,7 @@ export function redisCache(client: RedisLikeClient): CacheStore {
       await client.del(key);
     },
     async getdel(key) {
-      // This branches on client capability, not server version: a client that exposes getDel
-      // against a pre-6.2 Redis surfaces the server's error rather than falling back. The
-      // fallback itself is not atomic — two concurrent redemptions of one authorization code
-      // could both read it before either delete lands.
-      if (client.getDel) return client.getDel(key);
-      const value = await client.get(key);
-      await client.del(key);
-      return value;
+      return client.getDel(key);
     },
   };
 }
@@ -1753,15 +1888,14 @@ import type { NewOAuthClient, NewToken, OAuthClient, OAuthStorage, ShopRef, Stor
 interface PrismaDelegate {
   findFirst(args: { where: Record<string, unknown> }): Promise<Record<string, unknown> | null>;
   create(args: { data: Record<string, unknown> }): Promise<Record<string, unknown>>;
+  // Optional so a minimal delegate (e.g. a shop-mapping model that only needs findFirst) still
+  // satisfies this type; callers that need them get a runtime guard instead (upsertClient/revokeToken).
   upsert?(args: {
     where: Record<string, unknown>;
     create: Record<string, unknown>;
     update: Record<string, unknown>;
   }): Promise<Record<string, unknown>>;
-  updateMany?(args: {
-    where: Record<string, unknown>;
-    data: Record<string, unknown>;
-  }): Promise<{ count: number }>;
+  updateMany?(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>;
 }
 
 /**
@@ -1845,6 +1979,11 @@ function buildCore(prisma: PrismaLikeClient): Omit<OAuthStorage, "findShopByDoma
       const row = await prisma.mcpOAuthToken.findFirst({
         where: { accessTokenHash: hash, revokedAt: null, accessTokenExpiresAt: { gt: new Date() } },
       });
+      return row ? toToken(row) : null;
+    },
+
+    async findTokenByAccessHashIgnoringExpiry(hash) {
+      const row = await prisma.mcpOAuthToken.findFirst({ where: { accessTokenHash: hash, revokedAt: null } });
       return row ? toToken(row) : null;
     },
 
@@ -2079,9 +2218,7 @@ export interface ShopifySessionStorageLike {
   findSessionsByShop(shop: string): Promise<ShopifySessionLike[]>;
 }
 
-export function shopifySessionStorage(
-  sessionStorage: ShopifySessionStorageLike
-): OAuthStorage["findShopByDomain"] {
+export function shopifySessionStorage(sessionStorage: ShopifySessionStorageLike): OAuthStorage["findShopByDomain"] {
   return async (domain: string): Promise<ShopRef | null> => {
     try {
       const sessions = await sessionStorage.findSessionsByShop(domain);
@@ -2336,13 +2473,13 @@ export interface ResolvedConfig {
 }
 
 const CACHE_FALLBACK_WARNING =
-  "shopify-mcp-oauth: no cache supplied, falling back to an in-memory one. It is single-process, " +
-  "so on a multi-instance deploy an authorization code written by one instance is invisible to the " +
-  "others and login fails intermittently. Supply a shared cache such as redisCache in production.";
+  "shopify-mcp-oauth: no cache supplied, falling back to an in-memory cache. This cache is single-process, so " +
+  "authorization codes and rate-limit counters written by one instance are invisible to the others and login " +
+  "will fail intermittently across multiple instances — supply a shared cache such as redisCache in production.";
 
-// A prefix check like /^https?:\/\// is not enough: it accepts "https:///" (no host at all) and
-// hosts carrying a query string or fragment, each of which yields a malformed `resource`. Since
-// `resource` is compared against token audience values, those configs boot fine and fail at login.
+// A prefix regex only checks the string starts with a scheme; new URL() also catches a missing
+// hostname, a query string, or a fragment, none of which are valid in the resource identifier
+// this host is used to derive.
 function validateHost(value: string, ctx: z.RefinementCtx): void {
   let url: URL;
   try {
@@ -2359,8 +2496,6 @@ function validateHost(value: string, ctx: z.RefinementCtx): void {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must include a hostname" });
     return;
   }
-  // `resource` is published in the protected-resource metadata document and written into every
-  // token's audience, so credentials embedded in the host would reach a public endpoint.
   if (url.username || url.password) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a username or password" });
     return;
@@ -2392,8 +2527,6 @@ const configSchema = z.object({
 export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
   const parsed = configSchema.safeParse(input);
   if (!parsed.success) {
-    // Every failing field at once — reporting only issues[0] makes an adopter with three bad
-    // fields fix them across three boots. Field paths only; never echo a value.
     const details = parsed.error.issues
       .map((issue) => `"${issue.path.join(".") || "config"}": ${issue.message}`)
       .join("; ");
@@ -2401,10 +2534,9 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
   }
   if (!input.storage) throw new Error('shopify-mcp-oauth config invalid at "storage": storage is required');
 
-  // Derive from the parsed URL, not the raw string, so the scheme and hostname lowercase and a
-  // default port drops. Token-audience matching against `resource` is plain string equality, so an
-  // unnormalized host fails it silently. Strip trailing slashes after, or a host written with one
-  // yields a double slash — note `pathname` is "/" even when the adopter wrote no path.
+  // validateHost already proved this parses; re-derive from the URL (not the raw string) so the
+  // scheme and hostname are lowercased and a default port is dropped — token-audience matching
+  // against `resource` is plain string equality, so an unnormalized host would fail it silently.
   const parsedHost = new URL(parsed.data.host);
   const host = `${parsedHost.protocol}//${parsedHost.host}${parsedHost.pathname}`.replace(/\/+$/, "");
   const logger = input.logger ?? console;
@@ -3673,6 +3805,7 @@ export async function issueCode(
       codeChallengeMethod: input.codeChallengeMethod,
       resource: input.resource,
     };
+    // Keyed by the code's own hash, not the code itself, so a cache dump never yields a redeemable code.
     await config.cache.set(`${CODE_PREFIX}${sha256Hex(code)}`, JSON.stringify(record), ttl);
   }
   return { code };
@@ -3680,17 +3813,17 @@ export async function issueCode(
 
 export async function consumeCode(config: ResolvedConfig, code: string): Promise<CodeRecord | null> {
   const key = `${CODE_PREFIX}${sha256Hex(code)}`;
-  // Read-and-delete in one operation where the backend allows it; that atomicity is what makes
-  // a code single-use when two /token requests race.
-  const raw = config.cache.getdel
-    ? await config.cache.getdel(key)
-    : await (async () => {
-        const value = await config.cache.get(key);
-        await config.cache.del(key);
-        return value;
-      })();
+  // getdel is atomic on every CacheStore; that's what keeps a code single-use when two /token
+  // requests race on it concurrently.
+  const raw = await config.cache.getdel(key);
   if (!raw) return null;
-  return JSON.parse(raw) as CodeRecord;
+  try {
+    return JSON.parse(raw) as CodeRecord;
+  } catch {
+    // A cache entry that isn't valid JSON can't be a code this package wrote; treat it the same
+    // as "not found" rather than letting a corrupt entry crash the /token request.
+    return null;
+  }
 }
 ```
 
@@ -3756,7 +3889,8 @@ export async function rotateRefresh(
   if (!existing) return null;
   // Bind rotation to the presenting client: a stolen refresh token is useless to a different one.
   if (existing.clientId !== clientId) return null;
-  // Only the caller whose revoke actually flipped the row may mint a replacement.
+  // Only the caller whose revoke actually flipped the row may mint a replacement, so two
+  // concurrent refreshes of the same token can't both win.
   const won = await config.storage.revokeToken(existing.id);
   if (!won) return null;
 
@@ -3771,7 +3905,9 @@ export async function rotateRefresh(
 }
 
 export async function revokeByAccessToken(config: ResolvedConfig, token: string): Promise<void> {
-  const existing = await config.storage.findTokenByAccessHash(sha256Hex(token));
+  // Ignores expiry deliberately: an access token that has expired since it was issued still
+  // names a real grant, and revocation must be able to kill that grant's refresh token too.
+  const existing = await config.storage.findTokenByAccessHashIgnoringExpiry(sha256Hex(token));
   if (existing) await config.storage.revokeToken(existing.id);
 }
 
