@@ -2447,7 +2447,7 @@ git commit -m "feat: validate and resolve package config at construction time"
 ## Task 11: Request and document schemas
 
 **Files:**
-- Create: `packages/shopify-mcp-oauth/src/schemas/authorize.ts`, `token.ts`, `register.ts`, `revoke.ts`, `shopifyCallback.ts`, `cimd.ts`
+- Create: `packages/shopify-mcp-oauth/src/schemas/authorize.ts`, `token.ts`, `register.ts`, `revoke.ts`, `shopifyCallback.ts`, `cimd.ts`, `capOversizedArray.ts`
 - Test: `packages/shopify-mcp-oauth/src/schemas/schemas.test.ts`
 
 **Interfaces:**
@@ -2617,12 +2617,17 @@ Expected: FAIL — none of the schema modules resolve.
 ```ts
 import { z } from "zod";
 
+// S256 is the only accepted method (see code_challenge_method below), and its output is
+// deterministic: base64url(SHA-256(verifier)) with no padding is always exactly 43 characters
+// from [A-Za-z0-9_-]. Unlike code_verifier's RFC 7636 charset, "." and "~" never appear here.
+const S256_CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
 export const authorizeQuerySchema = z.object({
   response_type: z.literal("code", { message: "response_type must be 'code'" }),
   client_id: z.string().min(1, "client_id is required"),
   redirect_uri: z.string().min(1, "redirect_uri is required"),
   state: z.string().min(1, "state is required"),
-  code_challenge: z.string().min(1, "code_challenge is required"),
+  code_challenge: z.string().regex(S256_CHALLENGE_PATTERN, "code_challenge must be a 43-character S256 challenge"),
   code_challenge_method: z.literal("S256", { message: "code_challenge_method must be S256" }),
   // RFC 8707 says clients MUST send `resource`, but as an AS hosting a single resource we accept
   // its absence and treat it as the canonical one. When present it is exact-matched downstream.
@@ -2638,12 +2643,19 @@ export type AuthorizeQuery = z.infer<typeof authorizeQuerySchema>;
 ```ts
 import { z } from "zod";
 
+// RFC 7636 §4.1: code-verifier = 43*128unreserved, unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~".
+// This alphabet is wider than code_challenge's base64url charset (see authorize.ts) — verifiers are
+// client-generated and the RFC permits "." and "~" here.
+const CODE_VERIFIER_PATTERN = /^[A-Za-z0-9\-._~]{43,128}$/;
+
 const authorizationCodeGrantSchema = z.object({
   grant_type: z.literal("authorization_code"),
   code: z.string().min(1, "code is required"),
   redirect_uri: z.string().min(1, "redirect_uri is required"),
   client_id: z.string().min(1, "client_id is required"),
-  code_verifier: z.string().min(1, "code_verifier is required"),
+  code_verifier: z
+    .string()
+    .regex(CODE_VERIFIER_PATTERN, "code_verifier must be 43-128 characters of unreserved RFC 7636 characters"),
 });
 
 const refreshTokenGrantSchema = z.object({
@@ -2662,40 +2674,137 @@ export type AuthorizationCodeGrant = z.infer<typeof authorizationCodeGrantSchema
 export type RefreshTokenGrant = z.infer<typeof refreshTokenGrantSchema>;
 ```
 
+`src/schemas/capOversizedArray.ts`:
+
+Both `register.ts` and `cimd.ts` parse arrays straight off an unauthenticated boundary, so both
+need this bound. Define it once — a security bound duplicated across two files drifts the moment
+one of them gains a field.
+
+```ts
+// zod validates every array element's shape before any .max()/.refine() check runs, so a bounded
+// count check or refine alone still pays O(n) to parse an oversized array's elements. Replace an
+// over-cap array with a fixed-size placeholder before it reaches the real schema, so a hostile
+// array of any size costs the same to reject as one just over the limit — a downstream .max()
+// check still fires on the placeholder and reports the same message.
+//
+// Usage note for an optional field: wrap `.optional()` around the whole
+// `z.preprocess((value) => capOversizedArray(value, cap), schema)` call, not around `schema`
+// itself. `ZodOptional` short-circuits on an absent key before ever invoking the inner type, so
+// that placement means this helper never runs at all when the field isn't sent — not just a
+// no-op on `undefined`. `z.preprocess(fn, schema.optional())` calls `fn` with `undefined` on
+// every absent field instead, which is unnecessary work even though this helper tolerates it.
+//
+// Internal to src/schemas/ — not part of this package's public export surface.
+export function capOversizedArray(value: unknown, cap: number): unknown {
+  if (Array.isArray(value) && value.length > cap) {
+    return Array.from({ length: cap + 1 }, () => "");
+  }
+  return value;
+}
+```
+
+The placeholder is `cap + 1` entries, never `cap` — an over-cap array must still fail the count
+check, never be silently truncated into an accepted one.
+
 `src/schemas/register.ts`:
+
+Every array field gets the cap, not just `redirect_uris`. They all arrive on the same
+unauthenticated request.
 
 ```ts
 import { z } from "zod";
 import { validateRedirectUri } from "../services/redirectUri";
+import { capOversizedArray } from "./capOversizedArray";
+
+// This body is reachable directly from an unauthenticated client's POST /register — bound its
+// worst case here rather than depending on a body-size limit owned by a different layer. Limits
+// are generous for any real client (a handful of redirect URIs, short display metadata) while
+// still capping the cost of validating a maliciously large payload.
+export const REGISTER_MAX_REDIRECT_URIS = 20;
+export const REGISTER_MAX_URI_LENGTH = 2048;
+export const REGISTER_MAX_GRANT_TYPES = 10;
+export const REGISTER_MAX_RESPONSE_TYPES = 10;
+export const REGISTER_MAX_CLIENT_NAME_LENGTH = 200;
 
 export const registerRequestSchema = z.object({
-  client_name: z.string().optional(),
-  redirect_uris: z
-    .array(z.string())
-    .min(1, "redirect_uris must contain at least one entry")
-    .refine((uris) => uris.every((uri) => validateRedirectUri(uri) === null), {
-      message: "redirect_uris contains an unacceptable URI",
-    }),
-  grant_types: z.array(z.string()).optional(),
-  response_types: z.array(z.string()).optional(),
-  logo_uri: z.string().optional(),
-  client_uri: z.string().optional(),
+  client_name: z.string().max(REGISTER_MAX_CLIENT_NAME_LENGTH, "client_name is too long").optional(),
+  redirect_uris: z.preprocess(
+    (value) => capOversizedArray(value, REGISTER_MAX_REDIRECT_URIS),
+    z
+      .array(z.string().max(REGISTER_MAX_URI_LENGTH, "redirect_uris entry is too long"))
+      .min(1, "redirect_uris must contain at least one entry")
+      .max(REGISTER_MAX_REDIRECT_URIS, "redirect_uris has too many entries")
+      .refine(
+        (uris) => uris.length > REGISTER_MAX_REDIRECT_URIS || uris.every((uri) => validateRedirectUri(uri) === null),
+        { message: "redirect_uris contains an unacceptable URI" }
+      )
+  ),
+  grant_types: z
+    .preprocess(
+      (value) => capOversizedArray(value, REGISTER_MAX_GRANT_TYPES),
+      z.array(z.string()).max(REGISTER_MAX_GRANT_TYPES, "grant_types has too many entries")
+    )
+    .optional(),
+  response_types: z
+    .preprocess(
+      (value) => capOversizedArray(value, REGISTER_MAX_RESPONSE_TYPES),
+      z.array(z.string()).max(REGISTER_MAX_RESPONSE_TYPES, "response_types has too many entries")
+    )
+    .optional(),
+  logo_uri: z.string().max(REGISTER_MAX_URI_LENGTH, "logo_uri is too long").optional(),
+  client_uri: z.string().max(REGISTER_MAX_URI_LENGTH, "client_uri is too long").optional(),
 });
 
 export type RegisterRequest = z.infer<typeof registerRequestSchema>;
 ```
 
+The `redirect_uris` refine short-circuits on `uris.length > REGISTER_MAX_REDIRECT_URIS` so an
+over-cap array reports the count error alone rather than also running `validateRedirectUri` over
+the placeholder entries.
+
 `src/schemas/revoke.ts`:
+
+Do not reach for a bare `z.enum` here. Its `invalid_enum_value` issue carries the received value
+verbatim even when you override the message, so a client that misfills `token_type_hint` with a
+real token gets it echoed back inside the issue object.
 
 ```ts
 import { z } from "zod";
 
+const TOKEN_TYPE_HINTS = ["access_token", "refresh_token"] as const;
+
+function isTokenTypeHint(value: string): value is (typeof TOKEN_TYPE_HINTS)[number] {
+  return (TOKEN_TYPE_HINTS as readonly string[]).includes(value);
+}
+
+// z.enum's own invalid_enum_value issue carries the received value verbatim, even with a custom
+// message — the message is clean but the issue object still leaks it (e.g. via JSON.stringify(
+// error.issues)). token_type_hint sits beside `token` and is the field most likely to receive a
+// real token by client mistake, so validate it with a plain string + superRefine instead: a custom
+// issue never carries `received`. Piping into z.enum recovers the narrowed literal type — the pipe's
+// second stage never runs once the first has gone dirty, so the enum's leaky issue is unreachable.
+const tokenTypeHintSchema = z
+  .string()
+  .superRefine((value, ctx) => {
+    if (!isTokenTypeHint(value)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "token_type_hint must be access_token or refresh_token",
+      });
+    }
+  })
+  .pipe(z.enum(TOKEN_TYPE_HINTS));
+
 export const revokeRequestSchema = z.object({
   token: z.string().min(1, "token is required"),
-  token_type_hint: z.enum(["access_token", "refresh_token"]).optional(),
+  token_type_hint: tokenTypeHintSchema.optional(),
   client_id: z.string().optional(),
 });
 ```
+
+The pipe is what keeps the parsed type narrowed to the two literals rather than widening to
+`string`. Test that narrowing with a `@ts-expect-error`-style assertion, not just a runtime check —
+a widened type is a silent regression the suite would otherwise pass straight over.
 
 `src/schemas/shopifyCallback.ts`:
 
@@ -2718,37 +2827,79 @@ export const shopifyCallbackQuerySchema = z.object({
 
 `src/schemas/cimd.ts`:
 
+This schema owns its own worst case. It parses a document fetched from a client-controlled URL, so
+it must not assume the fetch layer's byte cap (Task 12) ran — that cap could be loosened, bypassed
+by another call site, or this schema reused without it. Cap every array field, same as `register.ts`.
+
 ```ts
 import { z } from "zod";
+import { capOversizedArray } from "./capOversizedArray";
 
-export const cimdDocumentSchema = z
-  .object({
-    client_id: z.string().optional(),
-    client_name: z.string().optional(),
-    redirect_uris: z.array(z.string()).min(1, "CIMD document missing redirect_uris[]"),
-    // The document lists what the client supports; we only require the grant we drive.
-    grant_types: z
-      .array(z.string())
-      .refine((types) => types.includes("authorization_code"), {
-        message: "CIMD grant_types must include 'authorization_code'",
-      })
-      .optional(),
-    response_types: z.array(z.string()).optional(),
-    token_endpoint_auth_method: z
-      .literal("none", { message: "CIMD token_endpoint_auth_method must be 'none'" })
-      .optional(),
-    logo_uri: z.string().optional(),
-    client_uri: z.string().optional(),
-  })
-  .strip();
+// This document is fetched from a URL the client controls — hostile input. Bound its worst case
+// here rather than depending on a fetch layer's byte cap owned by a different task: that cap could
+// be loosened, bypassed by a different call site, or this schema reused without it.
+export const CIMD_MAX_REDIRECT_URIS = 20;
+export const CIMD_MAX_URI_LENGTH = 2048;
+export const CIMD_MAX_GRANT_TYPES = 10;
+export const CIMD_MAX_RESPONSE_TYPES = 10;
+export const CIMD_MAX_CLIENT_NAME_LENGTH = 200;
+
+export const cimdDocumentSchema = z.object({
+  client_id: z.string().max(CIMD_MAX_URI_LENGTH, "client_id is too long").optional(),
+  client_name: z.string().max(CIMD_MAX_CLIENT_NAME_LENGTH, "client_name is too long").optional(),
+  redirect_uris: z.preprocess(
+    (value) => capOversizedArray(value, CIMD_MAX_REDIRECT_URIS),
+    z
+      .array(z.string().max(CIMD_MAX_URI_LENGTH, "redirect_uris entry is too long"))
+      .min(1, "CIMD document missing redirect_uris[]")
+      .max(CIMD_MAX_REDIRECT_URIS, "CIMD document has too many redirect_uris")
+  ),
+  // The document lists what the client supports; we only require the grant we drive.
+  grant_types: z
+    .preprocess(
+      (value) => capOversizedArray(value, CIMD_MAX_GRANT_TYPES),
+      z
+        .array(z.string())
+        .max(CIMD_MAX_GRANT_TYPES, "CIMD document has too many grant_types")
+        .refine((types) => types.length > CIMD_MAX_GRANT_TYPES || types.includes("authorization_code"), {
+          message: "CIMD grant_types must include 'authorization_code'",
+        })
+    )
+    .optional(),
+  response_types: z
+    .preprocess(
+      (value) => capOversizedArray(value, CIMD_MAX_RESPONSE_TYPES),
+      z.array(z.string()).max(CIMD_MAX_RESPONSE_TYPES, "CIMD document has too many response_types")
+    )
+    .optional(),
+  token_endpoint_auth_method: z
+    .literal("none", { message: "CIMD token_endpoint_auth_method must be 'none'" })
+    .optional(),
+  logo_uri: z.string().max(CIMD_MAX_URI_LENGTH, "logo_uri is too long").optional(),
+  client_uri: z.string().max(CIMD_MAX_URI_LENGTH, "client_uri is too long").optional(),
+});
 
 export type CimdDocument = z.infer<typeof cimdDocumentSchema>;
 ```
 
+No `.strip()` call — stripping unknown keys is already `z.object`'s default, so writing it adds a
+line that reads like it changes behaviour when it doesn't.
+
+An over-cap `grant_types` reports the count error only, not the missing-`authorization_code` error
+as well: the placeholder entries would fail the refine too, so the refine short-circuits on length
+first. Lock that single-issue outcome with a test — it is a deliberate choice, not an accident.
+
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `pnpm --filter shopify-mcp-oauth test src/schemas`
-Expected: PASS, 17 tests.
+Expected: PASS, 53 tests.
+
+Cover every cap and both leak-shaped cases, not only the happy paths: each field's over-cap
+rejection, each field's per-entry length limit, the absent-optional-field path (an optional capped
+field must parse to `undefined`), the at-cap boundary (exactly `cap` entries must still be fully
+validated, not shortcut), and — for `revoke.ts` — that the rejected value appears in neither the
+message, the issue object, nor `JSON.stringify(error)`. Assert on the whole serialized error, not
+just `issue.message`; a message-only assertion passes while the issue object leaks.
 
 - [ ] **Step 5: Commit**
 
