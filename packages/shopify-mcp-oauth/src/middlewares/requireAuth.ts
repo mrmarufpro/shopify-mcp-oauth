@@ -53,11 +53,17 @@ export function requireAuth(config: ResolvedConfig): RequestHandler {
     const shop = await config.storage.findShopByDomain(stored.shopDomain);
     if (!shop) return unauthorized(res, "invalid_token");
 
-    // Bound to the token's own shopId, not `shop.id` from the lookup above: if a shop uninstalls
-    // and reinstalls, the fresh row can get a new id while keeping the same domain. A token
-    // minted before the reinstall must not silently gain access to the new installation --
-    // binding to stored.shopId fails closed (a downstream lookup keyed on the stale id finds
-    // nothing), while binding to the freshly-looked-up shop.id would fail open.
+    // A shop that uninstalls and reinstalls can get a fresh row id under the same domain. A
+    // token minted before the reinstall names the *old* row's id in stored.shopId; downstream
+    // code (this middleware's own check above included) keys lookups by shopDomain, so without
+    // this comparison such a token would authenticate fine against the new installation --
+    // stored.shopId is the only thing that still tells the two apart. Stringified: shopId is
+    // typed `string | number`, and the stored and freshly-looked-up values may come from
+    // different adapters/columns that don't agree on which. (An adapter that reuses the same id
+    // across a reinstall -- e.g. an upsert keyed on domain -- will still accept here; that's the
+    // adapter's own choice, not a gap in this check.)
+    if (String(stored.shopId) !== String(shop.id)) return unauthorized(res, "invalid_token");
+
     req.mcp = { shopId: stored.shopId, shopDomain: stored.shopDomain, tokenId: stored.id };
     config.storage.touchToken(stored.id, new Date()).catch(() => {});
     next();

@@ -132,6 +132,14 @@ export function runStorageContractTests(
       expect(await storage.findTokenByAccessHashIgnoringExpiry("never-stored-access-hash")).toBeNull();
     });
 
+    it("does not match findTokenByAccessHashIgnoringExpiry by prefix or superset", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "full-ignoring-expiry-hash-1234567890" }));
+      expect(await storage.findTokenByAccessHashIgnoringExpiry("full-ignoring-expiry-hash-123456789")).toBeNull();
+      expect(
+        await storage.findTokenByAccessHashIgnoringExpiry("full-ignoring-expiry-hash-1234567890-extra")
+      ).toBeNull();
+    });
+
     it("finds a token by its refresh hash", async () => {
       await storage.createToken(
         buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup", clientId: CONTRACT_CLIENT_ID })
@@ -142,6 +150,12 @@ export function runStorageContractTests(
 
     it("returns null for a refresh hash that was never stored", async () => {
       expect(await storage.findTokenByRefreshHash("never-stored-refresh-hash")).toBeNull();
+    });
+
+    it("does not match a refresh hash by prefix or superset", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "full-refresh-hash-1234567890" }));
+      expect(await storage.findTokenByRefreshHash("full-refresh-hash-123456789")).toBeNull();
+      expect(await storage.findTokenByRefreshHash("full-refresh-hash-1234567890-extra")).toBeNull();
     });
 
     it("does not return an expired refresh token", async () => {

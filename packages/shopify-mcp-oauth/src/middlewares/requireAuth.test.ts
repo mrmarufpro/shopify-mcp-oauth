@@ -92,6 +92,26 @@ describe("requireAuth", () => {
     expect(downstream).not.toHaveBeenCalled();
   });
 
+  it("rejects a scheme with no space delimiter after it, and never reaches the protected handler", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const downstream = vi.fn();
+    // "Bearer" without a trailing space isn't the scheme this middleware accepts, even though the
+    // rest of the header text looks like a real token glued onto the end of the word.
+    const response = await request(buildApp(config, downstream))
+      .post("/mcp")
+      .set("Authorization", `Bearer${tokens.access_token}`)
+      .send({});
+    expect(response.status).toBe(401);
+    // Asserting the specific error code, not just the status: without the space, slicing off the
+    // (wrong) prefix length still hands the unknown-token lookup a garbage string that legitimately
+    // misses, which would return 401 with error "invalid_token" for an unrelated reason even if
+    // this check's space requirement were silently dropped. "missing_bearer" pins that this test
+    // fails on its own scheme check.
+    expect(response.body).toEqual({ error: "missing_bearer" });
+    expect(downstream).not.toHaveBeenCalled();
+  });
+
   it("accepts a case-insensitive Bearer scheme", async () => {
     const config = buildConfig();
     const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
@@ -209,12 +229,11 @@ describe("requireAuth", () => {
     expect(downstream).not.toHaveBeenCalled();
   });
 
-  it("binds shopId from the stored token, not a freshly looked-up shop row (fails closed after a reinstall)", async () => {
+  it("rejects a token whose shopId doesn't match the row currently owning that domain (a stale, pre-reinstall token), and never reaches the protected handler", async () => {
     // The seeded shop row's id differs from the id the token itself carries -- simulating a shop
-    // that uninstalled and reinstalled under a new row id after this token was minted. Design
-    // ruling: the response must carry the token's own (stale) shopId, not the fresh row's id --
-    // binding to the fresh row would let a pre-reinstall token silently reach the new
-    // installation.
+    // that uninstalled and reinstalled under a new row id after this token was minted. The token
+    // names a *previous* installation and must not authenticate against the fresh one, even
+    // though the domain (the lookup key one line up) still matches.
     const config = resolveConfig({
       host: HOST,
       shopify: { apiKey: "test-api-key", apiSecret: API_SECRET_CANARY, scopes: "read_products" },
@@ -223,14 +242,14 @@ describe("requireAuth", () => {
     });
     const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
 
-    const response = await request(buildApp(config))
+    const downstream = vi.fn();
+    const response = await request(buildApp(config, downstream))
       .post("/mcp")
       .set("Authorization", `Bearer ${tokens.access_token}`)
       .send({});
 
-    expect(response.status).toBe(200);
-    expect(response.body.shopId).toBe(DEMO_SHOP_ID);
-    expect(response.body.shopId).not.toBe(REINSTALLED_SHOP_ID);
+    expect(response.status).toBe(401);
+    expect(downstream).not.toHaveBeenCalled();
   });
 
   it("points a 401 at the protected-resource metadata document when the header is missing", async () => {
