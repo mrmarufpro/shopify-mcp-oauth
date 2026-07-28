@@ -17,8 +17,8 @@ const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 // Must still satisfy the 43-128 char code_verifier shape (schemas/token.ts), or it fails schema
 // validation before ever reaching the PKCE hash comparison these tests mean to exercise.
 const WRONG_CODE_VERIFIER = "not-the-verifier-that-made-the-challenge-xyz";
-const LOOPBACK_REGISTERED_REDIRECT_URI = "http://127.0.0.1:4000/callback";
-const LOOPBACK_EPHEMERAL_REDIRECT_URI = "http://127.0.0.1:53219/callback";
+const LOOPBACK_BOUND_REDIRECT_URI = "http://127.0.0.1:4000/callback";
+const LOOPBACK_DIFFERENT_PORT_REDIRECT_URI = "http://127.0.0.1:53219/callback";
 
 function buildConfig(): ResolvedConfig {
   return resolveConfig({
@@ -144,24 +144,26 @@ describe("tokenController — authorization_code", () => {
     expect(response.status).toBe(400);
   });
 
-  it("accepts a loopback redirect_uri whose port differs from the one bound to the code", async () => {
-    // RFC 8252 §7.3: a native client's loopback redirect binds an ephemeral port picked when it
-    // starts listening, which can legitimately differ between the /authorize and /token legs.
-    // redirectUriMatches (already covered exhaustively in services/redirectUri.test.ts) is what
-    // grants that flexibility; this test just pins that the controller actually calls it instead
-    // of a strict string comparison.
+  it("rejects a loopback redirect_uri whose port differs from the one bound to the code", async () => {
+    // The loopback port flexibility of RFC 8252 §7.3 belongs to /authorize, where the presented
+    // redirect_uri is matched against the client's *registered* URIs (see redirectUriMatches and
+    // its exhaustive coverage in services/redirectUri.test.ts). What's stored on the code is the
+    // exact string the client already presented and had accepted at that step, and RFC 6749
+    // §4.1.3 requires this leg's redirect_uri be identical to that one — so even a same-host,
+    // loopback, different-port value must be rejected here, not waved through.
     const config = buildConfig();
     const response = await request(buildApp(config))
       .post("/token")
       .send({
         grant_type: "authorization_code",
-        code: await issueTestCode(config, { redirectUri: LOOPBACK_REGISTERED_REDIRECT_URI }),
-        redirect_uri: LOOPBACK_EPHEMERAL_REDIRECT_URI,
+        code: await issueTestCode(config, { redirectUri: LOOPBACK_BOUND_REDIRECT_URI }),
+        redirect_uri: LOOPBACK_DIFFERENT_PORT_REDIRECT_URI,
         client_id: CLIENT_ID,
         code_verifier: CODE_VERIFIER,
       });
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_grant");
   });
 
   it("refuses to redeem the same code twice", async () => {

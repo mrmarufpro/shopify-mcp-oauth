@@ -4,7 +4,6 @@ import { tokenRequestSchema, type AuthorizationCodeGrant, type RefreshTokenGrant
 import { serializeTokenBundle } from "../serializers/token";
 import { consumeCode } from "../services/codes";
 import { verifyS256 } from "../services/pkce";
-import { redirectUriMatches } from "../services/redirectUri";
 import { issueTokens, rotateRefresh } from "../services/tokens";
 import { asyncHandler } from "./asyncHandler";
 
@@ -21,7 +20,13 @@ async function handleAuthorizationCode(
   const record = await consumeCode(config, grant.code);
   if (!record) return bad(res, "invalid_grant", "code unknown, expired, or already used");
   if (record.clientId !== grant.client_id) return bad(res, "invalid_grant", "client_id mismatch");
-  if (!redirectUriMatches(record.redirectUri, grant.redirect_uri)) {
+  // Deliberately strict, not redirectUriMatches: the record holds the exact string the client
+  // presented at /authorize (after that endpoint already matched it against the client's
+  // registered URIs, where loopback port flexibility per RFC 8252 §7.3 belongs). RFC 6749
+  // §4.1.3 requires this leg's redirect_uri be identical to the one in the authorization
+  // request, so re-applying the loopback allowance here would let a code bound to one local
+  // listener be redeemed by a different one on the same host.
+  if (record.redirectUri !== grant.redirect_uri) {
     return bad(res, "invalid_grant", "redirect_uri mismatch");
   }
   // The record's method isn't a literal type at rest, so a stored "plain" (or anything but
