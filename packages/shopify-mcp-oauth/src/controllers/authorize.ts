@@ -1,6 +1,7 @@
 import type { RequestHandler, Response } from "express";
 import type { ResolvedConfig } from "../config";
 import { randomBase64Url } from "../crypto";
+import { OAuthError } from "../errors";
 import { authorizeQuerySchema } from "../schemas/authorize";
 import { isCimdClientId, resolveCimdClient } from "../services/cimd";
 import { redirectUriMatches } from "../services/redirectUri";
@@ -41,7 +42,12 @@ export function authorizeController(config: ResolvedConfig, options: AuthorizeCo
         });
         registeredRedirectUris = doc.redirect_uris;
       } catch (error) {
-        return bad(res, (error as Error).message, "invalid_client");
+        // Only an OAuthError is a judgment about the client's own client_id/document — safe to
+        // name on this unauthenticated endpoint. Anything else (e.g. the storage lookup inside
+        // resolveCimdClient failing) is an infrastructure error and must fall through to
+        // asyncHandler's generic 500 instead of reflecting internal detail into a 400 body.
+        if (!(error instanceof OAuthError)) throw error;
+        return bad(res, error.description, error.code);
       }
     } else {
       const client = await config.storage.findClient(query.client_id);

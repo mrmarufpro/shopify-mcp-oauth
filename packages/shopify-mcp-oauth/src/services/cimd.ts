@@ -1,6 +1,7 @@
 import dns from "node:dns/promises";
 import net from "node:net";
 import type { ResolvedConfig } from "../config";
+import { OAuthError } from "../errors";
 import { cimdDocumentSchema, type CimdDocument } from "../schemas/cimd";
 import { clientToCimdDocument, upsertCimdClient } from "./clients";
 
@@ -170,14 +171,17 @@ async function assertPublicHost(url: URL): Promise<void> {
   const literal = stripIpv6Brackets(host);
   if (net.isIP(literal)) {
     if (isPrivateOrLoopbackIp(literal)) {
-      throw new Error(`CIMD URL host ${literal} resolves to a private/loopback address`);
+      throw new OAuthError("invalid_client", `CIMD URL host ${literal} resolves to a private/loopback address`);
     }
     return;
   }
   const addresses = await dns.lookup(host, { all: true });
   for (const address of addresses) {
     if (isPrivateOrLoopbackIp(address.address)) {
-      throw new Error(`CIMD URL host ${host} resolves to a private/loopback address (${address.address})`);
+      throw new OAuthError(
+        "invalid_client",
+        `CIMD URL host ${host} resolves to a private/loopback address (${address.address})`
+      );
     }
   }
 }
@@ -190,7 +194,7 @@ async function assertPublicHost(url: URL): Promise<void> {
 async function readBodyCapped(response: Response): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) {
-    throw new Error("CIMD fetch response has no readable body");
+    throw new OAuthError("invalid_client", "CIMD fetch response has no readable body");
   }
   const decoder = new TextDecoder();
   let text = "";
@@ -201,7 +205,7 @@ async function readBodyCapped(response: Response): Promise<string> {
     total += value.byteLength;
     if (total > MAX_BYTES) {
       await reader.cancel();
-      throw new Error(`CIMD document exceeds ${MAX_BYTES} bytes`);
+      throw new OAuthError("invalid_client", `CIMD document exceeds ${MAX_BYTES} bytes`);
     }
     text += decoder.decode(value, { stream: true });
   }
@@ -210,7 +214,7 @@ async function readBodyCapped(response: Response): Promise<string> {
 
 async function fetchCimd(config: ResolvedConfig, urlStr: string, allowPrivateHosts: boolean): Promise<CimdDocument> {
   const url = new URL(urlStr);
-  if (url.protocol !== "https:") throw new Error("CIMD client_id must use HTTPS");
+  if (url.protocol !== "https:") throw new OAuthError("invalid_client", "CIMD client_id must use HTTPS");
   if (!allowPrivateHosts) await assertPublicHost(url);
 
   const controller = new AbortController();
@@ -226,7 +230,7 @@ async function fetchCimd(config: ResolvedConfig, urlStr: string, allowPrivateHos
       signal: controller.signal,
       redirect: "error",
     });
-    if (!response.ok) throw new Error(`CIMD fetch returned ${response.status}`);
+    if (!response.ok) throw new OAuthError("invalid_client", `CIMD fetch returned ${response.status}`);
     // The byte cap is enforced here, before JSON.parse ever runs — an oversized body never
     // reaches the parser, let alone the schema, regardless of whether it would have been valid
     // JSON.
@@ -238,17 +242,17 @@ async function fetchCimd(config: ResolvedConfig, urlStr: string, allowPrivateHos
   try {
     raw = JSON.parse(text);
   } catch {
-    throw new Error("CIMD document is not valid JSON");
+    throw new OAuthError("invalid_client", "CIMD document is not valid JSON");
   }
   const parsed = cimdDocumentSchema.safeParse(raw);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
-    if (!issue) throw new Error("CIMD document is invalid");
+    if (!issue) throw new OAuthError("invalid_client", "CIMD document is invalid");
     // zod's own message for a missing required field is the generic "Required", with no mention
     // of which field — prefix the field path so callers (and this file's own tests) can tell
     // which part of the document failed without inspecting the ZodError directly.
     const message = issue.path.length > 0 ? `${issue.path.join(".")}: ${issue.message}` : issue.message;
-    throw new Error(message);
+    throw new OAuthError("invalid_client", message);
   }
   return parsed.data;
 }
@@ -258,7 +262,7 @@ export async function resolveCimdClient(
   url: string,
   opts: { allowPrivateHosts?: boolean } = {}
 ): Promise<CimdDocument> {
-  if (!isCimdClientId(url)) throw new Error("CIMD client_id must use HTTPS");
+  if (!isCimdClientId(url)) throw new OAuthError("invalid_client", "CIMD client_id must use HTTPS");
 
   const cacheKey = `${CACHE_PREFIX}${url}`;
   try {
@@ -268,6 +272,11 @@ export async function resolveCimdClient(
     // A cache outage must not break login; fall through to storage and the network.
   }
 
+  // Left unguarded deliberately: a storage failure here is an infrastructure error, not a
+  // statement about the client's own CIMD document, and must propagate as an ordinary Error so
+  // it reaches the caller's generic-failure path instead of being classified as OAuthError
+  // ("this client_id is invalid") — see the throws above and below, which are all judgments about
+  // the client's own URL/document and are safe to name to an unauthenticated caller.
   const stored = await config.storage.findClient(url);
   if (stored) {
     const doc = clientToCimdDocument(stored);

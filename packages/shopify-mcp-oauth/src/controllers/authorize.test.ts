@@ -23,7 +23,7 @@ const CODE_CHALLENGE = "test-code-challenge-value-12345678901234567";
 // and the default console logger would print a stack trace on every full-suite run otherwise.
 const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 
-function buildConfig(overrides: { logger?: Logger } = {}): ResolvedConfig {
+function buildConfig(overrides: { logger?: Logger; fetchImpl?: typeof fetch } = {}): ResolvedConfig {
   const cimdResponse = new Response(JSON.stringify({ client_name: "Test Client", redirect_uris: [REDIRECT_URI] }), {
     status: 200,
     headers: { "content-type": "application/json" },
@@ -168,5 +168,42 @@ describe("authorizeController", () => {
     expect(raw).not.toContain("db.internal.example");
     expect(raw).not.toContain(API_SECRET_CANARY);
     expect(raw).not.toContain(STATE_SECRET);
+  });
+
+  it("returns a generic 500 without leaking internal detail when CIMD resolution's storage lookup fails", async () => {
+    // resolveCimdClient checks storage before the network (see services/cimd.ts), so a CIMD
+    // client_id still reaches config.storage.findClient. That lookup is deliberately unguarded
+    // inside resolveCimdClient — a storage outage is an infrastructure failure, not a statement
+    // about the client's own document, and must reach asyncHandler's generic 500 rather than
+    // being reflected into a 400 body as (error as Error).message would have done.
+    const config = buildConfig({ logger: silentLogger });
+    vi.spyOn(config.storage, "findClient").mockRejectedValue(
+      new Error("storage unavailable: connection to db.internal.example refused")
+    );
+    const response = await request(buildApp(config)).get("/authorize").query(validQuery);
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    const raw = JSON.stringify(response.body);
+    expect(raw).not.toContain("db.internal.example");
+    expect(raw).not.toContain(API_SECRET_CANARY);
+    expect(raw).not.toContain(STATE_SECRET);
+  });
+
+  it("rejects a client whose CIMD document is genuinely invalid, naming the reason", async () => {
+    const invalidDocumentResponse = new Response(JSON.stringify({ client_name: "Invalid Client", redirect_uris: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const config = buildConfig({
+      fetchImpl: vi.fn().mockResolvedValue(invalidDocumentResponse) as unknown as typeof fetch,
+    });
+    const response = await request(buildApp(config)).get("/authorize").query(validQuery);
+    // Exact match, not a substring/regex check: bad(res, error.description, error.code) must not
+    // double up the OAuthError's own "invalid_client: " message prefix on top of error.code.
+    expect(response.body).toEqual({
+      error: "invalid_client",
+      error_description: "redirect_uris: CIMD document missing redirect_uris[]",
+    });
+    expect(response.status).toBe(400);
   });
 });
