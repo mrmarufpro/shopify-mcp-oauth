@@ -8,9 +8,10 @@ const CIMD_URL = "https://client.example/metadata.json";
 const REDIRECT_URI = "https://client.example/callback";
 const CIMD_DOC = { client_name: "Fetched Client", redirect_uris: [REDIRECT_URI] };
 
-// The package's byte cap on a fetched CIMD document (see cimd.ts). Duplicated here, not
-// imported, because the cap isn't part of this task's public export surface.
+// The package's byte cap and fetch timeout on a fetched CIMD document (see cimd.ts). Duplicated
+// here, not imported, because neither is part of this task's public export surface.
 const CIMD_BYTE_CAP = 64 * 1024;
+const CIMD_FETCH_TIMEOUT_MS = 3000;
 
 // Silent by default so the no-cache warning does not spray stderr across every case, matching
 // the convention in config.test.ts.
@@ -79,6 +80,35 @@ function buildLazyChunkedFetch(
   return { fetchImpl, pullCount: () => nextChunkIndex };
 }
 
+// A real fetch ties the AbortSignal it's called with to the response body's stream, so aborting
+// mid-download rejects a pending reader.read() -- that's how the fetch timeout is meant to reach a
+// body that drips bytes without ever finishing. A mocked Response built independently of the
+// signal doesn't get that behavior for free, so this fake wires it up by hand: its body stream
+// never produces another chunk on its own, but rejects the pending pull() the moment the signal
+// passed to fetchImpl aborts, mirroring what undici does for a real network response.
+function buildStalledBodyFetch(): typeof fetch {
+  return vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        return new Promise<void>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+            return;
+          }
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+          // Otherwise never settles -- simulates a server that stops sending bytes mid-response.
+          void controller;
+        });
+      },
+    });
+    const response = new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
+    return Promise.resolve(response);
+  }) as unknown as typeof fetch;
+}
+
 // Simulates a fetchImpl whose Response exposes no readable body stream at all (body: null) —
 // something a nonstandard or misbehaving fetch polyfill could return. There is deliberately no
 // .text() on this fake: if the implementation ever fell back to an unbounded, uncapped read
@@ -138,9 +168,16 @@ describe("resolveCimdClient", () => {
     expect(doc.redirect_uris).toEqual([REDIRECT_URI]);
   });
 
-  it("serves the second call from cache without refetching", async () => {
+  it("serves the second call from the cache without refetching, even when storage would also miss", async () => {
+    // resolveCimdClient checks storage before the network too, so a naive version of this test
+    // (default storage, which now holds a row after the first call) would pass even if the cache
+    // were completely broken -- storage alone would prevent the second fetch. Forcing
+    // storage.findClient to always miss isolates the property this test's name actually claims:
+    // the cache, specifically, is what serves the second call.
     const fetchImpl = buildFetch(CIMD_DOC);
-    const config = buildConfig(fetchImpl);
+    const storage = memoryStorage();
+    storage.findClient = async () => null;
+    const config = buildConfig(fetchImpl, { storage });
     await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
     await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -167,6 +204,58 @@ describe("resolveCimdClient", () => {
     await expect(resolveCimdClient(config, "https://[::1]/doc.json")).rejects.toThrow(/private/);
   });
 
+  it("rejects a hostname that resolves to a loopback address via DNS (localhost)", async () => {
+    // Every other private-host test above uses a literal IP, which short-circuits before
+    // dns.lookup() is ever called -- this is the guard's only coverage of the DNS-resolution
+    // branch of assertPublicHost. Uses the real dns.lookup (no mocking): "localhost" resolves
+    // locally without any network access, so this is not flaky.
+    const config = buildConfig(buildFetch(CIMD_DOC));
+    await expect(resolveCimdClient(config, "https://localhost/doc.json")).rejects.toThrow(/private/);
+  });
+
+  describe("SSRF guard: private, loopback, and reserved address families", () => {
+    // Each row is an address family the guard must reject that a naive implementation (matching
+    // on textual prefixes like "10." or "fe80:") is prone to missing -- particularly the last two,
+    // which are the same private/link-local addresses smuggled through IPv6's IPv4-mapped notation
+    // (the exact form WHATWG URL produces when a caller writes "[::ffff:127.0.0.1]").
+    const RESERVED_ADDRESS_URLS: Array<[string, string]> = [
+      ["0.0.0.0/8 (this network)", "https://0.0.0.0/doc.json"],
+      ["IPv6 unspecified address (::)", "https://[::]/doc.json"],
+      ["100.64.0.0/10 (carrier-grade NAT)", "https://100.64.0.1/doc.json"],
+      ["fe80::/10 upper edge (link-local)", "https://[febf::1]/doc.json"],
+      ["fec0::/10 (deprecated site-local)", "https://[fec0::1]/doc.json"],
+      ["255.255.255.255 (broadcast, inside 240.0.0.0/4)", "https://255.255.255.255/doc.json"],
+      ["224.0.0.0/4 (multicast)", "https://224.0.0.1/doc.json"],
+      ["240.0.0.0/4 (reserved)", "https://240.0.0.1/doc.json"],
+      ["192.0.0.0/24 (IETF protocol assignments)", "https://192.0.0.1/doc.json"],
+      ["198.18.0.0/15 (benchmarking)", "https://198.18.0.1/doc.json"],
+      ["IPv4-mapped IPv6 loopback (::ffff:127.0.0.1)", "https://[::ffff:127.0.0.1]/doc.json"],
+      ["IPv4-mapped IPv6 cloud-metadata address (::ffff:169.254.169.254)", "https://[::ffff:169.254.169.254]/doc.json"],
+    ];
+
+    it.each(RESERVED_ADDRESS_URLS)("rejects %s", async (_description, url) => {
+      const config = buildConfig(buildFetch(CIMD_DOC));
+      await expect(resolveCimdClient(config, url)).rejects.toThrow(/private/);
+    });
+
+    // A blanket rule wide enough to catch every reserved family can just as easily be wide
+    // enough to swallow legitimate public hosts too -- these are the regression guard for that.
+    // (This is not a hypothetical: an earlier draft added a single net.BlockList subnet meant to
+    // catch IPv4-mapped IPv6 literals and it silently rejected every public IPv4 host, this test
+    // included, because of how net.BlockList normalizes an "ipv4" check against that subnet.)
+    const PUBLIC_ADDRESS_URLS: Array<[string, string]> = [
+      ["a public IPv4 host", "https://8.8.8.8/doc.json"],
+      ["a public IPv6 host", "https://[2001:db8::1]/doc.json"],
+      ["a public host in IPv4-mapped IPv6 notation", "https://[::ffff:8.8.8.8]/doc.json"],
+    ];
+
+    it.each(PUBLIC_ADDRESS_URLS)("does not reject %s", async (_description, url) => {
+      const config = buildConfig(buildFetch(CIMD_DOC));
+      const doc = await resolveCimdClient(config, url);
+      expect(doc.redirect_uris).toEqual([REDIRECT_URI]);
+    });
+  });
+
   it("rejects a non-200 response", async () => {
     const config = buildConfig(buildFetch("nope", { status: 404 }));
     await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
@@ -179,6 +268,16 @@ describe("resolveCimdClient", () => {
 
   it("rejects a document with no redirect_uris", async () => {
     const config = buildConfig(buildFetch({ client_name: "No Redirects" }));
+    await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/redirect_uris/);
+  });
+
+  it("rejects a document whose redirect_uris contains a cleartext http URI on a non-loopback host", async () => {
+    // End-to-end proof that cimdDocumentSchema's validateRedirectUri refine actually reaches this
+    // call site: a byte-identical DCR registration would be rejected by registerRequestSchema for
+    // the same URI, so a CIMD document must not be able to smuggle it through unvalidated.
+    const config = buildConfig(
+      buildFetch({ client_name: "Bad Redirect", redirect_uris: ["http://attacker.example/cb"] })
+    );
     await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/redirect_uris/);
   });
 
@@ -259,6 +358,25 @@ describe("resolveCimdClient", () => {
       const config = buildConfig(fetchImpl);
       await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/readable body/);
       expect(onText).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("fetch timeout", () => {
+    it("rejects a body that stalls mid-stream within the timeout, instead of hanging until the byte cap is reached", async () => {
+      // Headers arrive immediately (the mocked Response resolves right away); the body then never
+      // produces another byte on its own, staying well under the 64KB cap forever. Only the
+      // timeout can end this -- proves the AbortController fires during the body read, not just
+      // during the initial fetchImpl call.
+      vi.useFakeTimers();
+      try {
+        const config = buildConfig(buildStalledBodyFetch());
+        const resolution = resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+        const assertion = expect(resolution).rejects.toThrow(/abort/i);
+        await vi.advanceTimersByTimeAsync(CIMD_FETCH_TIMEOUT_MS + 1);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

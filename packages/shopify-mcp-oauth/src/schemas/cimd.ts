@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { validateRedirectUri } from "../services/redirectUri";
 import { capOversizedArray } from "./capOversizedArray";
 
 // This document is fetched from a URL the client controls — hostile input. Bound its worst case
@@ -13,12 +14,20 @@ export const CIMD_MAX_CLIENT_NAME_LENGTH = 200;
 export const cimdDocumentSchema = z.object({
   client_id: z.string().max(CIMD_MAX_URI_LENGTH, "client_id is too long").optional(),
   client_name: z.string().max(CIMD_MAX_CLIENT_NAME_LENGTH, "client_name is too long").optional(),
+  // A CIMD document is fetched from a URL the client controls, exactly like a DCR request body —
+  // it gets the same validateRedirectUri check register.ts applies, so a document can't declare a
+  // redirect_uris entry (javascript:, cleartext http on a non-loopback host, embedded userinfo,
+  // ...) that a DCR registration would be rejected for.
   redirect_uris: z.preprocess(
     (value) => capOversizedArray(value, CIMD_MAX_REDIRECT_URIS),
     z
       .array(z.string().max(CIMD_MAX_URI_LENGTH, "redirect_uris entry is too long"))
       .min(1, "CIMD document missing redirect_uris[]")
       .max(CIMD_MAX_REDIRECT_URIS, "CIMD document has too many redirect_uris")
+      .refine(
+        (uris) => uris.length > CIMD_MAX_REDIRECT_URIS || uris.every((uri) => validateRedirectUri(uri) === null),
+        { message: "redirect_uris contains an unacceptable URI" }
+      )
   ),
   // The document lists what the client supports; we only require the grant we drive.
   grant_types: z

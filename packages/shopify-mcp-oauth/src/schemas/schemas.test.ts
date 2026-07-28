@@ -296,6 +296,19 @@ describe("cimdDocumentSchema", () => {
     expect(cimdDocumentSchema.safeParse({ client_name: "Client" }).success).toBe(false);
   });
 
+  it("rejects a javascript: redirect_uri", () => {
+    expect(cimdDocumentSchema.safeParse({ redirect_uris: ["javascript:alert(1)"] }).success).toBe(false);
+  });
+
+  it("rejects a cleartext http redirect_uri on a non-loopback host", () => {
+    // The concrete exploit this closes: a CIMD document declaring an http:// redirect_uri would
+    // otherwise be accepted here even though the byte-identical DCR registration is rejected by
+    // registerRequestSchema's own validateRedirectUri refine, letting the authorization code be
+    // delivered over cleartext HTTP.
+    const result = cimdDocumentSchema.safeParse({ redirect_uris: ["http://attacker.example/cb"] });
+    expect(result.success).toBe(false);
+  });
+
   it("rejects grant_types that omit authorization_code", () => {
     const result = cimdDocumentSchema.safeParse({
       redirect_uris: [REDIRECT_URI],
