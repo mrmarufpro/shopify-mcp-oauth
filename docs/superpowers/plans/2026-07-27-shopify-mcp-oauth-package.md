@@ -2164,12 +2164,17 @@ fails during a merchant's login is far worse than one that refuses to start.
 `src/config.test.ts`:
 
 ```ts
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { memoryCache } from "./adapters/memoryCache";
 import { memoryStorage } from "./adapters/memoryStorage";
 import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
 
 const HOST = "https://mcp.example.com";
 const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
+
+// Silent by default so the no-cache warning does not spray stderr across every case that isn't
+// about it. The two tests that assert the warning pass their own spy logger.
+const silentLogger = { info: () => {}, warn: () => {}, error: () => {} };
 
 function buildConfig(overrides: Partial<ShopifyMcpOAuthConfig> = {}): ShopifyMcpOAuthConfig {
   return {
@@ -2177,6 +2182,7 @@ function buildConfig(overrides: Partial<ShopifyMcpOAuthConfig> = {}): ShopifyMcp
     shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
     stateSecret: STATE_SECRET,
     storage: memoryStorage(),
+    logger: silentLogger,
     ...overrides,
   };
 }
@@ -2226,6 +2232,41 @@ describe("resolveConfig", () => {
   it("defaults the openai challenge token to null", () => {
     expect(resolveConfig(buildConfig()).openaiAppsChallengeToken).toBeNull();
   });
+
+  it("rejects a host carrying a query string", () => {
+    expect(() => resolveConfig(buildConfig({ host: `${HOST}?x=1` }))).toThrow(/query string/);
+  });
+
+  it("rejects a host carrying a fragment", () => {
+    expect(() => resolveConfig(buildConfig({ host: `${HOST}#frag` }))).toThrow(/fragment/);
+  });
+
+  it("rejects a URL with no host", () => {
+    expect(() => resolveConfig(buildConfig({ host: "https:///" }))).toThrow(/host/);
+  });
+
+  it("keeps a base path, which an app mounted under one needs", () => {
+    expect(resolveConfig(buildConfig({ host: `${HOST}/base` })).resource).toBe(`${HOST}/base/mcp`);
+  });
+
+  it("reports every invalid field, not just the first", () => {
+    const config = buildConfig({ host: "not-a-url", stateSecret: "too-short" });
+    expect(() => resolveConfig(config)).toThrow(/host/);
+    expect(() => resolveConfig(config)).toThrow(/stateSecret/);
+  });
+
+  it("warns when no cache is supplied", () => {
+    const warn = vi.fn();
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() } }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("single-process"));
+  });
+
+  it("does not warn when a cache is supplied", () => {
+    const warn = vi.fn();
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, cache: memoryCache() }));
+    expect(warn).not.toHaveBeenCalled();
+  });
 });
 ```
 
@@ -2272,11 +2313,41 @@ export interface ResolvedConfig {
   fetchImpl: typeof fetch;
 }
 
+const CACHE_FALLBACK_WARNING =
+  "shopify-mcp-oauth: no cache supplied, falling back to an in-memory one. It is single-process, " +
+  "so on a multi-instance deploy an authorization code written by one instance is invisible to the " +
+  "others and login fails intermittently. Supply a shared cache such as redisCache in production.";
+
+// A prefix check like /^https?:\/\// is not enough: it accepts "https:///" (no host at all) and
+// hosts carrying a query string or fragment, each of which yields a malformed `resource`. Since
+// `resource` is compared against token audience values, those configs boot fine and fail at login.
+function validateHost(value: string, ctx: z.RefinementCtx): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must be an absolute http(s) URL" });
+    return;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must use the http or https protocol" });
+    return;
+  }
+  if (!url.hostname) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must include a hostname" });
+    return;
+  }
+  if (url.search) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a query string" });
+    return;
+  }
+  if (url.hash) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "host must not include a fragment" });
+  }
+}
+
 const configSchema = z.object({
-  host: z
-    .string()
-    .min(1, "host is required")
-    .refine((value) => /^https?:\/\//.test(value), "host must be an absolute http(s) URL"),
+  host: z.string().min(1, "host is required").superRefine(validateHost),
   shopify: z.object({
     apiKey: z.string().min(1, "shopify.apiKey is required"),
     apiSecret: z.string().min(1, "shopify.apiSecret is required"),
@@ -2293,13 +2364,21 @@ const configSchema = z.object({
 export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
   const parsed = configSchema.safeParse(input);
   if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    const path = issue?.path.join(".") ?? "config";
-    throw new Error(`shopify-mcp-oauth config invalid at "${path}": ${issue?.message ?? "unknown error"}`);
+    // Every failing field at once — reporting only issues[0] makes an adopter with three bad
+    // fields fix them across three boots. Field paths only; never echo a value.
+    const details = parsed.error.issues
+      .map((issue) => `"${issue.path.join(".") || "config"}": ${issue.message}`)
+      .join("; ");
+    throw new Error(`shopify-mcp-oauth config invalid at ${details}`);
   }
   if (!input.storage) throw new Error('shopify-mcp-oauth config invalid at "storage": storage is required');
 
+  // Strip before deriving `resource`, or a host given with a trailing slash yields a double slash
+  // in the identifier that later tasks compare against token audience values.
   const host = parsed.data.host.replace(/\/+$/, "");
+  const logger = input.logger ?? console;
+
+  if (!input.cache) logger.warn(CACHE_FALLBACK_WARNING);
 
   return {
     host,
@@ -2314,7 +2393,7 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
     },
     openaiAppsChallengeToken: parsed.data.openaiAppsChallengeToken ?? null,
     registerRateLimit: parsed.data.registerRateLimit ?? DEFAULT_REGISTER_RATE_LIMIT,
-    logger: input.logger ?? console,
+    logger,
     fetchImpl: input.fetchImpl ?? fetch,
   };
 }
