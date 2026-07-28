@@ -36,12 +36,13 @@ interface PrivateAddressRange {
 // which is exactly what they exist to guard against.
 //
 // The deprecated IPv4-compatible notation ("::a.b.c.d", distinct from IPv4-mapped) is deliberately
-// not covered: net.BlockList has no way to extract just the embedded address from an "::/96" rule,
-// so a blanket entry there blocks every address in that notation indiscriminately -- including
-// public ones (verified: check("::808:808" [8.8.8.8's compatible form], "ipv6") is also true).
-// That notation has been obsolete since RFC 4291 (2006), is never produced by dns.lookup or by
-// WHATWG URL's own IPv6 serialization, and offers an attacker nothing that IPv4-mapped notation
-// doesn't already give them -- not worth the false-positive cost of a blanket rule.
+// not covered. A single blanket "::/96" rule can't discriminate an embedded public address from an
+// embedded private one (verified: check("::808:808" [8.8.8.8's compatible form], "ipv6") is also
+// true) -- the private ranges could instead be enumerated individually as explicit ipv6 rules in
+// this notation, the same way the ipv4 ranges are, but that notation has been obsolete since RFC
+// 4291 (2006), is never produced by dns.lookup or by WHATWG URL's own IPv6 serialization, and
+// offers an attacker nothing that IPv4-mapped notation doesn't already give them -- not worth the
+// extra entries for a notation nothing in this guard's real inputs ever produces.
 const PRIVATE_ADDRESS_RANGES: PrivateAddressRange[] = [
   { type: "ipv4", subnet: "0.0.0.0", prefix: 8 }, // "this network"
   { type: "ipv4", subnet: "10.0.0.0", prefix: 8 }, // RFC 1918 private
@@ -59,6 +60,7 @@ const PRIVATE_ADDRESS_RANGES: PrivateAddressRange[] = [
   { type: "ipv6", subnet: "fe80::", prefix: 10 }, // link-local
   { type: "ipv6", subnet: "fec0::", prefix: 10 }, // deprecated site-local
   { type: "ipv6", subnet: "fc00::", prefix: 7 }, // unique local (covers both fc00::/8 and fd00::/8)
+  { type: "ipv6", subnet: "ff00::", prefix: 8 }, // multicast, for symmetry with 224.0.0.0/4 above
 ];
 
 function buildPrivateAddressBlockList(): net.BlockList {

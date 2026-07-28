@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
 import type { CacheStore } from "../types";
@@ -32,12 +32,18 @@ function buildConfig(
   });
 }
 
+// Builds a fresh Response per call rather than resolving the same instance every time -- a
+// Response's body stream can only be read once, so a shared instance would break the moment any
+// test drove two real fetches through the same fetchImpl (a confusing "body already used" error
+// instead of a clear assertion failure).
 function buildFetch(body: unknown, init: { status?: number } = {}): typeof fetch {
-  return vi.fn().mockResolvedValue(
-    new Response(typeof body === "string" ? body : JSON.stringify(body), {
-      status: init.status ?? 200,
-      headers: { "content-type": "application/json" },
-    })
+  const text = typeof body === "string" ? body : JSON.stringify(body);
+  return vi.fn().mockImplementation(
+    async () =>
+      new Response(text, {
+        status: init.status ?? 200,
+        headers: { "content-type": "application/json" },
+      })
   ) as unknown as typeof fetch;
 }
 
@@ -85,20 +91,25 @@ function buildLazyChunkedFetch(
 // body that drips bytes without ever finishing. A mocked Response built independently of the
 // signal doesn't get that behavior for free, so this fake wires it up by hand: its body stream
 // never produces another chunk on its own, but rejects the pending pull() the moment the signal
-// passed to fetchImpl aborts, mirroring what undici does for a real network response.
-function buildStalledBodyFetch(): typeof fetch {
-  return vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+// passed to fetchImpl aborts, mirroring what undici does for a real network response. Also reports
+// whether it ever saw the abort, so a test can fail fast with a clear reason (instead of hanging
+// for the full suite timeout) if a regression means the abort never reaches the body read.
+function buildStalledBodyFetch(): { fetchImpl: typeof fetch; sawAbort: () => boolean } {
+  let abortObserved = false;
+  const fetchImpl = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
     const stream = new ReadableStream<Uint8Array>({
       pull(controller) {
         return new Promise<void>((_resolve, reject) => {
           const signal = init?.signal;
-          if (signal?.aborted) {
+          const onAbort = () => {
+            abortObserved = true;
             reject(new DOMException("The operation was aborted.", "AbortError"));
+          };
+          if (signal?.aborted) {
+            onAbort();
             return;
           }
-          signal?.addEventListener("abort", () => {
-            reject(new DOMException("The operation was aborted.", "AbortError"));
-          });
+          signal?.addEventListener("abort", onAbort);
           // Otherwise never settles -- simulates a server that stops sending bytes mid-response.
           void controller;
         });
@@ -107,6 +118,7 @@ function buildStalledBodyFetch(): typeof fetch {
     const response = new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
     return Promise.resolve(response);
   }) as unknown as typeof fetch;
+  return { fetchImpl, sawAbort: () => abortObserved };
 }
 
 // Simulates a fetchImpl whose Response exposes no readable body stream at all (body: null) —
@@ -226,6 +238,7 @@ describe("resolveCimdClient", () => {
       ["fec0::/10 (deprecated site-local)", "https://[fec0::1]/doc.json"],
       ["255.255.255.255 (broadcast, inside 240.0.0.0/4)", "https://255.255.255.255/doc.json"],
       ["224.0.0.0/4 (multicast)", "https://224.0.0.1/doc.json"],
+      ["ff00::/8 (IPv6 multicast)", "https://[ff02::1]/doc.json"],
       ["240.0.0.0/4 (reserved)", "https://240.0.0.1/doc.json"],
       ["192.0.0.0/24 (IETF protocol assignments)", "https://192.0.0.1/doc.json"],
       ["198.18.0.0/15 (benchmarking)", "https://198.18.0.1/doc.json"],
@@ -362,21 +375,32 @@ describe("resolveCimdClient", () => {
   });
 
   describe("fetch timeout", () => {
+    // afterEach (not an in-test try/finally) restores real timers even if the test below times
+    // out instead of failing a normal assertion -- vitest abandons the test body on timeout, so a
+    // finally block inside it would never run, leaking fake timers into later tests.
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     it("rejects a body that stalls mid-stream within the timeout, instead of hanging until the byte cap is reached", async () => {
       // Headers arrive immediately (the mocked Response resolves right away); the body then never
       // produces another byte on its own, staying well under the 64KB cap forever. Only the
       // timeout can end this -- proves the AbortController fires during the body read, not just
       // during the initial fetchImpl call.
       vi.useFakeTimers();
-      try {
-        const config = buildConfig(buildStalledBodyFetch());
-        const resolution = resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
-        const assertion = expect(resolution).rejects.toThrow(/abort/i);
-        await vi.advanceTimersByTimeAsync(CIMD_FETCH_TIMEOUT_MS + 1);
-        await assertion;
-      } finally {
-        vi.useRealTimers();
-      }
+      const { fetchImpl, sawAbort } = buildStalledBodyFetch();
+      const config = buildConfig(fetchImpl);
+      const resolution = resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+      // Attach the rejection handler before advancing timers, not after -- resolution can reject
+      // as soon as the timer fires, and attaching .rejects afterward leaves a window where it
+      // rejects with nothing listening yet (an unhandled-rejection warning, even though the test
+      // still passes overall).
+      const assertion = expect(resolution).rejects.toThrow(/abort/i);
+      await vi.advanceTimersByTimeAsync(CIMD_FETCH_TIMEOUT_MS + 1);
+      // Fails fast with a clear reason if the abort never reached the body read -- without this,
+      // a regression here previously hung for the full suite timeout with no diagnostic.
+      expect(sawAbort()).toBe(true);
+      await assertion;
     });
   });
 
