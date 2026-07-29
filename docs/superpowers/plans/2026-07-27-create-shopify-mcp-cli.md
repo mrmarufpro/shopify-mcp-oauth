@@ -2221,16 +2221,22 @@ Expected: all green. This is exactly what CI runs.
 - [ ] **Step 4: Final scrub before the first push**
 
 ```bash
-grep -rniE "storeseo|dataforseo|clickup|chatgpt-app-submission" --include="*.ts" --include="*.js" --include="*.mjs" --include="*.md" --include="*.json" --include="*.yml" --include="*.prisma" . | grep -v node_modules | grep -v "^./docs/superpowers/"
+grep -rniE "${SCRUB_TERMS:?set SCRUB_TERMS to your organization's internal app and vendor names before running this}" --include="*.ts" --include="*.js" --include="*.mjs" --include="*.md" --include="*.json" --include="*.yml" --include="*.prisma" --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=coverage .
 ```
 
-Expected: no output. The plans and specs under `docs/superpowers/` are the working documents and are
-allowed to name their origin; nothing in the shipped tree may.
+Expected: no output, from **every** path — this repository is public, so `docs/superpowers/` gets no
+pass; a plan or spec that names its origin is exactly the kind of thing this step exists to catch.
+`SCRUB_TERMS` is a required env var, not a literal in this file, so a published copy of this plan
+never enumerates what your organization considers sensitive — set it locally before running.
+`--exclude-dir`, not a piped `grep -v`: this repo's `node_modules` alone is thousands of files, and
+piping the exclusion in *after* a multi-`--include`, whole-tree recursive search has been observed to
+silently drop real matches outside `node_modules` under load — asking the search itself to skip the
+directory doesn't have that failure mode, and it's faster besides.
 
 Then confirm no real credentials:
 
 ```bash
-grep -rniE "shpat_|shpua_[a-z0-9]{20,}|sk-[a-zA-Z0-9]{20,}" --include="*.ts" --include="*.json" --include="*.md" . | grep -v node_modules
+grep -rniE "shpat_|shpua_[a-z0-9]{20,}|sk-[a-zA-Z0-9]{20,}" --include="*.ts" --include="*.json" --include="*.md" --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=coverage .
 ```
 
 Expected: no output. The only `shpua_` string in the tree is the literal `shpua_exchanged_token` used

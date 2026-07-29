@@ -2617,10 +2617,15 @@ Expected: no errors. Fix the README where a command's name or path is wrong.
 - [ ] **Step 3: Check the scrub list**
 
 ```bash
-grep -rniE "storeseo|dataforseo|myshopify\.com" examples/basic-server --include="*.ts" --include="*.md" --include="*.json" --include="*.prisma" | grep -v "demo.myshopify.com" | grep -v "other-store.myshopify.com" | grep -v "never-installed.myshopify.com" | grep -v "your-store.myshopify.com" | grep -v "first-store.myshopify.com" | grep -v "second-store.myshopify.com"
+grep -rniE "${SCRUB_TERMS:?set SCRUB_TERMS to your organization's internal app and vendor names before running this}|myshopify\.com" examples/basic-server --include="*.ts" --include="*.md" --include="*.json" --include="*.prisma" --exclude-dir=node_modules | grep -v "demo.myshopify.com" | grep -v "other-store.myshopify.com" | grep -v "never-installed.myshopify.com" | grep -v "your-store.myshopify.com" | grep -v "first-store.myshopify.com" | grep -v "second-store.myshopify.com"
 ```
 
 Expected: no output. Any hit is a real store domain or an internal name that must not ship.
+`SCRUB_TERMS` is a required env var, not a literal in this file, so a published copy of this plan
+never enumerates what your organization considers sensitive — set it locally before running.
+`--exclude-dir=node_modules`, not a piped `grep -v`: this example gets its own `node_modules` after
+`pnpm install`, and piping the exclusion in after a multi-`--include` recursive search has been
+observed to silently drop real matches outside `node_modules` under load.
 
 - [ ] **Step 4: Commit**
 

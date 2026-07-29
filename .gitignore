@@ -5,3 +5,7 @@ coverage/
 .env
 .DS_Store
 packages/create-shopify-mcp/templates/
+# AI-agent working state: task briefs, reviews, and diffs generated during development. Zero
+# tracked files today, but not previously ignored either -- a single `git add .` would have swept
+# in every ledger and review, including internal reasoning and app names.
+.superpowers/

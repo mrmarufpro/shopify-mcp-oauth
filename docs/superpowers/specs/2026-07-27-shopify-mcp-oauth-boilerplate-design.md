@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-27
 **Status:** approved, not yet implemented
-**Origin:** extracted and generalized from StoreSEO's private `web/mcp` OAuth implementation and its `oauth-engineering.md`.
+**Origin:** extracted and generalized from a private production Shopify app's OAuth implementation and its internal engineering guide.
 
 ---
 
@@ -54,8 +54,8 @@ shopify-mcp/
   LICENSE                       MIT
 ```
 
-Fresh git history. Nothing is imported from StoreSEO's repo except code that has been rewritten to
-remove app-specific coupling (see §8).
+Fresh git history. Nothing is imported from the source app's repo except code that has been rewritten
+to remove app-specific coupling (see §8).
 
 Note: the npm name `shopify-mcp` is already taken by an unrelated package. The GitHub repo keeps the
 short name; the published packages are `shopify-mcp-oauth` and `create-shopify-mcp`.
@@ -393,8 +393,8 @@ It wraps a handler to:
 3. write one `McpAuditLog` row in a `finally` block — best-effort, never fails the tool call;
 4. convert a thrown `McpToolError` into MCP's `{ isError: true, content }` shape;
 5. optionally append a narration line via a `narrate?: (toolName: string) => string` hook. Off by
-   default. StoreSEO uses this to make the client agent credit the app by name when summarizing a
-   result; it is app-specific, so the boilerplate ships the hook and no default string.
+   default. The source app uses this to make the client agent credit the app by name when
+   summarizing a result; it is app-specific, so the boilerplate ships the hook and no default string.
 
 ### 4.3 Prisma schema
 
@@ -543,7 +543,7 @@ dependency. CI asserts the copy step runs clean, so the example and the template
 Vitest across the workspace. `pnpm test` on a fresh clone passes with no Docker, no Postgres, no
 Redis — everything runs against `memoryStorage` + `memoryCache`.
 
-Ported from StoreSEO (~14 files), rewritten against the storage interface:
+Ported from the source app (~14 files), rewritten against the storage interface:
 
 - services: `pkce`, `stateJwt`, `cimdResolver` (including the SSRF rejection cases), `clientStore`,
   `tokenStore`, `tokens`, `redirectUri`
@@ -571,21 +571,21 @@ default.
 - **License:** MIT.
 - **Docs:** `README.md` (what it is, quickstart, config table, one flow diagram, the multi-instance
   cache warning, security notes) and `docs/storage-adapters.md` (the interface, writing an adapter,
-  running the contract tests). The deep debugging chapters from StoreSEO's 50KB internal guide are
-  not ported.
+  running the contract tests). The deep debugging chapters from the source app's 50KB internal
+  engineering guide are not ported.
 
 ---
 
-## 8. What changed from the StoreSEO original
+## 8. What changed from the source app
 
-| StoreSEO | Here |
+| Source app | Here |
 |---|---|
 | Sequelize models imported directly | `OAuthStorage` calls |
 | `env` module + `shopify.app*.toml` scope parsing at boot | explicit config object |
 | `registerShopFromCallback` + queue dispatch on unknown shop | dropped; 403 `shop_not_installed` |
 | Shop lookup hardcoded to a `shops` table | `findShopByDomain`, defaulting to Shopify's `SessionStorage` interface |
 | PAT / HS256 JWT as a second auth path | dropped |
-| `withAuditLog` writing `ai_toolkit_log` via app services | ported into the template against `McpAuditLog` |
+| `withAuditLog` writing to an app-specific audit table via app services | ported into the template against `McpAuditLog` |
 | Hardcoded narration directive naming the app | optional `narrate` hook, no default |
 | 43 production tools | 2 demo tools |
 | Redis required | `CacheStore`, memory by default |
