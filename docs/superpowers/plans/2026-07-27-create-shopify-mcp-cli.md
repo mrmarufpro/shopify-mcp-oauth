@@ -2228,10 +2228,14 @@ Expected: no output, from **every** path — this repository is public, so `docs
 pass; a plan or spec that names its origin is exactly the kind of thing this step exists to catch.
 `SCRUB_TERMS` is a required env var, not a literal in this file, so a published copy of this plan
 never enumerates what your organization considers sensitive — set it locally before running.
-`--exclude-dir`, not a piped `grep -v`: this repo's `node_modules` alone is thousands of files, and
-piping the exclusion in *after* a multi-`--include`, whole-tree recursive search has been observed to
-silently drop real matches outside `node_modules` under load — asking the search itself to skip the
-directory doesn't have that failure mode, and it's faster besides.
+`--exclude-dir`, not a piped `grep -v node_modules`: the piped form filters on the *text* of each
+output line, not which directory it came from — a line that legitimately matches but whose own
+content happens to mention "node_modules" (a doc line describing this exact command, say) gets
+silently dropped too, indistinguishable in the output from a line that was never a match. This isn't
+hypothetical — reproduced with `grep -rn "widget-secret" . | grep -v node_modules` dropping a real hit
+in a doc file that mentioned "node_modules" in its own prose, no `node_modules/` directory involved at
+all. `--exclude-dir` filters by the file's actual path, so it can't have that failure mode, and it's
+faster besides since it prunes the walk instead of filtering after it.
 
 Then confirm no real credentials:
 

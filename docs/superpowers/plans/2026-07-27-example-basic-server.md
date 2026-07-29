@@ -2623,9 +2623,12 @@ grep -rniE "${SCRUB_TERMS:?set SCRUB_TERMS to your organization's internal app a
 Expected: no output. Any hit is a real store domain or an internal name that must not ship.
 `SCRUB_TERMS` is a required env var, not a literal in this file, so a published copy of this plan
 never enumerates what your organization considers sensitive — set it locally before running.
-`--exclude-dir=node_modules`, not a piped `grep -v`: this example gets its own `node_modules` after
-`pnpm install`, and piping the exclusion in after a multi-`--include` recursive search has been
-observed to silently drop real matches outside `node_modules` under load.
+`--exclude-dir=node_modules`, not a piped `grep -v node_modules`: the piped form filters on each output
+line's own *text*, not which directory it came from, so a line that legitimately matches but whose
+content happens to mention "node_modules" (a doc line describing this exact command, say) is
+indistinguishable from a non-match and gets silently dropped too. `--exclude-dir` filters by the
+file's actual path instead, so it can't have that failure mode — and this example gets its own
+`node_modules` after `pnpm install`, so the distinction is live here, not theoretical.
 
 - [ ] **Step 4: Commit**
 
