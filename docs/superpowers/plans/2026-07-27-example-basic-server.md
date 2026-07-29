@@ -23,6 +23,7 @@ Spec: `docs/superpowers/specs/2026-07-27-shopify-mcp-oauth-boilerplate-design.md
 - Formatting: double quotes, 120 print width, 2-space indent, trailing comma `es5`.
 - Comments are minimal: only where the *why* is non-obvious. The `AsyncLocalStorage` constraint in `transport.ts` is the one place where a longer comment earns its keep.
 - Test data uses readable named constants (`const DEMO_SHOP = "demo.myshopify.com"`) referenced from both setup and assertion. Never assert on a factory default — pass the value as an explicit override next to the assertion.
+- A mock returning a stateful, consumable object — `Response`, `ReadableStream`, or anything else whose body is read once — must construct a fresh instance per call: `mockImplementation(() => new Response(...))`, not `mockResolvedValue(response)`. The latter hands back the same instance every time; a second caller (e.g. a second login sharing one `fetchImpl`) finds the body already consumed and fails with no indication why.
 - No app-specific names, no vendor names, no real credentials, no real store domains anywhere in the tree.
 
 ---
@@ -2174,6 +2175,12 @@ function buildApp(demoShopDomain = DEMO_SHOP) {
     stateSecret: STATE_SECRET,
     storage,
     audit: auditSink,
+    // mockResolvedValue hands back the SAME Response instance on every call, and a Response body
+    // is a single-use stream -- a second read (e.g. a second login sharing this app) finds it
+    // already consumed and fails with no indication why. Safe today because every test below
+    // calls buildApp() fresh and drives at most one login through it, so this fetchImpl is never
+    // invoked twice. A test that logs in twice against the SAME buildApp() result must switch this
+    // to `mockImplementation(() => new Response(...))` so each call gets its own instance.
     fetchImpl: vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ access_token: "shpua_exchanged_token" }), {
         status: 200,
