@@ -309,6 +309,27 @@ describe("terminal error handler", () => {
     expect(raw).not.toContain(".ts:");
   });
 
+  // "converts a malformed JSON body..." above only asserts the RESPONSE, which is identical
+  // whether errorHandler(resolved.logger) or errorHandler({ ...a hardcoded no-op logger }) built
+  // the mount -- the body and status don't carry the logger. Verified by mutation: swapping
+  // resolved.logger for a hardcoded no-op in index.ts left the full suite green. The log is a
+  // side channel the response can't prove one way or the other; this drives the configured
+  // logger's spy directly.
+  it("threads the caller's configured logger into the exported errorHandler, not a hardcoded one", async () => {
+    const errorLog = vi.fn();
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ logger: { info: () => {}, warn: () => {}, error: errorLog } })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+    app.use(oauth.errorHandler);
+
+    await request(app).post("/register").set("Content-Type", "application/json").send('{"redirect_uris": [invalid');
+
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+
   it("leaks Express's own HTML stack trace when the consumer does not mount oauth.errorHandler, proving that mount is load-bearing", async () => {
     const oauth = createShopifyMcpOAuth(buildBaseConfig());
     const app = express();
@@ -339,6 +360,25 @@ describe("terminal error handler", () => {
     const lastLayer = stack[stack.length - 1];
     expect(lastLayer?.handle.length).toBe(4);
   });
+
+  // No request today reaches this mount (see the comment above), so its logger pass-through can't
+  // be pinned by sending one either -- but `lastLayer.handle` IS the exact closure
+  // `errorHandler(config.logger)` returned inside buildRouter, captured `logger` and all. Invoking
+  // it directly (the same call shape Express itself uses once a layer is chosen: err, req, res,
+  // next) exercises that real closure without needing Express's dispatch to reach it.
+  it("threads the configured logger into the router-internal errorHandler mount too", () => {
+    const errorLog = vi.fn();
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ logger: { info: () => {}, warn: () => {}, error: errorLog } })
+    );
+    const stack = (oauth.router as unknown as { stack: Array<{ handle: (...args: unknown[]) => unknown }> }).stack;
+    const lastLayer = stack[stack.length - 1];
+
+    const fakeRes = { headersSent: false, status: () => ({ json: () => undefined }) };
+    lastLayer?.handle(new Error("synthetic error for direct invocation"), {}, fakeRes, () => {});
+
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("mounts a rate limiter on /register", () => {
@@ -363,6 +403,30 @@ describe("mounts a rate limiter on /register", () => {
     expect(second.body.error).toBe("too_many_requests");
     expect(second.headers["retry-after"]).toBeDefined();
   });
+
+  // The test above uses limit: 1 and only checks Retry-After is present -- any windowMs at all
+  // satisfies that, so it can't tell the configured window from a wrong (e.g. hardcoded) one.
+  // Retry-After is the one response value that actually carries windowMs, so a distinct,
+  // non-default window here is what makes a wrong pass-through observable.
+  it("threads the configured registerRateLimit.windowMs into the limiter, not just the limit", async () => {
+    const CONFIGURED_WINDOW_MS = 120_000;
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ registerRateLimit: { limit: 1, windowMs: CONFIGURED_WINDOW_MS } })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+    const blocked = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBe(String(CONFIGURED_WINDOW_MS / 1000));
+  });
 });
 
 describe("mounts a rate limiter on /revoke", () => {
@@ -379,6 +443,23 @@ describe("mounts a rate limiter on /revoke", () => {
     expect(second.status).toBe(429);
     expect(second.body.error).toBe("too_many_requests");
     expect(second.headers["retry-after"]).toBeDefined();
+  });
+
+  // Same gap as /register's windowMs test above, mirrored onto /revoke.
+  it("threads the configured revokeRateLimit.windowMs into the limiter, not just the limit", async () => {
+    const CONFIGURED_WINDOW_MS = 120_000;
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ revokeRateLimit: { limit: 1, windowMs: CONFIGURED_WINDOW_MS } })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    await request(app).post("/revoke").send({ token: "first-guess" });
+    const blocked = await request(app).post("/revoke").send({ token: "second-guess" });
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBe(String(CONFIGURED_WINDOW_MS / 1000));
   });
 
   it("keeps the revoke and register rate limits independent of one another", async () => {
