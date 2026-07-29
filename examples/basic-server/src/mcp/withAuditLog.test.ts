@@ -125,6 +125,27 @@ describe("withAuditLog", () => {
     expect(audit.entries[0]!.errorMessage).toBe("null is not an object");
   });
 
+  it("survives a handler that throws a non-Error", async () => {
+    const audit = buildAuditSpy();
+    const callback = withAuditLog({
+      toolName: "echo",
+      schema: ECHO_SCHEMA,
+      handler: async () => {
+        throw "boom";
+      },
+    });
+
+    const result = (await runTool(callback, { message: "hello" }, audit.sink)) as {
+      isError?: boolean;
+      content: Array<{ text: string }>;
+    };
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]!.text).code).toBe(ERROR_CODES.DOWNSTREAM_ERROR);
+    expect(audit.entries[0]!.errorMessage).toBe("boom");
+    expect(audit.entries).toHaveLength(1);
+  });
+
   it("still returns the result when the audit write fails", async () => {
     const failingSink: AuditSink = async () => {
       throw new Error("database unreachable");

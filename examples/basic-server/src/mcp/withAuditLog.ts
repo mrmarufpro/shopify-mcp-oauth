@@ -56,12 +56,11 @@ export function withAuditLog<TSchema extends z.ZodTypeAny>(
       result = await handler(parsedInput, { auth: context.auth, mcpClient: context.mcpClient });
     } catch (thrown) {
       status = "error";
-      const error = thrown as Error;
-      errorMessage = error.message;
+      errorMessage = thrown instanceof Error ? thrown.message : String(thrown);
       result =
         thrown instanceof McpToolError
           ? thrown.toContent()
-          : new McpToolError(ERROR_CODES.DOWNSTREAM_ERROR, error.message).toContent();
+          : new McpToolError(ERROR_CODES.DOWNSTREAM_ERROR, errorMessage).toContent();
     }
 
     // Best effort: an audit-log outage must not turn a successful tool call into a failure.
