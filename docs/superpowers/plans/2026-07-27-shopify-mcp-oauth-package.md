@@ -53,17 +53,22 @@ packages/shopify-mcp-oauth/
       allowAnyShop.ts               allowAnyShop()
     schemas/
       authorize.ts  token.ts  register.ts  revoke.ts  shopifyCallback.ts  cimd.ts
+      capOversizedArray.ts           shared array-size cap used by register.ts and cimd.ts
     serializers/
       metadata.ts  register.ts  token.ts
     controllers/
       metadata.ts  register.ts  authorize.ts  shopifyCallback.ts  token.ts  revoke.ts
       openaiAppsChallenge.ts
+      asyncHandler.ts                wraps a controller so a rejection becomes a generic 500
     middlewares/
-      requireAuth.ts  verifyShopifyHmac.ts  rateLimit.ts
+      requireAuth.ts  verifyShopifyHmac.ts  rateLimit.ts  errorHandler.ts
     router.ts                       buildRouter(resolved)
     index.ts                        createShopifyMcpOAuth + public exports
+    vitestSetup.ts                  per-test cool-down for the ephemeral-server race (Task 18)
     testing/
       storageContract.ts            runStorageContractTests
+      cacheContract.ts               runCacheContractTests
+      index.ts                       barrel the published ./testing subpath resolves to
   package.json  tsconfig.json  tsup.config.ts  vitest.config.ts
 ```
 
@@ -169,6 +174,7 @@ export interface ShopifyMcpOAuthConfig {
   tokenTtl?: { access?: number; refresh?: number };
   openaiAppsChallengeToken?: string | null;
   registerRateLimit?: { limit: number; windowMs: number };
+  revokeRateLimit?: { limit: number; windowMs: number };
   logger?: Logger;
   fetchImpl?: typeof fetch;
 }
@@ -183,6 +189,7 @@ export interface ResolvedConfig {
   tokenTtl: { access: number; refresh: number };
   openaiAppsChallengeToken: string | null;
   registerRateLimit: { limit: number; windowMs: number };
+  revokeRateLimit: { limit: number; windowMs: number };
   logger: Logger;
   fetchImpl: typeof fetch;
 }
@@ -191,18 +198,34 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig;
 ```
 
 ```ts
-// index.ts
-export interface ShopifyMcpOAuth {
-  router: Router;
-  requireAuth: RequestHandler;
-}
+// router.ts
 export interface BuildRouterOptions {
   /** Test-only escape hatch: skips the CIMD private-address guard. Never set this in production. */
   allowPrivateCimdHosts?: boolean;
 }
+export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions = {}): Router;
+```
+
+```ts
+// index.ts
+export interface ShopifyMcpOAuth {
+  router: Router;
+  requireAuth: RequestHandler;
+  /**
+   * Mount this as the LAST `app.use(...)` call on YOUR OWN top-level Express app -- after your
+   * own body-parsers (e.g. `express.json()`) AND after `app.use(router)` -- never inside a
+   * router of your own. Express only looks for an error handler within the stack level where an
+   * error occurred, and a mounted Router is an ordinary layer to its parent, so an error thrown
+   * by a parent-level middleware (your body-parser included) never enters this package's router
+   * at all -- nothing mounted anywhere but your app's own final middleware can catch it. Get the
+   * placement wrong and such an error falls through to Express's own default handler instead,
+   * which answers with an HTML stack trace on an unauthenticated endpoint.
+   */
+  errorHandler: ErrorRequestHandler;
+}
 export function createShopifyMcpOAuth(
   config: ShopifyMcpOAuthConfig,
-  options?: BuildRouterOptions
+  options: BuildRouterOptions = {}
 ): ShopifyMcpOAuth;
 ```
 
@@ -2723,8 +2746,9 @@ export interface ResolvedConfig {
 const CACHE_FALLBACK_WARNING =
   "shopify-mcp-oauth: no cache supplied, falling back to an in-memory cache. This cache is single-process, so " +
   "authorization codes written by one instance are invisible to the others and login will fail intermittently " +
-  "across multiple instances — supply a shared cache such as redisCache in production. (The /register rate " +
-  "limiter is separate from this cache and always process-local — see registerRateLimit.)";
+  "across multiple instances — supply a shared cache such as redisCache in production. (The /register and " +
+  "/revoke rate limiters are separate from this cache and always process-local — see registerRateLimit and " +
+  "revokeRateLimit.)";
 
 // A prefix regex only checks the string starts with a scheme; new URL() also catches a missing
 // hostname, a query string, or a fragment, none of which are valid in the resource identifier
@@ -5001,8 +5025,12 @@ git commit -m "feat: add single-use authorization codes and rotating tokens"
   - `revokeController(config): RequestHandler`
   - `openaiAppsChallengeController(token: string | null): RequestHandler`
 
-Revocation always answers 200, even for a token we have never seen. RFC 7009 requires it: a
-distinguishable 404 would turn the endpoint into an oracle for guessing valid tokens.
+The revocation *controller* always answers 200, even for a token we have never seen, regardless of
+whether the token existed. RFC 7009 requires it: a distinguishable 404 would turn the endpoint into
+an oracle for guessing valid tokens. Task 19 puts a rate limiter in front of `/revoke`, so the
+endpoint as a whole can answer 429 under heavy call volume from one caller — that carries no
+information about whether any particular token is valid, so it doesn't reopen the oracle RFC 7009
+guards against; the controller's own 200-regardless-of-validity guarantee is unchanged.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5546,7 +5574,10 @@ import type { Logger } from "../types";
 
 type AsyncControllerHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>;
 
-const GENERIC_SERVER_ERROR_BODY = { error: "server_error", error_description: "An unexpected error occurred" };
+// Exported so middlewares/errorHandler.ts — the terminal handler for errors this wrapper never
+// gets a chance to see — answers with the exact same body. Two call sites hand-typing the same
+// literal would drift silently; importing this one guarantees they can't.
+export const GENERIC_SERVER_ERROR_BODY = { error: "server_error", error_description: "An unexpected error occurred" };
 
 // Express 4 drops a route handler's rejected promise on the floor — the request hangs, and
 // Node's default unhandled-rejection policy then kills the process. Express 5 forwards the
@@ -8328,6 +8359,25 @@ export interface RateLimiterOptions {
 
 const DEFAULT_MAX_ENTRIES = 10_000;
 
+// Config-driven limiters (registerRateLimit, revokeRateLimit) already pass through resolveConfig's
+// zod schema (z.number().int().positive()), which rules out every case rejected below. A consumer
+// calling this exported factory directly has no such schema in front of them, so it can't be
+// allowed to silently misbehave: a non-finite or non-positive windowMs (0, negative, NaN, Infinity)
+// would make every window already-expired the instant it's created (and Infinity would put that
+// same value straight into a Retry-After header), and a limit that isn't a non-negative integer
+// would either allow unlimited requests (negative) or not do what its value claims.
+function assertValidRateLimiterOptions(options: RateLimiterOptions): void {
+  if (!Number.isFinite(options.windowMs) || options.windowMs <= 0) {
+    throw new Error("createRateLimiter: windowMs must be a positive, finite number of milliseconds");
+  }
+  if (!Number.isInteger(options.limit) || options.limit < 0) {
+    throw new Error("createRateLimiter: limit must be a non-negative integer");
+  }
+  if (options.maxEntries !== undefined && (!Number.isInteger(options.maxEntries) || options.maxEntries <= 0)) {
+    throw new Error("createRateLimiter: maxEntries must be a positive integer");
+  }
+}
+
 // req.ip only names the real caller when the app has configured Express's `trust proxy` setting
 // to match its actual deployment (see https://expressjs.com/en/guide/behind-proxies.html) --
 // something this package cannot do on the consumer's behalf, since it only ever receives a
@@ -8350,6 +8400,7 @@ function defaultKey(req: Request): string {
 // multiplies by the instance count, which is an acceptable, well-understood shape for a spam
 // brake and is documented as such on `registerRateLimit`.
 export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
+  assertValidRateLimiterOptions(options);
   const windows = new Map<string, Window>();
   const keyFor = options.keyFor ?? defaultKey;
   const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
@@ -8365,7 +8416,7 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
     const now = Date.now();
 
     const stored = windows.get(key);
-    const current = stored && stored.resetAt > now ? stored : undefined;
+    let current = stored && stored.resetAt > now ? stored : undefined;
 
     if (!current) {
       // A lapsed key that's still in the map is being refreshed, not newly added. `Map#set` on a
@@ -8410,15 +8461,24 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
         const oldestKey = windows.keys().next().value;
         if (oldestKey !== undefined) windows.delete(oldestKey);
       }
-      windows.set(key, { count: 1, resetAt: now + windowMs });
-      return next();
+      // count starts at 0, not 1: a fresh window still has to pass the same `count >= limit` check
+      // below before its first request is allowed through. Starting at 1 (and returning next()
+      // immediately, skipping that check) would let exactly one request through per window no
+      // matter what `limit` says -- correct for every limit >= 1, but silently wrong for `limit: 0`
+      // ("block every request"), which would then let the first one through anyway.
+      current = { count: 0, resetAt: now + windowMs };
+      windows.set(key, current);
     }
 
     if (current.count >= limit) {
-      // No floor needed: `current` is only ever truthy when `stored.resetAt > now` (see above),
-      // using this same `now` -- so resetAt - now is always strictly positive here, and ceiling
-      // any positive number of milliseconds to whole seconds always lands on at least 1 (that
-      // holds for any positive value, not because milliseconds happen to be integers).
+      // No floor needed: current.resetAt - now is strictly positive either way `current` got
+      // here. If it's the window just created/refreshed above, resetAt = now + windowMs with
+      // this SAME now, and windowMs > 0 is guaranteed by assertValidRateLimiterOptions -- so
+      // resetAt - now = windowMs > 0. Otherwise `current` is the existing, unexpired window read
+      // from the map above, where stored.resetAt > now already held, again using this same now.
+      // Either way, ceiling a strictly positive number of milliseconds to whole seconds always
+      // lands on at least 1 (true for any positive value, not because milliseconds happen to be
+      // integers).
       res.setHeader("Retry-After", Math.ceil((current.resetAt - now) / 1000));
       res.status(429).json({ error: "too_many_requests", error_description: "rate limit exceeded" });
       return;
@@ -8433,7 +8493,7 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `pnpm --filter shopify-mcp-oauth test src/middlewares/rateLimit.test.ts`
-Expected: PASS, 16 tests.
+Expected: PASS, 28 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -8447,44 +8507,73 @@ git commit -m "feat: add a fixed-window rate limiter for the registration endpoi
 ## Task 20: Router, factory, and public exports
 
 **Files:**
-- Create: `packages/shopify-mcp-oauth/src/router.ts`
+- Create: `packages/shopify-mcp-oauth/src/router.ts`, `src/middlewares/errorHandler.ts`
 - Modify: `packages/shopify-mcp-oauth/src/index.ts` (replace the `PACKAGE_NAME` placeholder from Task 1)
 - Modify: `packages/shopify-mcp-oauth/src/index.test.ts` (replace the placeholder test)
-- Test: `packages/shopify-mcp-oauth/src/router.test.ts`
+- Test: `packages/shopify-mcp-oauth/src/router.test.ts`, `src/middlewares/errorHandler.test.ts`
 
 **Interfaces:**
-- Consumes: every controller and middleware from Tasks 14–19; `resolveConfig` from `./config`
+- Consumes: every controller and middleware from Tasks 14–19; `resolveConfig` from `./config`;
+  `GENERIC_SERVER_ERROR_BODY` from `./controllers/asyncHandler`
 - Produces:
   - `buildRouter(config: ResolvedConfig, options?: BuildRouterOptions): Router`
+  - `errorHandler(logger: Logger): ErrorRequestHandler` — the terminal 500 handler. Mounted twice,
+    for two different origins of error: once inside `buildRouter`'s own stack (defense in depth for
+    anything that throws synchronously inside this package's routing, including a future controller
+    that forgets to wrap with `asyncHandler`), and once more on `ShopifyMcpOAuth.errorHandler` for
+    the consumer's own app. Only the second mount can catch a body-parser's `SyntaxError` on a
+    malformed request body: that error is thrown *before* Express ever reaches `app.use(oauth.router)`,
+    and Express only looks for the next error-handling middleware within the stack level where the
+    error occurred, so nothing mounted inside the router — this package's own mount included — can
+    ever see it. See `src/middlewares/errorHandler.ts`'s own comment for the full mechanics.
   - `createShopifyMcpOAuth(config: ShopifyMcpOAuthConfig, options?: BuildRouterOptions): ShopifyMcpOAuth`
   - the package's full public export surface
 
 The six discovery routes are deliberate duplication. Clients probe different URLs, and a 404 on the
 one a given client happens to check surfaces to the user as "this server does not support OAuth".
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 `src/router.test.ts`:
 
 ```ts
+import crypto from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "./adapters/memoryStorage";
-import { createShopifyMcpOAuth } from "./index";
+import { resolveConfig } from "./config";
+import type { BuildRouterOptions } from "./router";
+import { signOuterState } from "./services/stateJwt";
+import { issueTokens } from "./services/tokens";
+import type { Logger } from "./types";
+import { createShopifyMcpOAuth, type ShopifyMcpOAuthConfig } from "./index";
 
 const HOST = "https://mcp.example.com";
 const DEMO_SHOP = "demo.myshopify.com";
 const DEMO_SHOP_ID = "shop_1";
 const REDIRECT_URI = "https://client.example/callback";
+const SHOPIFY_API_KEY = "test-api-key";
+const SHOPIFY_API_SECRET = "test-api-secret";
+const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
+
+// Silent by default so the no-cache warning (and, in the error-handler tests, the deliberately
+// triggered error log) doesn't spray stderr across every case that isn't about it.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+function buildBaseConfig(overrides: Partial<ShopifyMcpOAuthConfig> = {}): ShopifyMcpOAuthConfig {
+  return {
+    host: HOST,
+    shopify: { apiKey: SHOPIFY_API_KEY, apiSecret: SHOPIFY_API_SECRET, scopes: "read_products" },
+    stateSecret: STATE_SECRET,
+    storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
+    logger: silentLogger,
+    ...overrides,
+  };
+}
 
 function buildApp() {
-  const oauth = createShopifyMcpOAuth({
-    host: HOST,
-    shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
-    stateSecret: "test-state-secret-at-least-32-bytes-long",
-    storage: memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
-  });
+  const oauth = createShopifyMcpOAuth(buildBaseConfig());
   const app = express();
   app.use(express.json());
   app.use(express.urlencoded({ extended: false }));
@@ -8493,23 +8582,45 @@ function buildApp() {
   return app;
 }
 
-const DISCOVERY_PATHS = [
+// Split by which document each path must serve, not just "does it 200" -- both controllers
+// answer 200 for any of these six paths, so a request-level test that only checks status can't
+// tell a correctly-wired route apart from one silently cross-wired to the OTHER metadata
+// controller (verified by mutation: swapping protectedResourceMetadataController for
+// authorizationServerMetadataController on the two oauth-protected-resource routes left the full
+// suite green). Each group below asserts a field that only its own document carries.
+const AUTHORIZATION_SERVER_METADATA_PATHS = [
   "/.well-known/oauth-authorization-server",
   "/.well-known/oauth-authorization-server/mcp",
   "/.well-known/openid-configuration",
   "/.well-known/openid-configuration/mcp",
+];
+
+const PROTECTED_RESOURCE_METADATA_PATHS = [
   "/.well-known/oauth-protected-resource",
   "/.well-known/oauth-protected-resource/mcp",
 ];
 
 describe("router", () => {
-  it.each(DISCOVERY_PATHS)("serves %s", async (path) => {
+  it.each(AUTHORIZATION_SERVER_METADATA_PATHS)("serves authorization server metadata at %s", async (path) => {
     const response = await request(buildApp()).get(path);
     expect(response.status).toBe(200);
+    // authorization_endpoint exists only on the authorization-server document (see
+    // serializers/metadata.ts) -- the protected-resource document has no such field.
+    expect(response.body.authorization_endpoint).toBe(`${HOST}/authorize`);
+  });
+
+  it.each(PROTECTED_RESOURCE_METADATA_PATHS)("serves protected resource metadata at %s", async (path) => {
+    const response = await request(buildApp()).get(path);
+    expect(response.status).toBe(200);
+    // resource exists only on the protected-resource document -- the authorization-server
+    // document has no such field.
+    expect(response.body.resource).toBe(`${HOST}/mcp`);
   });
 
   it("mounts /register", async () => {
-    const response = await request(buildApp()).post("/register").send({ redirect_uris: [REDIRECT_URI] });
+    const response = await request(buildApp())
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
     expect(response.status).toBe(201);
   });
 
@@ -8538,6 +8649,65 @@ describe("router", () => {
     const response = await request(buildApp()).get("/.well-known/openai-apps-challenge");
     expect(response.status).toBe(404);
   });
+
+  // The request-level test above is not enough on its own: openaiAppsChallengeController itself
+  // 404s when handed a null token, so unconditionally registering the route regardless of
+  // config -- `router.get(path, openaiAppsChallengeController(config.openaiAppsChallengeToken))`
+  // with no `if` at all -- produces the exact same 404 response and would NOT redden that test.
+  // Verified by mutation. This asserts the thing that actually distinguishes the two: no layer
+  // for that path exists in the router's own stack at all when the token isn't configured.
+  it("does not register a layer for the openai challenge path at all when no token is configured", () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const stack = (oauth.router as unknown as { stack: Array<{ route?: { path: string } }> }).stack;
+    const matchingLayer = stack.find((layer) => layer.route?.path === "/.well-known/openai-apps-challenge");
+    expect(matchingLayer).toBeUndefined();
+  });
+
+  // The two tests above only ever pin the ABSENT case. Nothing proved the route is actually
+  // served -- through buildRouter, not a bare app mounting the controller directly -- when a
+  // token IS configured. controllers/metadata.test.ts mounts openaiAppsChallengeController on its
+  // own bare app, bypassing buildRouter entirely, so it can't stand in for this either.
+  it("serves the configured challenge token through the full router when one is configured", async () => {
+    const CHALLENGE_TOKEN = "openai-challenge-token-value";
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ openaiAppsChallengeToken: CHALLENGE_TOKEN }));
+    const app = express();
+    app.use(oauth.router);
+
+    const response = await request(app).get("/.well-known/openai-apps-challenge");
+
+    expect(response.status).toBe(200);
+    expect(response.text).toBe(CHALLENGE_TOKEN);
+  });
+});
+
+describe("requireAuth accepts a token this server actually issued", () => {
+  // "guards the mcp route with requireAuth" above only pins the REJECT direction (no token ->
+  // 401) -- an always-401 stub swapped in for requireAuth would leave that test green too
+  // (verified by mutation). This drives a real token, issued through the exact same config's
+  // storage, all the way through buildRouter + requireAuth and checks it's actually accepted.
+  it("returns 200 and populates req.mcp for a valid access token", async () => {
+    const config = buildBaseConfig();
+    const oauth = createShopifyMcpOAuth(config);
+    const app = express();
+    app.use(oauth.router);
+    app.post("/mcp", oauth.requireAuth, (req, res) => res.status(200).json(req.mcp));
+
+    // Same `config` object resolveConfig was already called on inside createShopifyMcpOAuth --
+    // resolving it again here is side-effect-free (beyond the harmless no-cache log) and shares
+    // the identical `storage` instance by reference, so a token issued against this resolved copy
+    // is visible to requireAuth's lookups against the router's own copy.
+    const resolved = resolveConfig(config);
+    const tokens = await issueTokens(resolved, {
+      shopId: DEMO_SHOP_ID,
+      shopDomain: DEMO_SHOP,
+      clientId: "test-client-id",
+    });
+
+    const response = await request(app).post("/mcp").set("Authorization", `Bearer ${tokens.access_token}`).send({});
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, tokenId: expect.any(String) });
+  });
 });
 
 describe("createShopifyMcpOAuth", () => {
@@ -8545,11 +8715,430 @@ describe("createShopifyMcpOAuth", () => {
     expect(() =>
       createShopifyMcpOAuth({
         host: "mcp.example.com",
-        shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
-        stateSecret: "test-state-secret-at-least-32-bytes-long",
+        shopify: { apiKey: SHOPIFY_API_KEY, apiSecret: SHOPIFY_API_SECRET, scopes: "read_products" },
+        stateSecret: STATE_SECRET,
         storage: memoryStorage(),
       })
     ).toThrow(/host/);
+  });
+});
+
+// A genuinely valid, signed outer state -- not a throwaway string -- is what makes the HMAC tests
+// below actually isolate the HMAC guard rather than incidentally failing on state verification
+// instead. Shared by both the negative and positive HMAC describe blocks.
+function validSignedState(): string {
+  return signOuterState(
+    {
+      clientId: "test-client-id",
+      redirectUri: REDIRECT_URI,
+      clientState: "client-state",
+      codeChallenge: "a".repeat(43),
+      codeChallengeMethod: "S256",
+      resource: `${HOST}/mcp`,
+      nonce: "test-nonce-value",
+    },
+    STATE_SECRET,
+    600
+  );
+}
+
+describe("the shopify callback route requires a valid HMAC", () => {
+  function callbackQuery(hmacValue: string): string {
+    return new URLSearchParams({
+      shop: DEMO_SHOP,
+      code: "some-code",
+      state: validSignedState(),
+      timestamp: "1700000000",
+      hmac: hmacValue,
+    }).toString();
+  }
+
+  it("rejects a callback request with an invalid HMAC, and never reaches the controller", async () => {
+    const fetchImpl = vi.fn();
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ fetchImpl: fetchImpl as unknown as typeof fetch }));
+    const app = express();
+    app.use(oauth.router);
+
+    const response = await request(app).get(`/oauth/shopify-callback?${callbackQuery("not-a-real-signature")}`);
+
+    expect(response.status).toBe(400);
+    // shopifyCallbackController only calls config.fetchImpl (the Shopify token exchange) after
+    // this valid state successfully verifies -- so fetchImpl staying uncalled proves the request
+    // never got past requireShopifyHmac into the controller, not that it failed downstream for an
+    // unrelated reason. Mutation-verified for this task: deleting `requireShopifyHmac(...)` from
+    // the /oauth/shopify-callback route in router.ts turns this red (status becomes 500 and
+    // fetchImpl.not.toHaveBeenCalled() fails, because the controller then runs, the valid state
+    // verifies, and it proceeds to call the bare `vi.fn()` fetchImpl).
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe("the shopify callback route accepts a genuinely valid HMAC", () => {
+  // The negative test above only pins the REJECT direction -- it would stay equally green if
+  // router.ts wired requireShopifyHmac to the WRONG secret entirely (e.g. config.stateSecret
+  // instead of config.shopify.apiSecret), since a request signed with neither secret is rejected
+  // either way. Verified by mutation. This signs with the REAL secret the wiring is supposed to
+  // use and asserts the request is actually accepted through to a full, successful redirect --
+  // not just that the HMAC check itself passes.
+  function signQuery(params: Record<string, string>): string {
+    // Sorted by key, mirroring the algorithm verifyShopifyHmac.test.ts's own signQuery uses (the
+    // one Shopify's docs document) -- see that file for why this is an accurate stand-in for how
+    // Shopify actually signs a callback.
+    const sortedEntries = Object.entries(params).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    const message = new URLSearchParams(sortedEntries).toString();
+    const hmac = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
+    return `${message}&hmac=${hmac}`;
+  }
+
+  it("passes a request signed with the real shopify.apiSecret all the way through to a successful redirect", async () => {
+    const shopifyExchangeResponse = new Response(JSON.stringify({ access_token: "shopify-admin-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const fetchImpl = vi.fn().mockResolvedValue(shopifyExchangeResponse);
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ fetchImpl: fetchImpl as unknown as typeof fetch }));
+    const app = express();
+    app.use(oauth.router);
+
+    const queryString = signQuery({ shop: DEMO_SHOP, code: "some-code", state: validSignedState() });
+    const response = await request(app).get(`/oauth/shopify-callback?${queryString}`);
+
+    // fetchImpl is only ever called once the HMAC guard AND state verification both succeed --
+    // proving this got past requireShopifyHmac using the real secret, not just that some other
+    // check happened not to fire.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(302);
+    expect(response.headers.location).toContain("code=");
+  });
+});
+
+describe("terminal error handler", () => {
+  function buildFullyWiredApp() {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+    // Mounted LAST, at the top level -- after the consumer's own body-parser and after
+    // oauth.router -- which is the only placement that can catch a body-parser error (see
+    // src/middlewares/errorHandler.ts for why this can't be automatic).
+    app.use(oauth.errorHandler);
+    return app;
+  }
+
+  it("converts a malformed JSON body into the generic safe shape instead of Express's default HTML stack trace", async () => {
+    const response = await request(buildFullyWiredApp())
+      .post("/register")
+      .set("Content-Type", "application/json")
+      .send('{"redirect_uris": [invalid');
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    expect(response.headers["content-type"]).toContain("json");
+  });
+
+  it("never leaks the SyntaxError message or a stack trace in that response", async () => {
+    const response = await request(buildFullyWiredApp())
+      .post("/register")
+      .set("Content-Type", "application/json")
+      .send('{"redirect_uris": [invalid');
+
+    const raw = JSON.stringify(response.body);
+    expect(raw).not.toContain("SyntaxError");
+    expect(raw).not.toContain("JSON.parse");
+    expect(raw).not.toContain(".ts:");
+  });
+
+  // "converts a malformed JSON body..." above only asserts the RESPONSE, which is identical
+  // whether errorHandler(resolved.logger) or errorHandler({ ...a hardcoded no-op logger }) built
+  // the mount -- the body and status don't carry the logger. Verified by mutation: swapping
+  // resolved.logger for a hardcoded no-op in index.ts left the full suite green. The log is a
+  // side channel the response can't prove one way or the other; this drives the configured
+  // logger's spy directly.
+  it("threads the caller's configured logger into the exported errorHandler, not a hardcoded one", async () => {
+    const errorLog = vi.fn();
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ logger: { info: () => {}, warn: () => {}, error: errorLog } })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+    app.use(oauth.errorHandler);
+
+    await request(app).post("/register").set("Content-Type", "application/json").send('{"redirect_uris": [invalid');
+
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaks Express's own HTML stack trace when the consumer does not mount oauth.errorHandler, proving that mount is load-bearing", async () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+    // No app.use(oauth.errorHandler) here -- the gap this test exists to prove is real.
+
+    const response = await request(app)
+      .post("/register")
+      .set("Content-Type", "application/json")
+      .send('{"redirect_uris": [invalid');
+
+    expect(response.body).not.toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    expect(response.text).toContain("SyntaxError");
+  });
+
+  // Every controller mounted on `oauth.router` is already wrapped in asyncHandler, and none of
+  // the middlewares router.ts mounts directly (requireShopifyHmac, createRateLimiter) ever throw
+  // synchronously or call next(err) in this codebase today -- so there is currently no request
+  // that can make the router-internal errorHandler mount actually fire. Its value is structural:
+  // it protects a *future* controller that forgets to wrap with asyncHandler, or a synchronous
+  // throw added later to one of those middlewares. That can't be pinned by sending a request (there
+  // isn't one that reaches it), so this asserts the thing that actually matters -- an error-
+  // handling (4-arg) layer sits LAST in the router's own stack -- directly on the router's shape.
+  it("mounts an error-handling (4-arg) layer as the last layer in the router's own stack", () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const stack = (oauth.router as unknown as { stack: Array<{ handle: (...args: unknown[]) => unknown }> }).stack;
+    const lastLayer = stack[stack.length - 1];
+    expect(lastLayer?.handle.length).toBe(4);
+  });
+
+  // No request today reaches this mount (see the comment above), so its logger pass-through can't
+  // be pinned by sending one either -- but `lastLayer.handle` IS the exact closure
+  // `errorHandler(config.logger)` returned inside buildRouter, captured `logger` and all. Invoking
+  // it directly (the same call shape Express itself uses once a layer is chosen: err, req, res,
+  // next) exercises that real closure without needing Express's dispatch to reach it.
+  it("threads the configured logger into the router-internal errorHandler mount too", () => {
+    const errorLog = vi.fn();
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ logger: { info: () => {}, warn: () => {}, error: errorLog } })
+    );
+    const stack = (oauth.router as unknown as { stack: Array<{ handle: (...args: unknown[]) => unknown }> }).stack;
+    const lastLayer = stack[stack.length - 1];
+
+    const fakeRes = { headersSent: false, status: () => ({ json: () => undefined }) };
+    lastLayer?.handle(new Error("synthetic error for direct invocation"), {}, fakeRes, () => {});
+
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mounts a rate limiter on /register", () => {
+  // Mirrors the /revoke block below exactly. The brief already wired createRateLimiter onto
+  // /register; nothing in this file had actually driven it past its own configured limit through
+  // the fully-wired app before this test existed -- unmounting it left the full suite green.
+  it("answers 429 once the configured register rate limit is exceeded", async () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ registerRateLimit: { limit: 1, windowMs: 60_000 } }));
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    const first = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+    const second = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(429);
+    expect(second.body.error).toBe("too_many_requests");
+    expect(second.headers["retry-after"]).toBeDefined();
+  });
+
+  // The test above uses limit: 1 and only checks Retry-After is present -- any windowMs at all
+  // satisfies that, so it can't tell the configured window from a wrong (e.g. hardcoded) one.
+  // Retry-After is the one response value that actually carries windowMs, so a distinct,
+  // non-default window here is what makes a wrong pass-through observable.
+  it("threads the configured registerRateLimit.windowMs into the limiter, not just the limit", async () => {
+    const CONFIGURED_WINDOW_MS = 120_000;
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ registerRateLimit: { limit: 1, windowMs: CONFIGURED_WINDOW_MS } })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+    const blocked = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBe(String(CONFIGURED_WINDOW_MS / 1000));
+  });
+});
+
+describe("mounts a rate limiter on /revoke", () => {
+  it("answers 429 once the configured revoke rate limit is exceeded", async () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ revokeRateLimit: { limit: 1, windowMs: 60_000 } }));
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    const first = await request(app).post("/revoke").send({ token: "first-guess" });
+    const second = await request(app).post("/revoke").send({ token: "second-guess" });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(429);
+    expect(second.body.error).toBe("too_many_requests");
+    expect(second.headers["retry-after"]).toBeDefined();
+  });
+
+  // Same gap as /register's windowMs test above, mirrored onto /revoke.
+  it("threads the configured revokeRateLimit.windowMs into the limiter, not just the limit", async () => {
+    const CONFIGURED_WINDOW_MS = 120_000;
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ revokeRateLimit: { limit: 1, windowMs: CONFIGURED_WINDOW_MS } })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    await request(app).post("/revoke").send({ token: "first-guess" });
+    const blocked = await request(app).post("/revoke").send({ token: "second-guess" });
+
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBe(String(CONFIGURED_WINDOW_MS / 1000));
+  });
+
+  it("keeps the revoke and register rate limits independent of one another", async () => {
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({
+        revokeRateLimit: { limit: 1, windowMs: 60_000 },
+        registerRateLimit: { limit: 5, windowMs: 60_000 },
+      })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    await request(app).post("/revoke").send({ token: "spends-the-one-revoke-slot" });
+    const blockedRevoke = await request(app).post("/revoke").send({ token: "another-guess" });
+    const stillAllowedRegister = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+
+    expect(blockedRevoke.status).toBe(429);
+    expect(stillAllowedRegister.status).toBe(201);
+  });
+});
+
+describe("allowPrivateCimdHosts option flows from createShopifyMcpOAuth through to /authorize", () => {
+  const PRIVATE_CIMD_CLIENT_ID = "https://127.0.0.1/metadata.json";
+  const CODE_CHALLENGE = "a".repeat(43);
+  const authorizeQuery = {
+    response_type: "code",
+    client_id: PRIVATE_CIMD_CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    state: "client-state",
+    code_challenge: CODE_CHALLENGE,
+    code_challenge_method: "S256",
+  };
+
+  function buildAppWithOptions(options: BuildRouterOptions) {
+    const cimdResponse = new Response(JSON.stringify({ client_name: "Test Client", redirect_uris: [REDIRECT_URI] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({ fetchImpl: vi.fn().mockResolvedValue(cimdResponse) as unknown as typeof fetch }),
+      options
+    );
+    const app = express();
+    app.use(oauth.router);
+    return app;
+  }
+
+  it("rejects a private-host CIMD client_id by default (options omitted)", async () => {
+    const response = await request(buildAppWithOptions({})).get("/authorize").query(authorizeQuery);
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_client");
+  });
+
+  it("allows a private-host CIMD client_id through when allowPrivateCimdHosts is true", async () => {
+    const response = await request(buildAppWithOptions({ allowPrivateCimdHosts: true }))
+      .get("/authorize")
+      .query(authorizeQuery);
+    expect(response.status).toBe(302);
+  });
+});
+```
+
+`src/middlewares/errorHandler.test.ts`:
+
+```ts
+import express from "express";
+import request from "supertest";
+import { describe, expect, it, vi } from "vitest";
+import type { Logger } from "../types";
+import { errorHandler } from "./errorHandler";
+
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
+
+// Stands in for a consumer's own body-parser (or any middleware mounted ahead of this package's
+// router) throwing before a request ever reaches inside it — the exact scenario errorHandler.ts
+// exists to close. `next(err)` is how Express itself routes a thrown/rejected error to the next
+// error-handling middleware in the same stack; this fake reproduces that hand-off without needing
+// a real malformed body on the wire.
+function buildApp(logger: Logger) {
+  const app = express();
+  app.get("/probe", (_req, _res, next) => {
+    next(new Error("storage unavailable: connection to db.internal.example refused"));
+  });
+  app.use(errorHandler(logger));
+  return app;
+}
+
+describe("errorHandler", () => {
+  it("converts an error passed via next() into a generic 500", async () => {
+    const response = await request(buildApp(silentLogger)).get("/probe");
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+  });
+
+  it("never lets the original error message or stack reach the response body", async () => {
+    const response = await request(buildApp(silentLogger)).get("/probe");
+    const raw = JSON.stringify(response.body);
+    expect(raw).not.toContain("db.internal.example");
+    expect(raw).not.toContain(".ts:");
+  });
+
+  it("logs the failure instead of swallowing it silently", async () => {
+    const errorLog = vi.fn();
+    await request(buildApp({ info: () => {}, warn: () => {}, error: errorLog })).get("/probe");
+    expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards to next(err) instead of double-responding once headers are already sent", async () => {
+    const nextSpy = vi.fn();
+    const app = express();
+    app.get("/probe", (_req, res, next) => {
+      res.status(200).json({ ok: true });
+      next(new Error("failure after the response was already flushed"));
+    });
+    app.use(errorHandler(silentLogger));
+    app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+      nextSpy(err);
+      next(err);
+    });
+    const response = await request(app).get("/probe");
+    expect(response.status).toBe(200);
+    expect(nextSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("produces the exact same body as asyncHandler's own generic 500, so the two can never drift", async () => {
+    const { asyncHandler } = await import("../controllers/asyncHandler");
+    const asyncHandlerApp = express();
+    asyncHandlerApp.get(
+      "/probe",
+      asyncHandler(silentLogger, async () => {
+        throw new Error("boom");
+      })
+    );
+    const fromAsyncHandler = await request(asyncHandlerApp).get("/probe");
+    const fromErrorHandler = await request(buildApp(silentLogger)).get("/probe");
+    expect(fromErrorHandler.body).toEqual(fromAsyncHandler.body);
+    expect(fromErrorHandler.status).toBe(fromAsyncHandler.status);
   });
 });
 ```
@@ -8560,30 +9149,71 @@ Delete the placeholder test file from Task 1:
 rm packages/shopify-mcp-oauth/src/index.test.ts
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm --filter shopify-mcp-oauth test src/router.test.ts`
-Expected: FAIL — `createShopifyMcpOAuth` is not exported from `./index`.
+Run: `pnpm --filter shopify-mcp-oauth test src/router.test.ts src/middlewares/errorHandler.test.ts`
+Expected: FAIL — `createShopifyMcpOAuth` is not exported from `./index`, and `./errorHandler` does
+not resolve.
 
-- [ ] **Step 3: Write `src/router.ts`**
+- [ ] **Step 3: Write `src/middlewares/errorHandler.ts`**
+
+```ts
+import type { ErrorRequestHandler } from "express";
+import { GENERIC_SERVER_ERROR_BODY } from "../controllers/asyncHandler";
+import type { Logger } from "../types";
+
+// asyncHandler (controllers/asyncHandler.ts) only ever sees an error that occurs *inside* a
+// wrapped controller. A body-parser mounted ahead of this package's router — e.g. the consumer's
+// own `app.use(express.json())` — throws its SyntaxError before any request reaches inside the
+// router at all, so no per-route guard, asyncHandler included, ever runs for it; left alone,
+// Express's own default handler answers with an HTML stack trace instead.
+//
+// Express only ever searches for the next error-handling (4-arg) middleware within the stack
+// level where the error occurred. A sub-router mounted via `app.use(router)` is itself an
+// ordinary (3-arg) layer to its parent, so an error thrown before the router is reached skips
+// over the router's *entire* internal stack, including any error handler mounted inside it —
+// verified empirically, not assumed. In one sentence: an error thrown by a parent-level
+// middleware (the consumer's own body-parser, above all) never enters this package's router at
+// all, so nothing mounted inside `buildRouter`'s own Router (see ../router.ts) can ever catch it.
+// This export exists so the consumer can *also* mount it — as their own app's LAST `app.use(...)`
+// call, after their body-parsers AND after `app.use(oauth.router)`, never inside a router of
+// their own — which closes that gap, because at that point it shares the same stack level the
+// body-parser error occurred in. Both mounts matter and do different jobs: this one (exported on
+// `ShopifyMcpOAuth.errorHandler`) protects the whole app; the one router.ts mounts internally
+// protects anything that throws synchronously inside the router's own stack (a middleware this
+// package mounts itself, or a future controller that forgets to wrap with asyncHandler) even if
+// the consumer never wires the app-level one. Don't "simplify" this down to one mount — see
+// router.ts's own mutation-tested proof that each one guards a different origin.
+export function errorHandler(logger: Logger): ErrorRequestHandler {
+  return (err, _req, res, next) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    logger.error("shopify-mcp-oauth: unhandled error", err);
+    res.status(500).json(GENERIC_SERVER_ERROR_BODY);
+  };
+}
+```
+
+- [ ] **Step 4: Write `src/router.ts`**
 
 ```ts
 import { Router } from "express";
 import type { ResolvedConfig } from "./config";
 import { authorizeController } from "./controllers/authorize";
-import {
-  authorizationServerMetadataController,
-  protectedResourceMetadataController,
-} from "./controllers/metadata";
+import { authorizationServerMetadataController, protectedResourceMetadataController } from "./controllers/metadata";
 import { openaiAppsChallengeController } from "./controllers/openaiAppsChallenge";
 import { registerController } from "./controllers/register";
 import { revokeController } from "./controllers/revoke";
 import { shopifyCallbackController } from "./controllers/shopifyCallback";
 import { tokenController } from "./controllers/token";
+import { errorHandler } from "./middlewares/errorHandler";
 import { createRateLimiter } from "./middlewares/rateLimit";
 import { requireShopifyHmac } from "./middlewares/verifyShopifyHmac";
 
 export interface BuildRouterOptions {
+  /** Test-only escape hatch: skips the CIMD private-address guard. Never set this in production. */
   allowPrivateCimdHosts?: boolean;
 }
 
@@ -8613,29 +9243,64 @@ export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions 
   );
 
   router.get("/authorize", authorizeController(config, { allowPrivateCimdHosts: options.allowPrivateCimdHosts }));
+  // The HMAC guard runs first: it must reject a forged callback before shopifyCallbackController
+  // ever sees the request, not merely alongside it. See middlewares/verifyShopifyHmac.ts for why
+  // this has to check the raw query string (req.originalUrl), never req.query.
   router.get(
     "/oauth/shopify-callback",
     requireShopifyHmac(config.shopify.apiSecret),
     shopifyCallbackController(config)
   );
   router.post("/token", tokenController(config));
-  router.post("/revoke", revokeController(config));
+  // RFC 7009 requires this to answer 200 regardless of whether the token existed, so it can't be
+  // used as a token-guessing oracle -- but it's still free unauthenticated work (two hash +
+  // storage lookups per request), the same shape /register's limiter guards against. Its own
+  // config field (revokeRateLimit), not registerRateLimit: the two endpoints see very different
+  // legitimate call volume and must be tunable independently.
+  router.post(
+    "/revoke",
+    createRateLimiter({ limit: config.revokeRateLimit.limit, windowMs: config.revokeRateLimit.windowMs }),
+    revokeController(config)
+  );
+
+  // Defense in depth for anything that throws synchronously *inside* this router's own stack --
+  // a middleware mounted above (requireShopifyHmac, createRateLimiter) or a future controller that
+  // forgets to wrap with asyncHandler. This mount cannot, by itself, catch an error from
+  // middleware the consumer mounts before `app.use(oauth.router)` (their own body-parser,
+  // typically) -- Express only searches for an error handler within the stack level where the
+  // error occurred, and a mounted Router is an ordinary (3-arg) layer to its parent, so the
+  // parent's dispatch skips over this entire router when an error is already pending there. See
+  // middlewares/errorHandler.ts, and the same `errorHandler` this package also exports on
+  // `ShopifyMcpOAuth` for the consumer-mounted half of that fix.
+  router.use(errorHandler(config.logger));
 
   return router;
 }
 ```
 
-- [ ] **Step 4: Rewrite `src/index.ts` with the full export surface**
+- [ ] **Step 5: Rewrite `src/index.ts` with the full export surface**
 
 ```ts
-import type { RequestHandler, Router } from "express";
+import type { ErrorRequestHandler, RequestHandler, Router } from "express";
 import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
+import { errorHandler } from "./middlewares/errorHandler";
 import { requireAuth } from "./middlewares/requireAuth";
 import { buildRouter, type BuildRouterOptions } from "./router";
 
 export interface ShopifyMcpOAuth {
   router: Router;
   requireAuth: RequestHandler;
+  /**
+   * Mount this as the LAST `app.use(...)` call on YOUR OWN top-level Express app -- after your
+   * own body-parsers (e.g. `express.json()`) AND after `app.use(router)` -- never inside a
+   * router of your own. Express only looks for an error handler within the stack level where an
+   * error occurred, and a mounted Router is an ordinary layer to its parent, so an error thrown
+   * by a parent-level middleware (your body-parser included) never enters this package's router
+   * at all -- nothing mounted anywhere but your app's own final middleware can catch it. Get the
+   * placement wrong and such an error falls through to Express's own default handler instead,
+   * which answers with an HTML stack trace on an unauthenticated endpoint.
+   */
+  errorHandler: ErrorRequestHandler;
 }
 
 export function createShopifyMcpOAuth(
@@ -8646,6 +9311,7 @@ export function createShopifyMcpOAuth(
   return {
     router: buildRouter(resolved, options),
     requireAuth: requireAuth(resolved),
+    errorHandler: errorHandler(resolved.logger),
   };
 }
 
@@ -8661,6 +9327,7 @@ export {
 } from "./adapters/shopifySessionStorage";
 export { resolveConfig, type ResolvedConfig, type ShopifyMcpOAuthConfig } from "./config";
 export { OAuthError } from "./errors";
+export { createRateLimiter, type RateLimiterOptions } from "./middlewares/rateLimit";
 export type { BuildRouterOptions } from "./router";
 export type {
   CacheStore,
@@ -8675,20 +9342,23 @@ export type {
 } from "./types";
 ```
 
-- [ ] **Step 5: Run the whole suite**
+- [ ] **Step 6: Run the whole suite**
 
 Run: `pnpm --filter shopify-mcp-oauth test`
-Expected: PASS — every test from Tasks 2–20, including the 13 in `router.test.ts`.
+Expected: PASS — every test from Tasks 2–20, including the 25 in `router.test.ts` and the 5 in
+`middlewares/errorHandler.test.ts`.
 
-- [ ] **Step 6: Verify typecheck and build**
+- [ ] **Step 7: Verify typecheck and build**
 
 Run: `pnpm --filter shopify-mcp-oauth typecheck && pnpm --filter shopify-mcp-oauth build`
 Expected: no errors; `dist/` contains `index.js`, `index.cjs`, `index.d.ts`, `testing.js`, `testing.cjs`, `testing.d.ts`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add packages/shopify-mcp-oauth/src/router.ts packages/shopify-mcp-oauth/src/router.test.ts packages/shopify-mcp-oauth/src/index.ts
+git add packages/shopify-mcp-oauth/src/router.ts packages/shopify-mcp-oauth/src/router.test.ts \
+  packages/shopify-mcp-oauth/src/middlewares/errorHandler.ts packages/shopify-mcp-oauth/src/middlewares/errorHandler.test.ts \
+  packages/shopify-mcp-oauth/src/index.ts
 git rm --cached packages/shopify-mcp-oauth/src/index.test.ts 2>/dev/null || true
 git add -A
 git commit -m "feat: assemble the oauth router and public package exports"
