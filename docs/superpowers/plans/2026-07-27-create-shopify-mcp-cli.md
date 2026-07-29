@@ -1902,6 +1902,7 @@ app.use(oauth.errorHandler);
 | `registerRateLimit` | no | `{ limit: 20, windowMs: 3600000 }` | Dynamic client registration is unauthenticated by definition. |
 | `revokeRateLimit` | no | `{ limit: 20, windowMs: 3600000 }` | `/revoke` is also unauthenticated by design (RFC 7009) — its own field, tuned independently of `registerRateLimit`. |
 | `logger` | no | `console` | Anything with `info` / `warn` / `error`. |
+| `fetchImpl` | no | the global `fetch` | Test seam: the package uses this for Shopify's own token exchange and for fetching client-metadata documents. |
 
 Configuration is validated when you construct it. A missing or malformed value throws immediately,
 naming the field — never at the first request.
@@ -2085,15 +2086,23 @@ const storage: OAuthStorage = {
 
 ## Proving it
 
-The package ships the same suite it runs against its own adapters:
+The package ships the same suites it runs against its own adapters — one for `OAuthStorage`, one
+for `CacheStore`:
 
 ```ts
-import { runStorageContractTests } from "shopify-mcp-oauth/testing";
+import { runCacheContractTests, runStorageContractTests } from "shopify-mcp-oauth/testing";
 
 runStorageContractTests(() => myStorage(), {
   seedShop: { id: "shop_1", domain: "demo.myshopify.com" },
 });
+
+// Exercises the atomic-getdel guarantee directly: of several callers racing the same key,
+// exactly one may see the value. A get-then-del implementation fails this every time.
+runCacheContractTests(() => myCache());
 ```
+
+If you're writing a custom `CacheStore`, running this against it is the only way to know `getdel`
+is actually atomic rather than merely present — the type system can't check that for you.
 
 It covers expiry filtering, revocation semantics, hash uniqueness, null handling, and the one-time-use
 guarantee on `revokeToken`. If it passes, the package will work against your storage.
