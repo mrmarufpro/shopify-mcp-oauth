@@ -10,9 +10,11 @@ export interface ToolContext {
   mcpClient: string;
 }
 
+/** The index signature is what makes this assignable to the SDK's passthrough-inferred CallToolResult. */
 export interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+  [key: string]: unknown;
 }
 
 export interface WithAuditLogOptions<TSchema extends z.ZodTypeAny> {

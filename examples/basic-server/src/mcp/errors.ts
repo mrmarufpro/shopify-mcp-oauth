@@ -9,6 +9,7 @@ export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 export interface ToolErrorContent {
   content: Array<{ type: "text"; text: string }>;
   isError: true;
+  [key: string]: unknown;
 }
 
 export class McpToolError extends Error {
