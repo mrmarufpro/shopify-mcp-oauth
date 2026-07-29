@@ -9423,7 +9423,11 @@ function buildApp() {
 }
 
 function signShopifyCallback(params: Record<string, string>): string {
-  const message = new URLSearchParams(params).toString();
+  // Sorted by key, mirroring the algorithm verifyShopifyHmac applies (see
+  // middlewares/verifyShopifyHmac.test.ts's own signQuery) -- an insertion-order message would
+  // produce a different digest and this fixture would 400 at the package's own HMAC gate.
+  const sortedEntries = Object.entries(params).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  const message = new URLSearchParams(sortedEntries).toString();
   const hmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
   return `${message}&hmac=${hmac}`;
 }
