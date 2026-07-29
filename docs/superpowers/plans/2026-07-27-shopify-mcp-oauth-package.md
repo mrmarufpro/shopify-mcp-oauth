@@ -368,6 +368,10 @@ coverage/
 .env
 .DS_Store
 packages/create-shopify-mcp/templates/
+# AI-agent working state: task briefs, reviews, and diffs generated during development. Zero
+# tracked files today, but not previously ignored either -- a single `git add .` would have swept
+# in every ledger and review, including internal reasoning and app names.
+.superpowers/
 ```
 
 `.prettierignore` — without this, the `prettier --check .` lint gate fails on the lockfile,
@@ -1354,6 +1358,24 @@ export function runStorageContractTests(
       expect(await storage.findTokenByAccessHash("revoke-me")).toBeNull();
     });
 
+    it("round-trips a token's resource field", async () => {
+      // Deliberately not buildToken's own default resource -- a fixture that coincided with it
+      // would pass even if an adapter silently dropped the field and fell back to some default.
+      const DISTINCT_RESOURCE = "https://mcp.example.com/mcp/reports";
+      const created = await storage.createToken(
+        buildToken(opts.seedShop, { accessTokenHash: "resource-roundtrip-hash", resource: DISTINCT_RESOURCE })
+      );
+      expect(created.resource).toBe(DISTINCT_RESOURCE);
+      const found = await storage.findTokenByAccessHash("resource-roundtrip-hash");
+      expect(found?.resource).toBe(DISTINCT_RESOURCE);
+    });
+
+    it("does not match an access hash by prefix or superset", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "full-access-hash-1234567890" }));
+      expect(await storage.findTokenByAccessHash("full-access-hash-123456789")).toBeNull();
+      expect(await storage.findTokenByAccessHash("full-access-hash-1234567890-extra")).toBeNull();
+    });
+
     it("findTokenByAccessHashIgnoringExpiry finds an expired-but-unrevoked token", async () => {
       await storage.createToken(
         buildToken(opts.seedShop, {
@@ -1377,6 +1399,14 @@ export function runStorageContractTests(
       expect(await storage.findTokenByAccessHashIgnoringExpiry("never-stored-access-hash")).toBeNull();
     });
 
+    it("does not match findTokenByAccessHashIgnoringExpiry by prefix or superset", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { accessTokenHash: "full-ignoring-expiry-hash-1234567890" }));
+      expect(await storage.findTokenByAccessHashIgnoringExpiry("full-ignoring-expiry-hash-123456789")).toBeNull();
+      expect(
+        await storage.findTokenByAccessHashIgnoringExpiry("full-ignoring-expiry-hash-1234567890-extra")
+      ).toBeNull();
+    });
+
     it("finds a token by its refresh hash", async () => {
       await storage.createToken(
         buildToken(opts.seedShop, { refreshTokenHash: "refresh-lookup", clientId: CONTRACT_CLIENT_ID })
@@ -1387,6 +1417,12 @@ export function runStorageContractTests(
 
     it("returns null for a refresh hash that was never stored", async () => {
       expect(await storage.findTokenByRefreshHash("never-stored-refresh-hash")).toBeNull();
+    });
+
+    it("does not match a refresh hash by prefix or superset", async () => {
+      await storage.createToken(buildToken(opts.seedShop, { refreshTokenHash: "full-refresh-hash-1234567890" }));
+      expect(await storage.findTokenByRefreshHash("full-refresh-hash-123456789")).toBeNull();
+      expect(await storage.findTokenByRefreshHash("full-refresh-hash-1234567890-extra")).toBeNull();
     });
 
     it("does not return an expired refresh token", async () => {
@@ -2644,6 +2680,67 @@ describe("resolveConfig", () => {
     expect(resolveConfig(buildConfig()).registerRateLimit).toEqual({ limit: 20, windowMs: 3_600_000 });
   });
 
+  it("defaults the revoke rate limit to 20 per hour", () => {
+    expect(resolveConfig(buildConfig()).revokeRateLimit).toEqual({ limit: 20, windowMs: 3_600_000 });
+  });
+
+  it("keeps an explicit revoke rate limit instead of the default", () => {
+    const revokeRateLimit = { limit: 5, windowMs: 30_000 };
+    expect(resolveConfig(buildConfig({ revokeRateLimit })).revokeRateLimit).toEqual(revokeRateLimit);
+  });
+
+  it("keeps registerRateLimit and revokeRateLimit independently tunable", () => {
+    const resolved = resolveConfig(
+      buildConfig({ registerRateLimit: { limit: 1, windowMs: 1000 }, revokeRateLimit: { limit: 2, windowMs: 2000 } })
+    );
+    expect(resolved.registerRateLimit).toEqual({ limit: 1, windowMs: 1000 });
+    expect(resolved.revokeRateLimit).toEqual({ limit: 2, windowMs: 2000 });
+  });
+
+  // A default nothing pins is exactly how rateLimit.ts's own maxEntries default nearly shipped
+  // unbounded — this is that lesson applied here, not a hypothetical.
+  it("defaults the CIMD fetch concurrency cap to 10", () => {
+    expect(resolveConfig(buildConfig()).cimdFetchConcurrency).toBe(10);
+  });
+
+  it("keeps an explicit cimdFetchConcurrency instead of the default", () => {
+    expect(resolveConfig(buildConfig({ cimdFetchConcurrency: 3 })).cimdFetchConcurrency).toBe(3);
+  });
+
+  it("builds a cimdFetchLimiter from the resolved cimdFetchConcurrency", async () => {
+    // Not just "a limiter exists" — it must actually enforce the configured number, not some
+    // other hardcoded value. See services/cimd.test.ts for the request-level version of this same
+    // proof, driven through resolveCimdClient rather than the limiter's own run() directly.
+    const resolved = resolveConfig(buildConfig({ cimdFetchConcurrency: 1 }));
+    const started = new Set<string>();
+    function buildTask(name: string): { task: () => Promise<void>; release: () => void } {
+      let releaseFn: (() => void) | undefined;
+      return {
+        task: () => {
+          started.add(name);
+          return new Promise<void>((resolve) => {
+            releaseFn = resolve;
+          });
+        },
+        release: () => releaseFn?.(),
+      };
+    }
+    const first = buildTask("first");
+    const second = buildTask("second");
+
+    const results = Promise.all([
+      resolved.cimdFetchLimiter.run(first.task),
+      resolved.cimdFetchLimiter.run(second.task),
+    ]);
+    await vi.waitFor(() => expect(started.has("first")).toBe(true));
+    expect(started.has("second")).toBe(false);
+
+    first.release();
+    await vi.waitFor(() => expect(started.has("second")).toBe(true));
+    second.release();
+    await results;
+  });
+
   it("supplies a memory cache when none is given", () => {
     expect(resolveConfig(buildConfig()).cache).toBeDefined();
   });
@@ -2717,6 +2814,19 @@ describe("resolveConfig", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("redisCache"));
   });
 
+  it("does not claim the fallback cache holds rate-limit counters -- those are process-local, not cached", () => {
+    // The /register rate limiter (rateLimit.ts) never touches `cache` at all -- it's an
+    // in-process Map, independent of whichever CacheStore resolveConfig picks. An earlier
+    // version of this warning said otherwise; this pins the correction.
+    const warn = vi.fn();
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() } }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    const warningMessage = warn.mock.calls[0]![0];
+    expect(warningMessage).not.toContain("rate-limit counters");
+    expect(warningMessage).toContain("registerRateLimit");
+    expect(warningMessage).toContain("revokeRateLimit");
+  });
+
   it("does not warn when a cache is supplied", () => {
     const warn = vi.fn();
     resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, cache: memoryCache() }));
@@ -2735,11 +2845,25 @@ Expected: FAIL — cannot resolve `./config`.
 ```ts
 import { z } from "zod";
 import { memoryCache } from "./adapters/memoryCache";
+import { createConcurrencyLimiter, type ConcurrencyLimiter } from "./services/concurrencyLimiter";
 import type { CacheStore, Logger, OAuthStorage } from "./types";
 
 const DEFAULT_ACCESS_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30;
 const DEFAULT_REGISTER_RATE_LIMIT = { limit: 20, windowMs: 60 * 60 * 1000 };
+const DEFAULT_REVOKE_RATE_LIMIT = { limit: 20, windowMs: 60 * 60 * 1000 };
+// An unauthenticated caller can drive /authorize with an unlimited number of distinct CIMD
+// client_id URLs (see services/cimd.ts), each holding an outbound HTTPS connection open for up to
+// TIMEOUT_MS (3s) with no bound on how many run at once — real resource exhaustion on the first
+// endpoint any client touches, on every default deployment, not only a misconfigured one. 10 is a
+// sane default for a single Node process: generous enough that a legitimate burst of distinct
+// CIMD clients queues rather than serializes to uselessness, small enough that a flood of bogus
+// URLs can never hold open more than 10 outbound sockets at once regardless of how many requests
+// arrive. Deliberately NOT a per-IP limiter (see rateLimit.ts's own req.ip/trust-proxy caveat) —
+// this bounds the shared, expensive resource itself, so it can't be defeated by trust-proxy
+// bucket-collapse the way an IP-keyed limiter could, and it can't false-positive-lock out a
+// legitimate caller the way a request-rate limiter would on the worst possible endpoint for that.
+const DEFAULT_CIMD_FETCH_CONCURRENCY = 10;
 
 export interface ShopifyMcpOAuthConfig {
   host: string;
@@ -2756,6 +2880,25 @@ export interface ShopifyMcpOAuthConfig {
    * a cache-backed counter isn't a safe substitute.
    */
   registerRateLimit?: { limit: number; windowMs: number };
+  /**
+   * Caps requests to the unauthenticated `/revoke` endpoint. Same process-local shape as
+   * `registerRateLimit` above (see its own doc comment) — its own field rather than sharing
+   * registerRateLimit because the two endpoints see different legitimate call volume and must be
+   * tunable independently. RFC 7009 requires `/revoke` to answer 200 whether or not the submitted
+   * token existed, so this isn't guarding against it being used as a token-guessing oracle (the
+   * response never reveals that either way) — only against unlimited free work (two hash +
+   * storage lookups per request) from an unauthenticated caller.
+   */
+  revokeRateLimit?: { limit: number; windowMs: number };
+  /**
+   * Caps how many CIMD client_id documents (see services/cimd.ts) this process fetches over the
+   * network at once, across every /authorize request combined — not per caller, and not a
+   * request-rate limit. Defaults to 10. Requests beyond the cap queue (FIFO) for a free slot
+   * rather than being rejected; each fetch is itself already bounded to a few seconds by this
+   * package's own internal timeout, so a queued caller waits at most a few cap-sized batches, not
+   * indefinitely.
+   */
+  cimdFetchConcurrency?: number;
   logger?: Logger;
   fetchImpl?: typeof fetch;
 }
@@ -2770,6 +2913,10 @@ export interface ResolvedConfig {
   tokenTtl: { access: number; refresh: number };
   openaiAppsChallengeToken: string | null;
   registerRateLimit: { limit: number; windowMs: number };
+  revokeRateLimit: { limit: number; windowMs: number };
+  /** The resolved (defaulted or explicit) cap `cimdFetchLimiter` below was actually built from. */
+  cimdFetchConcurrency: number;
+  cimdFetchLimiter: ConcurrencyLimiter;
   logger: Logger;
   fetchImpl: typeof fetch;
 }
@@ -2826,6 +2973,8 @@ const configSchema = z.object({
     .optional(),
   openaiAppsChallengeToken: z.string().min(1).nullish(),
   registerRateLimit: z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() }).optional(),
+  revokeRateLimit: z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() }).optional(),
+  cimdFetchConcurrency: z.number().int().positive().optional(),
 });
 
 export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
@@ -2847,6 +2996,8 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
 
   if (!input.cache) logger.warn(CACHE_FALLBACK_WARNING);
 
+  const cimdFetchConcurrency = parsed.data.cimdFetchConcurrency ?? DEFAULT_CIMD_FETCH_CONCURRENCY;
+
   return {
     host,
     resource: `${host}/mcp`,
@@ -2860,6 +3011,9 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
     },
     openaiAppsChallengeToken: parsed.data.openaiAppsChallengeToken ?? null,
     registerRateLimit: parsed.data.registerRateLimit ?? DEFAULT_REGISTER_RATE_LIMIT,
+    revokeRateLimit: parsed.data.revokeRateLimit ?? DEFAULT_REVOKE_RATE_LIMIT,
+    cimdFetchConcurrency,
+    cimdFetchLimiter: createConcurrencyLimiter(cimdFetchConcurrency),
     logger,
     fetchImpl: input.fetchImpl ?? fetch,
   };
@@ -2869,7 +3023,7 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `pnpm --filter shopify-mcp-oauth test src/config.test.ts`
-Expected: PASS, 11 tests.
+Expected: PASS, 30 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -3892,12 +4046,17 @@ import { createDcrClient } from "./clients";
 
 const REDIRECT_URI = "https://client.example/callback";
 
+// Silent by default so the no-cache warning does not spray stderr across every case, matching
+// the convention in config.test.ts.
+const silentLogger = { info: () => {}, warn: () => {}, error: () => {} };
+
 function buildConfig(): ResolvedConfig {
   return resolveConfig({
     host: "https://mcp.example.com",
     shopify: { apiKey: "test-api-key", apiSecret: "test-api-secret", scopes: "read_products" },
     stateSecret: "test-state-secret-at-least-32-bytes-long",
     storage: memoryStorage(),
+    logger: silentLogger,
   });
 }
 
@@ -3939,8 +4098,10 @@ describe("createDcrClient", () => {
 
 ```ts
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { memoryCache } from "../adapters/memoryCache";
 import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
+import { OAuthError } from "../errors";
 import type { CacheStore } from "../types";
 import { isCimdClientId, resolveCimdClient } from "./cimd";
 
@@ -4170,6 +4331,158 @@ describe("resolveCimdClient", () => {
     await expect(resolveCimdClient(config, "https://localhost/doc.json")).rejects.toThrow(/private/);
   });
 
+  it("does not put the DNS-resolved address in the client-facing error, unlike the literal-IP case", async () => {
+    // The literal-IP branch (e.g. "rejects a private-address host" above) is safe to echo back —
+    // the caller supplied that IP themselves. This is the DNS branch: the resolved address is
+    // *our* resolver's answer, which split-horizon DNS means can differ from the caller's own, so
+    // it must not appear in the response even though it's fine to log for our own diagnostics.
+    const warnSpy = vi.fn();
+    const config = buildConfig(buildFetch(CIMD_DOC), {
+      // Also supplied so the "no cache configured" warning (which every other test in this file
+      // avoids only by routing through silentLogger) doesn't land on this same spy and make the
+      // call count assertion below about the wrong warning.
+      cache: memoryCache(),
+      logger: { info: () => {}, warn: warnSpy, error: () => {} },
+    });
+    const error = await resolveCimdClient(config, "https://localhost/doc.json").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(OAuthError);
+    expect((error as OAuthError).description).toBe("CIMD URL host localhost resolves to a private/loopback address");
+    expect((error as OAuthError).description).not.toMatch(/\d+\.\d+\.\d+\.\d+/);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const loggedMessage = warnSpy.mock.calls[0]?.[0] as string;
+    expect(loggedMessage).toContain("localhost");
+    // Either form, not "private|loopback" alone -- that text is fixed regardless of whether the
+    // resolved address actually made it into the log, so it wouldn't catch the address being
+    // dropped. "localhost" resolves to ::1 first on some systems (this one included) and to
+    // 127.0.0.1 first on others, so pinning one order would be flaky.
+    expect(loggedMessage).toMatch(/127\.0\.0\.1|::1/);
+  });
+
+  describe("concurrency cap on in-flight CIMD fetches", () => {
+    // Distinct URLs, never seen before -- each must independently miss both the success cache and
+    // storage and reach the actual fetch, which is what lets this test observe the cap rather than
+    // the unrelated single-flight caching proven above.
+    const URL_A = "https://client-a.example/doc.json";
+    const URL_B = "https://client-b.example/doc.json";
+    const URL_C = "https://client-c.example/doc.json";
+
+    // A fetchImpl that reports which url it was called with into `started` the moment its own
+    // call runs, then hangs until this test explicitly releases that specific url. `started` is a
+    // Set (a fact that, once true, stays true), so a test can `vi.waitFor` on it without racing a
+    // counter that's transiently at the target value for an unrelated reason.
+    function buildControllableFetch(): {
+      fetchImpl: typeof fetch;
+      started: Set<string>;
+      release: (url: string) => void;
+    } {
+      const started = new Set<string>();
+      const releasers = new Map<string, () => void>();
+      const fetchImpl = vi.fn().mockImplementation(async (url: string) => {
+        started.add(url);
+        await new Promise<void>((resolve) => releasers.set(url, resolve));
+        return new Response(JSON.stringify(CIMD_DOC), { status: 200, headers: { "content-type": "application/json" } });
+      }) as unknown as typeof fetch;
+      return { fetchImpl, started, release: (url) => releasers.get(url)?.() };
+    }
+
+    it("limits concurrent CIMD fetches to config.cimdFetchConcurrency, queueing the rest", async () => {
+      const { fetchImpl, started, release } = buildControllableFetch();
+      const config = buildConfig(fetchImpl, { cimdFetchConcurrency: 2 });
+
+      const resolutions = [
+        resolveCimdClient(config, URL_A, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_B, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_C, { allowPrivateHosts: true }),
+      ];
+
+      await vi.waitFor(() => expect(started.has(URL_A) && started.has(URL_B)).toBe(true));
+      // The cap is only proven if the third genuinely hasn't started -- otherwise this is
+      // indistinguishable from a limiter that never actually queues anything.
+      expect(started.has(URL_C)).toBe(false);
+
+      release(URL_A);
+      await vi.waitFor(() => expect(started.has(URL_C)).toBe(true));
+
+      release(URL_B);
+      release(URL_C);
+      const docs = await Promise.all(resolutions);
+      expect(docs.map((doc) => doc.client_name)).toEqual(["Fetched Client", "Fetched Client", "Fetched Client"]);
+    });
+
+    it("lets every fetch proceed at once when the cap is not reached", async () => {
+      const { fetchImpl, started, release } = buildControllableFetch();
+      const config = buildConfig(fetchImpl, { cimdFetchConcurrency: 3 });
+
+      const resolutions = [
+        resolveCimdClient(config, URL_A, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_B, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_C, { allowPrivateHosts: true }),
+      ];
+
+      await vi.waitFor(() => expect(started.has(URL_A) && started.has(URL_B) && started.has(URL_C)).toBe(true));
+      release(URL_A);
+      release(URL_B);
+      release(URL_C);
+      await Promise.all(resolutions);
+    });
+  });
+
+  describe("negative caching a failed fetch", () => {
+    it("does not re-fetch a CIMD URL that recently failed within the negative-cache TTL", async () => {
+      const fetchImpl = buildFetch("not found", { status: 404 });
+      const config = buildConfig(fetchImpl);
+
+      await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+      await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-fetches once the negative-cache TTL has elapsed", async () => {
+      vi.useFakeTimers();
+      try {
+        const fetchImpl = buildFetch("not found", { status: 404 });
+        const config = buildConfig(fetchImpl);
+
+        await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+        vi.advanceTimersByTime(CIMD_NEGATIVE_CACHE_TTL_SECONDS * 1000 + 1000);
+        await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+
+        expect(fetchImpl).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not shadow a client that started succeeding again after a past failure", async () => {
+      // A negative-cache entry from an earlier failed attempt must never win over a genuine
+      // document once storage actually has one -- storage is only ever populated by a SUCCESSFUL
+      // fetch, so its presence is authoritative regardless of what the negative cache still says.
+      const cache = memoryCache();
+      const failingFetch = buildFetch("not found", { status: 404 });
+      const config = buildConfig(failingFetch, { cache });
+      await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+
+      // Simulates the client's document having been registered through some other path (e.g. a
+      // prior successful fetch on another instance sharing this cache/storage) without waiting
+      // out the negative-cache TTL.
+      await config.storage.createClient({
+        clientId: CIMD_URL,
+        clientName: "Recovered Client",
+        redirectUris: [REDIRECT_URI],
+        grantTypes: null,
+        responseTypes: null,
+        logoUri: null,
+        clientUri: null,
+        tokenEndpointAuthMethod: "none",
+      });
+
+      const doc = await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+      expect(doc.client_name).toBe("Recovered Client");
+      expect(failingFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("SSRF guard: private, loopback, and reserved address families", () => {
     // Each row is an address family the guard must reject that a naive implementation (matching
     // on textual prefixes like "10." or "fe80:") is prone to missing -- particularly the last two,
@@ -4354,6 +4667,86 @@ describe("resolveCimdClient", () => {
       // a regression here previously hung for the full suite timeout with no diagnostic.
       expect(sawAbort()).toBe(true);
       await assertion;
+    });
+
+    it("rejects with an OAuthError, not a raw DOMException, when a stalled body read is aborted by the timeout", async () => {
+      // Companion to the test above: same scenario (a body that stalls past TIMEOUT_MS), but
+      // pinning the *type* the controller actually branches on, not just that the message
+      // happens to contain "abort" -- the two are not the same guarantee.
+      vi.useFakeTimers();
+      const { fetchImpl, sawAbort } = buildStalledBodyFetch();
+      const config = buildConfig(fetchImpl);
+      const resolution = resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+      const caught = resolution.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(CIMD_FETCH_TIMEOUT_MS + 1);
+      expect(sawAbort()).toBe(true);
+      expect(await caught).toBeInstanceOf(OAuthError);
+    });
+
+    it("rejects with an OAuthError, not a raw AbortError, when the timeout fires before the initial fetch resolves", async () => {
+      // Same timer, different call site: the test above stalls after headers arrive (aborting a
+      // pending reader.read()); this one never gets headers at all (aborting the pending
+      // fetchImpl call itself). Both must classify as OAuthError, not a raw DOMException that
+      // falls through the controller's `instanceof OAuthError` check.
+      vi.useFakeTimers();
+      const fetchImpl = vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      }) as unknown as typeof fetch;
+      const config = buildConfig(fetchImpl);
+      const resolution = resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+      const assertion = expect(resolution).rejects.toThrow(/abort/i);
+      await vi.advanceTimersByTimeAsync(CIMD_FETCH_TIMEOUT_MS + 1);
+      await assertion;
+      const error = await resolution.catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(OAuthError);
+    });
+  });
+
+  describe("classifying native network/parse failures as OAuthError", () => {
+    // authorizeController only treats an OAuthError as safe to reflect into a 400; anything else
+    // it rethrows, and asyncHandler turns that into a generic 500 (with a logged stack trace).
+    // Each of these is a native throw/rejection this file's own code does not raise directly, so
+    // without a catch here it would reach the controller as a plain Error/TypeError/DOMException
+    // and 500 instead of 400 -- exactly the regression this describe block guards against.
+
+    it("rejects with an OAuthError, not a raw TypeError, for a malformed client_id URL", async () => {
+      const config = buildConfig(buildFetch(CIMD_DOC));
+      const error = await resolveCimdClient(config, "https://[", { allowPrivateHosts: true }).catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toBeInstanceOf(OAuthError);
+      expect((error as OAuthError).description).toBe("CIMD client_id must be a valid URL");
+    });
+
+    it("rejects with an OAuthError, not a raw DNS error, when the host cannot be resolved", async () => {
+      // ".invalid" is reserved by RFC 2606 to never resolve, so this is a real (not mocked)
+      // dns.lookup failure -- no network access required and no flakiness risk.
+      const config = buildConfig(buildFetch(CIMD_DOC));
+      const error = await resolveCimdClient(config, "https://this-host-does-not-exist.invalid/doc.json").catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toBeInstanceOf(OAuthError);
+      expect((error as OAuthError).description).toBe(
+        "CIMD URL host this-host-does-not-exist.invalid could not be resolved"
+      );
+    });
+
+    it("rejects with an OAuthError, not a raw network error, when the fetch itself fails", async () => {
+      const canaryMessage = "connect ECONNREFUSED 10.1.2.3:443";
+      const fetchImpl = vi.fn().mockRejectedValue(new TypeError(canaryMessage)) as unknown as typeof fetch;
+      const config = buildConfig(fetchImpl);
+      const error = await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true }).catch(
+        (caught: unknown) => caught
+      );
+      expect(error).toBeInstanceOf(OAuthError);
+      expect((error as OAuthError).description).toBe("CIMD document could not be fetched");
+      // Fixed text, not the caught error's message -- the raw network error must not ride along.
+      expect((error as OAuthError).description).not.toContain(canaryMessage);
+      expect((error as OAuthError).description).not.toContain("10.1.2.3");
     });
   });
 
@@ -5417,6 +5810,14 @@ describe("serializeAuthorizationServerMetadata", () => {
     expect(serializeAuthorizationServerMetadata(buildConfig()).code_challenge_methods_supported).toEqual(["S256"]);
   });
 
+  it("advertises none as the revocation endpoint auth method, since every client is public", () => {
+    // RFC 8414 §2 defaults this field to client_secret_basic when absent — omitting it would tell
+    // a spec-following client that /revoke needs HTTP Basic auth, which it never checks.
+    expect(serializeAuthorizationServerMetadata(buildConfig()).revocation_endpoint_auth_methods_supported).toEqual([
+      "none",
+    ]);
+  });
+
   it("declares CIMD support so clients skip registration", () => {
     expect(serializeAuthorizationServerMetadata(buildConfig()).client_id_metadata_document_supported).toBe(true);
   });
@@ -5480,6 +5881,8 @@ describe("metadata controllers", () => {
 
   it("echoes the configured challenge token", async () => {
     const response = await request(buildApp()).get("/.well-known/openai-apps-challenge");
+    expect(response.status).toBe(200);
+    expect(response.type).toBe("text/plain");
     expect(response.text).toBe(CHALLENGE_TOKEN);
   });
 });
@@ -5670,6 +6073,31 @@ describe("revokeController", () => {
     expect(await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token))).toBeNull();
   });
 
+  // RFC 7009 §2.1: token_type_hint is a lookup optimization, and the server MUST fall back to
+  // checking other token types when the hint doesn't resolve. Access and refresh tokens are both
+  // opaque, same-shape random strings, so a client submitting one but hinting the other is
+  // plausible, not hypothetical -- without the fallback, the controller would answer 200 (the same
+  // success response as a real revocation) while the submitted token stayed live.
+  it("still revokes an access token submitted with a mismatched refresh_token hint", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config))
+      .post("/revoke")
+      .send({ token: tokens.access_token, token_type_hint: "refresh_token" });
+    expect(response.status).toBe(200);
+    expect(await config.storage.findTokenByAccessHash(sha256Hex(tokens.access_token))).toBeNull();
+  });
+
+  it("still revokes a refresh token submitted with a mismatched access_token hint", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config))
+      .post("/revoke")
+      .send({ token: tokens.refresh_token, token_type_hint: "access_token" });
+    expect(response.status).toBe(200);
+    expect(await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token))).toBeNull();
+  });
+
   it("answers 200 for a token it has never seen, so it is not an oracle", async () => {
     const response = await request(buildApp(buildConfig())).post("/revoke").send({ token: "never-issued" });
     expect(response.status).toBe(200);
@@ -5768,6 +6196,9 @@ export function serializeAuthorizationServerMetadata(config: ResolvedConfig): Re
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     token_endpoint_auth_methods_supported: ["none"],
+    // RFC 8414 §2 defaults this to client_secret_basic when omitted, which would misdescribe
+    // /revoke as requiring HTTP Basic auth — every client here is public and unauthenticated.
+    revocation_endpoint_auth_methods_supported: ["none"],
     code_challenge_methods_supported: ["S256"],
     scopes_supported: ["mcp:*"],
     client_id_metadata_document_supported: true,
@@ -8575,6 +9006,71 @@ describe("createRateLimiter", () => {
       expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(true);
     });
   });
+
+  describe("input validation", () => {
+    // Task 20 exports this factory on the package's public surface, where a consumer calling it
+    // directly has none of resolveConfig's zod schema in front of them -- these guards are what
+    // stands between a typo'd option and one of the silent-misbehavior cases below.
+    it("throws when windowMs is zero", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: 0 })).toThrow(/windowMs/);
+    });
+
+    it("throws when windowMs is negative", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: -1 })).toThrow(/windowMs/);
+    });
+
+    it("throws when windowMs is NaN", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: NaN })).toThrow(/windowMs/);
+    });
+
+    it("throws when windowMs is Infinity, which would otherwise put a non-finite Retry-After on every blocked response", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: Infinity })).toThrow(/windowMs/);
+    });
+
+    it("throws when limit is negative", () => {
+      expect(() => createRateLimiter({ limit: -1, windowMs: 60_000 })).toThrow(/limit/);
+    });
+
+    it("throws when limit is not an integer", () => {
+      expect(() => createRateLimiter({ limit: 1.5, windowMs: 60_000 })).toThrow(/limit/);
+    });
+
+    it("throws when limit is NaN", () => {
+      expect(() => createRateLimiter({ limit: NaN, windowMs: 60_000 })).toThrow(/limit/);
+    });
+
+    it("throws when maxEntries is zero", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: 60_000, maxEntries: 0 })).toThrow(/maxEntries/);
+    });
+
+    it("throws when maxEntries is not an integer", () => {
+      expect(() => createRateLimiter({ limit: 1, windowMs: 60_000, maxEntries: 2.5 })).toThrow(/maxEntries/);
+    });
+
+    it("accepts limit: 0 as a valid (if unusual) input rather than rejecting it", () => {
+      expect(() => createRateLimiter({ limit: 0, windowMs: 60_000 })).not.toThrow();
+    });
+  });
+
+  describe("limit: 0 blocks every request", () => {
+    it("blocks the very first request in a brand-new window, not just requests after it", async () => {
+      // Before this fix, a fresh window's first request skipped the limit check entirely and was
+      // always let through -- correct for any limit >= 1, but silently wrong for limit: 0, which
+      // this test would otherwise report as 201 instead of the 429 "block everything" its value
+      // claims.
+      const app = buildApp({ limit: 0, windowMs: 60_000 });
+      const response = await request(app).post("/register");
+      expect(response.status).toBe(429);
+      expect(response.body.error).toBe("too_many_requests");
+    });
+
+    it("keeps blocking every subsequent request in the same window too", async () => {
+      const app = buildApp({ limit: 0, windowMs: 60_000 });
+      await request(app).post("/register");
+      const second = await request(app).post("/register");
+      expect(second.status).toBe(429);
+    });
+  });
 });
 ```
 
@@ -9537,6 +10033,15 @@ import { buildRouter, type BuildRouterOptions } from "./router";
 
 export interface ShopifyMcpOAuth {
   router: Router;
+  /**
+   * Mount on any route this server considers protected, after `app.use(oauth.router)`. On success,
+   * populates `req.mcp` (see the exported `McpAuthContext` type -- `shopId`, `shopDomain`,
+   * `tokenId`) and calls `next()`; on failure, answers 401 with a `WWW-Authenticate` header naming
+   * where to start the login flow. `req.mcp` typechecks because this package augments
+   * `Express.Request` globally the moment it's imported (see `types.ts`) -- no separate import or
+   * setup needed beyond `import "shopify-mcp-oauth"` (or any of its named exports) somewhere in
+   * your program.
+   */
   requireAuth: RequestHandler;
   /**
    * Mount this as the LAST `app.use(...)` call on YOUR OWN top-level Express app -- after your
