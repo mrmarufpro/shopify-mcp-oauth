@@ -31,19 +31,25 @@ describe("mcp request context", () => {
   });
 
   it("keeps concurrent requests from seeing each other's shop", async () => {
-    const observed: string[] = [];
+    const observed: Record<string, string> = {};
+    let releaseSecond: () => void = () => undefined;
+    const secondEntered = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
 
     await Promise.all([
       runWithMcpContext(buildContext(FIRST_SHOP), async () => {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        observed.push(getMcpContext()!.auth.shopDomain);
+        await secondEntered;
+        observed.first = getMcpContext()!.auth.shopDomain;
       }),
       runWithMcpContext(buildContext(SECOND_SHOP), async () => {
-        observed.push(getMcpContext()!.auth.shopDomain);
+        releaseSecond();
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        observed.second = getMcpContext()!.auth.shopDomain;
       }),
     ]);
 
-    expect(observed.sort()).toEqual([FIRST_SHOP, SECOND_SHOP].sort());
+    expect(observed).toEqual({ first: FIRST_SHOP, second: SECOND_SHOP });
   });
 
   it("is null again after the request finishes", async () => {
