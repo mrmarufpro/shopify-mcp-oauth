@@ -10,11 +10,12 @@ export interface ShopifyMcpOAuth {
   /**
    * Mount this as the LAST `app.use(...)` call on YOUR OWN top-level Express app -- after your
    * own body-parsers (e.g. `express.json()`) AND after `app.use(router)` -- never inside a
-   * router of your own. An error thrown by a parent-level middleware (your body-parser included)
-   * never enters this package's router at all, so mounting this anywhere other than your app's
-   * own final middleware cannot catch it. Get the placement wrong and such an error falls through
-   * to Express's own default handler instead, which answers with an HTML stack trace on an
-   * unauthenticated endpoint. See src/middlewares/errorHandler.ts for the full mechanics.
+   * router of your own. Express only looks for an error handler within the stack level where an
+   * error occurred, and a mounted Router is an ordinary layer to its parent, so an error thrown
+   * by a parent-level middleware (your body-parser included) never enters this package's router
+   * at all -- nothing mounted anywhere but your app's own final middleware can catch it. Get the
+   * placement wrong and such an error falls through to Express's own default handler instead,
+   * which answers with an HTML stack trace on an unauthenticated endpoint.
    */
   errorHandler: ErrorRequestHandler;
 }

@@ -1,9 +1,12 @@
+import crypto from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "./adapters/memoryStorage";
+import { resolveConfig } from "./config";
 import type { BuildRouterOptions } from "./router";
 import { signOuterState } from "./services/stateJwt";
+import { issueTokens } from "./services/tokens";
 import type { Logger } from "./types";
 import { createShopifyMcpOAuth, type ShopifyMcpOAuthConfig } from "./index";
 
@@ -40,19 +43,39 @@ function buildApp() {
   return app;
 }
 
-const DISCOVERY_PATHS = [
+// Split by which document each path must serve, not just "does it 200" -- both controllers
+// answer 200 for any of these six paths, so a request-level test that only checks status can't
+// tell a correctly-wired route apart from one silently cross-wired to the OTHER metadata
+// controller (verified by mutation: swapping protectedResourceMetadataController for
+// authorizationServerMetadataController on the two oauth-protected-resource routes left the full
+// suite green). Each group below asserts a field that only its own document carries.
+const AUTHORIZATION_SERVER_METADATA_PATHS = [
   "/.well-known/oauth-authorization-server",
   "/.well-known/oauth-authorization-server/mcp",
   "/.well-known/openid-configuration",
   "/.well-known/openid-configuration/mcp",
+];
+
+const PROTECTED_RESOURCE_METADATA_PATHS = [
   "/.well-known/oauth-protected-resource",
   "/.well-known/oauth-protected-resource/mcp",
 ];
 
 describe("router", () => {
-  it.each(DISCOVERY_PATHS)("serves %s", async (path) => {
+  it.each(AUTHORIZATION_SERVER_METADATA_PATHS)("serves authorization server metadata at %s", async (path) => {
     const response = await request(buildApp()).get(path);
     expect(response.status).toBe(200);
+    // authorization_endpoint exists only on the authorization-server document (see
+    // serializers/metadata.ts) -- the protected-resource document has no such field.
+    expect(response.body.authorization_endpoint).toBe(`${HOST}/authorize`);
+  });
+
+  it.each(PROTECTED_RESOURCE_METADATA_PATHS)("serves protected resource metadata at %s", async (path) => {
+    const response = await request(buildApp()).get(path);
+    expect(response.status).toBe(200);
+    // resource exists only on the protected-resource document -- the authorization-server
+    // document has no such field.
+    expect(response.body.resource).toBe(`${HOST}/mcp`);
   });
 
   it("mounts /register", async () => {
@@ -100,6 +123,52 @@ describe("router", () => {
     const matchingLayer = stack.find((layer) => layer.route?.path === "/.well-known/openai-apps-challenge");
     expect(matchingLayer).toBeUndefined();
   });
+
+  // The two tests above only ever pin the ABSENT case. Nothing proved the route is actually
+  // served -- through buildRouter, not a bare app mounting the controller directly -- when a
+  // token IS configured. controllers/metadata.test.ts mounts openaiAppsChallengeController on its
+  // own bare app, bypassing buildRouter entirely, so it can't stand in for this either.
+  it("serves the configured challenge token through the full router when one is configured", async () => {
+    const CHALLENGE_TOKEN = "openai-challenge-token-value";
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ openaiAppsChallengeToken: CHALLENGE_TOKEN }));
+    const app = express();
+    app.use(oauth.router);
+
+    const response = await request(app).get("/.well-known/openai-apps-challenge");
+
+    expect(response.status).toBe(200);
+    expect(response.text).toBe(CHALLENGE_TOKEN);
+  });
+});
+
+describe("requireAuth accepts a token this server actually issued", () => {
+  // "guards the mcp route with requireAuth" above only pins the REJECT direction (no token ->
+  // 401) -- an always-401 stub swapped in for requireAuth would leave that test green too
+  // (verified by mutation). This drives a real token, issued through the exact same config's
+  // storage, all the way through buildRouter + requireAuth and checks it's actually accepted.
+  it("returns 200 and populates req.mcp for a valid access token", async () => {
+    const config = buildBaseConfig();
+    const oauth = createShopifyMcpOAuth(config);
+    const app = express();
+    app.use(oauth.router);
+    app.post("/mcp", oauth.requireAuth, (req, res) => res.status(200).json(req.mcp));
+
+    // Same `config` object resolveConfig was already called on inside createShopifyMcpOAuth --
+    // resolving it again here is side-effect-free (beyond the harmless no-cache log) and shares
+    // the identical `storage` instance by reference, so a token issued against this resolved copy
+    // is visible to requireAuth's lookups against the router's own copy.
+    const resolved = resolveConfig(config);
+    const tokens = await issueTokens(resolved, {
+      shopId: DEMO_SHOP_ID,
+      shopDomain: DEMO_SHOP,
+      clientId: "test-client-id",
+    });
+
+    const response = await request(app).post("/mcp").set("Authorization", `Bearer ${tokens.access_token}`).send({});
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, tokenId: expect.any(String) });
+  });
 });
 
 describe("createShopifyMcpOAuth", () => {
@@ -115,28 +184,26 @@ describe("createShopifyMcpOAuth", () => {
   });
 });
 
-describe("the shopify callback route requires a valid HMAC", () => {
-  // A genuinely valid, signed outer state -- not a throwaway string -- is what makes this test
-  // actually isolate the HMAC guard. shopifyCallbackController's first move after HMAC passes is
-  // to verify this JWT; if it were unsigned garbage, the controller would reject for THAT reason
-  // whether or not the HMAC guard ran, and removing requireShopifyHmac from router.ts would not
-  // redden this test at all (proved below -- see the mutation note on the assertions).
-  function validSignedState(): string {
-    return signOuterState(
-      {
-        clientId: "test-client-id",
-        redirectUri: REDIRECT_URI,
-        clientState: "client-state",
-        codeChallenge: "a".repeat(43),
-        codeChallengeMethod: "S256",
-        resource: `${HOST}/mcp`,
-        nonce: "test-nonce-value",
-      },
-      STATE_SECRET,
-      600
-    );
-  }
+// A genuinely valid, signed outer state -- not a throwaway string -- is what makes the HMAC tests
+// below actually isolate the HMAC guard rather than incidentally failing on state verification
+// instead. Shared by both the negative and positive HMAC describe blocks.
+function validSignedState(): string {
+  return signOuterState(
+    {
+      clientId: "test-client-id",
+      redirectUri: REDIRECT_URI,
+      clientState: "client-state",
+      codeChallenge: "a".repeat(43),
+      codeChallengeMethod: "S256",
+      resource: `${HOST}/mcp`,
+      nonce: "test-nonce-value",
+    },
+    STATE_SECRET,
+    600
+  );
+}
 
+describe("the shopify callback route requires a valid HMAC", () => {
   function callbackQuery(hmacValue: string): string {
     return new URLSearchParams({
       shop: DEMO_SHOP,
@@ -164,6 +231,45 @@ describe("the shopify callback route requires a valid HMAC", () => {
     // fetchImpl.not.toHaveBeenCalled() fails, because the controller then runs, the valid state
     // verifies, and it proceeds to call the bare `vi.fn()` fetchImpl).
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe("the shopify callback route accepts a genuinely valid HMAC", () => {
+  // The negative test above only pins the REJECT direction -- it would stay equally green if
+  // router.ts wired requireShopifyHmac to the WRONG secret entirely (e.g. config.stateSecret
+  // instead of config.shopify.apiSecret), since a request signed with neither secret is rejected
+  // either way. Verified by mutation. This signs with the REAL secret the wiring is supposed to
+  // use and asserts the request is actually accepted through to a full, successful redirect --
+  // not just that the HMAC check itself passes.
+  function signQuery(params: Record<string, string>): string {
+    // Sorted by key, mirroring the algorithm verifyShopifyHmac.test.ts's own signQuery uses (the
+    // one Shopify's docs document) -- see that file for why this is an accurate stand-in for how
+    // Shopify actually signs a callback.
+    const sortedEntries = Object.entries(params).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    const message = new URLSearchParams(sortedEntries).toString();
+    const hmac = crypto.createHmac("sha256", SHOPIFY_API_SECRET).update(message).digest("hex");
+    return `${message}&hmac=${hmac}`;
+  }
+
+  it("passes a request signed with the real shopify.apiSecret all the way through to a successful redirect", async () => {
+    const shopifyExchangeResponse = new Response(JSON.stringify({ access_token: "shopify-admin-token" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const fetchImpl = vi.fn().mockResolvedValue(shopifyExchangeResponse);
+    const oauth = createShopifyMcpOAuth(buildBaseConfig({ fetchImpl: fetchImpl as unknown as typeof fetch }));
+    const app = express();
+    app.use(oauth.router);
+
+    const queryString = signQuery({ shop: DEMO_SHOP, code: "some-code", state: validSignedState() });
+    const response = await request(app).get(`/oauth/shopify-callback?${queryString}`);
+
+    // fetchImpl is only ever called once the HMAC guard AND state verification both succeed --
+    // proving this got past requireShopifyHmac using the real secret, not just that some other
+    // check happened not to fire.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(302);
+    expect(response.headers.location).toContain("code=");
   });
 });
 

@@ -131,10 +131,14 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
     }
 
     if (current.count >= limit) {
-      // No floor needed: `current` is only ever truthy when `stored.resetAt > now` (see above),
-      // using this same `now` -- so resetAt - now is always strictly positive here, and ceiling
-      // any positive number of milliseconds to whole seconds always lands on at least 1 (that
-      // holds for any positive value, not because milliseconds happen to be integers).
+      // No floor needed: current.resetAt - now is strictly positive either way `current` got
+      // here. If it's the window just created/refreshed above, resetAt = now + windowMs with
+      // this SAME now, and windowMs > 0 is guaranteed by assertValidRateLimiterOptions -- so
+      // resetAt - now = windowMs > 0. Otherwise `current` is the existing, unexpired window read
+      // from the map above, where stored.resetAt > now already held, again using this same now.
+      // Either way, ceiling a strictly positive number of milliseconds to whole seconds always
+      // lands on at least 1 (true for any positive value, not because milliseconds happen to be
+      // integers).
       res.setHeader("Retry-After", Math.ceil((current.resetAt - now) / 1000));
       res.status(429).json({ error: "too_many_requests", error_description: "rate limit exceeded" });
       return;
