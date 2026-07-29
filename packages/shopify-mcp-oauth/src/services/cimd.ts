@@ -10,6 +10,13 @@ const MAX_BYTES = 64 * 1024;
 const TIMEOUT_MS = 3000;
 const CACHE_TTL_SECONDS = 3600;
 const CACHE_PREFIX = "mcp:oauth:cimd:";
+// Deliberately much shorter than CACHE_TTL_SECONDS above: a merchant's CIMD endpoint that's down
+// for a minute and back shouldn't leave their client_id rejected for an hour. Negative-caching a
+// recently-failed URL at all is the natural companion to the concurrency cap below — a client
+// hammering the same known-bad URL is the same resource-exhaustion shape as one spreading load
+// across many distinct URLs, just concentrated on one instead.
+const NEGATIVE_CACHE_TTL_SECONDS = 60;
+const NEGATIVE_CACHE_PREFIX = "mcp:oauth:cimd:failed:";
 
 export function isCimdClientId(value: string): boolean {
   return value.startsWith("https://");
@@ -326,7 +333,32 @@ export async function resolveCimdClient(
     return doc;
   }
 
-  const doc = await fetchCimd(config, url, opts.allowPrivateHosts ?? false);
+  // Checked only once neither cache above nor storage already has a real document -- a URL that
+  // failed recently and has since been fixed (and so now HAS a real document) must never be
+  // shadowed by a stale failure marker; storage/the success cache winning first, unconditionally,
+  // is what guarantees that.
+  const negativeCacheKey = `${NEGATIVE_CACHE_PREFIX}${url}`;
+  try {
+    const cachedFailureDescription = await config.cache.get(negativeCacheKey);
+    if (cachedFailureDescription) throw new OAuthError("invalid_client", cachedFailureDescription);
+  } catch (error) {
+    if (error instanceof OAuthError) throw error;
+    // A cache outage here must not break resolution; fall through to a real fetch attempt.
+  }
+
+  // The concurrency cap bounds the whole fetchCimd call, not just the initial fetchImpl request --
+  // the resource being protected (an open outbound socket) stays held through the body read and
+  // its own TIMEOUT_MS-bounded wait too, so a cap that released after the headers arrived would
+  // leave the slower, still-expensive tail of the same request uncapped.
+  let doc: CimdDocument;
+  try {
+    doc = await config.cimdFetchLimiter.run(() => fetchCimd(config, url, opts.allowPrivateHosts ?? false));
+  } catch (error) {
+    if (error instanceof OAuthError) {
+      await config.cache.set(negativeCacheKey, error.description, NEGATIVE_CACHE_TTL_SECONDS).catch(() => {});
+    }
+    throw error;
+  }
 
   try {
     await upsertCimdClient(config, url, doc);

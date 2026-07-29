@@ -77,3 +77,29 @@ export interface McpAuthContext {
   shopDomain: string;
   tokenId: string;
 }
+
+// Declared against the global Express namespace, not `declare module "express-serve-static-core"`:
+// that module is only a transitive dependency of @types/express, not one of this package's own,
+// so under pnpm's strict node_modules it doesn't resolve from here and tsc fails with TS2664. The
+// module-scoped `Request<...>` type (what RequestHandler's `req` actually is) extends
+// `Express.Request`, so augmenting the namespace below reaches it the same way.
+//
+// Colocated with McpAuthContext here, not with middlewares/requireAuth.ts (the function that
+// actually populates `req.mcp` at runtime) -- tsup's dts bundler (rollup-plugin-dts) only includes
+// a source file's declarations, ambient blocks included, when at least one of that file's OWN
+// exports is reachable from the public API surface it's bundling. requireAuth.ts's only export is
+// the `requireAuth` factory, which is used internally by createShopifyMcpOAuth but never
+// re-exported by name -- so the whole file, augmentation included, was silently dropped from
+// dist/index.d.ts, and every consumer's `req.mcp` access failed TS2339 despite compiling cleanly
+// inside this package's own test suite (which compiles requireAuth.ts directly, not through the
+// bundled output). types.ts's exports (McpAuthContext among them) are already re-exported from
+// index.ts, which is what guarantees this file -- and this block -- survive bundling. Verified by
+// compiling an external strict-mode consumer against the built dist/ output, not by reading the
+// emitted .d.ts from inside this package: that check is what caught this in the first place.
+declare global {
+  namespace Express {
+    interface Request {
+      mcp?: McpAuthContext;
+    }
+  }
+}

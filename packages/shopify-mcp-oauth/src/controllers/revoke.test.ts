@@ -63,6 +63,31 @@ describe("revokeController", () => {
     expect(await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token))).toBeNull();
   });
 
+  // RFC 7009 §2.1: token_type_hint is a lookup optimization, and the server MUST fall back to
+  // checking other token types when the hint doesn't resolve. Access and refresh tokens are both
+  // opaque, same-shape random strings, so a client submitting one but hinting the other is
+  // plausible, not hypothetical -- without the fallback, the controller would answer 200 (the same
+  // success response as a real revocation) while the submitted token stayed live.
+  it("still revokes an access token submitted with a mismatched refresh_token hint", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config))
+      .post("/revoke")
+      .send({ token: tokens.access_token, token_type_hint: "refresh_token" });
+    expect(response.status).toBe(200);
+    expect(await config.storage.findTokenByAccessHash(sha256Hex(tokens.access_token))).toBeNull();
+  });
+
+  it("still revokes a refresh token submitted with a mismatched access_token hint", async () => {
+    const config = buildConfig();
+    const tokens = await issueTokens(config, { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, clientId: CLIENT_ID });
+    const response = await request(buildApp(config))
+      .post("/revoke")
+      .send({ token: tokens.refresh_token, token_type_hint: "access_token" });
+    expect(response.status).toBe(200);
+    expect(await config.storage.findTokenByRefreshHash(sha256Hex(tokens.refresh_token))).toBeNull();
+  });
+
   it("answers 200 for a token it has never seen, so it is not an oracle", async () => {
     const response = await request(buildApp(buildConfig())).post("/revoke").send({ token: "never-issued" });
     expect(response.status).toBe(200);

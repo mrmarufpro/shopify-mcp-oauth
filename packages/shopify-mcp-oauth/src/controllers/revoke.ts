@@ -16,12 +16,16 @@ export function revokeController(config: ResolvedConfig): RequestHandler {
     }
     // RFC 7009 §2.2: answer 200 whether or not the token existed, so the endpoint cannot be
     // used to test token guesses.
-    if (parsed.data.token_type_hint === "refresh_token") {
-      await revokeByRefreshToken(config, parsed.data.token);
-    } else {
-      await revokeByAccessToken(config, parsed.data.token);
-      await revokeByRefreshToken(config, parsed.data.token);
-    }
+    //
+    // Both lookups always run, regardless of token_type_hint. RFC 7009 §2.1 allows a hint as a
+    // lookup optimization but requires falling back to the other token types when it doesn't
+    // resolve -- access and refresh tokens are both opaque, same-shape random strings (see
+    // services/tokens.ts), so a client that submits an access token but hints "refresh_token" (or
+    // vice versa) is entirely plausible, not just a hypothetical. A hint-only lookup would answer
+    // 200 -- the same success response as a real revocation -- while the submitted token stays
+    // live: the caller is told it's revoked when it isn't.
+    await revokeByAccessToken(config, parsed.data.token);
+    await revokeByRefreshToken(config, parsed.data.token);
     res.status(200).json({});
   });
 }

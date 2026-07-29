@@ -10,10 +10,12 @@ const CIMD_URL = "https://client.example/metadata.json";
 const REDIRECT_URI = "https://client.example/callback";
 const CIMD_DOC = { client_name: "Fetched Client", redirect_uris: [REDIRECT_URI] };
 
-// The package's byte cap and fetch timeout on a fetched CIMD document (see cimd.ts). Duplicated
-// here, not imported, because neither is part of this task's public export surface.
+// The package's byte cap, fetch timeout, and negative-cache TTL on a fetched CIMD document (see
+// cimd.ts). Duplicated here, not imported, because none is part of this task's public export
+// surface.
 const CIMD_BYTE_CAP = 64 * 1024;
 const CIMD_FETCH_TIMEOUT_MS = 3000;
+const CIMD_NEGATIVE_CACHE_TTL_SECONDS = 60;
 
 // Silent by default so the no-cache warning does not spray stderr across every case, matching
 // the convention in config.test.ts.
@@ -255,6 +257,131 @@ describe("resolveCimdClient", () => {
     // dropped. "localhost" resolves to ::1 first on some systems (this one included) and to
     // 127.0.0.1 first on others, so pinning one order would be flaky.
     expect(loggedMessage).toMatch(/127\.0\.0\.1|::1/);
+  });
+
+  describe("concurrency cap on in-flight CIMD fetches", () => {
+    // Distinct URLs, never seen before -- each must independently miss both the success cache and
+    // storage and reach the actual fetch, which is what lets this test observe the cap rather than
+    // the unrelated single-flight caching proven above.
+    const URL_A = "https://client-a.example/doc.json";
+    const URL_B = "https://client-b.example/doc.json";
+    const URL_C = "https://client-c.example/doc.json";
+
+    // A fetchImpl that reports which url it was called with into `started` the moment its own
+    // call runs, then hangs until this test explicitly releases that specific url. `started` is a
+    // Set (a fact that, once true, stays true), so a test can `vi.waitFor` on it without racing a
+    // counter that's transiently at the target value for an unrelated reason.
+    function buildControllableFetch(): {
+      fetchImpl: typeof fetch;
+      started: Set<string>;
+      release: (url: string) => void;
+    } {
+      const started = new Set<string>();
+      const releasers = new Map<string, () => void>();
+      const fetchImpl = vi.fn().mockImplementation(async (url: string) => {
+        started.add(url);
+        await new Promise<void>((resolve) => releasers.set(url, resolve));
+        return new Response(JSON.stringify(CIMD_DOC), { status: 200, headers: { "content-type": "application/json" } });
+      }) as unknown as typeof fetch;
+      return { fetchImpl, started, release: (url) => releasers.get(url)?.() };
+    }
+
+    it("limits concurrent CIMD fetches to config.cimdFetchConcurrency, queueing the rest", async () => {
+      const { fetchImpl, started, release } = buildControllableFetch();
+      const config = buildConfig(fetchImpl, { cimdFetchConcurrency: 2 });
+
+      const resolutions = [
+        resolveCimdClient(config, URL_A, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_B, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_C, { allowPrivateHosts: true }),
+      ];
+
+      await vi.waitFor(() => expect(started.has(URL_A) && started.has(URL_B)).toBe(true));
+      // The cap is only proven if the third genuinely hasn't started -- otherwise this is
+      // indistinguishable from a limiter that never actually queues anything.
+      expect(started.has(URL_C)).toBe(false);
+
+      release(URL_A);
+      await vi.waitFor(() => expect(started.has(URL_C)).toBe(true));
+
+      release(URL_B);
+      release(URL_C);
+      const docs = await Promise.all(resolutions);
+      expect(docs.map((doc) => doc.client_name)).toEqual(["Fetched Client", "Fetched Client", "Fetched Client"]);
+    });
+
+    it("lets every fetch proceed at once when the cap is not reached", async () => {
+      const { fetchImpl, started, release } = buildControllableFetch();
+      const config = buildConfig(fetchImpl, { cimdFetchConcurrency: 3 });
+
+      const resolutions = [
+        resolveCimdClient(config, URL_A, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_B, { allowPrivateHosts: true }),
+        resolveCimdClient(config, URL_C, { allowPrivateHosts: true }),
+      ];
+
+      await vi.waitFor(() => expect(started.has(URL_A) && started.has(URL_B) && started.has(URL_C)).toBe(true));
+      release(URL_A);
+      release(URL_B);
+      release(URL_C);
+      await Promise.all(resolutions);
+    });
+  });
+
+  describe("negative caching a failed fetch", () => {
+    it("does not re-fetch a CIMD URL that recently failed within the negative-cache TTL", async () => {
+      const fetchImpl = buildFetch("not found", { status: 404 });
+      const config = buildConfig(fetchImpl);
+
+      await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+      await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it("re-fetches once the negative-cache TTL has elapsed", async () => {
+      vi.useFakeTimers();
+      try {
+        const fetchImpl = buildFetch("not found", { status: 404 });
+        const config = buildConfig(fetchImpl);
+
+        await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+        vi.advanceTimersByTime(CIMD_NEGATIVE_CACHE_TTL_SECONDS * 1000 + 1000);
+        await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+
+        expect(fetchImpl).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("does not shadow a client that started succeeding again after a past failure", async () => {
+      // A negative-cache entry from an earlier failed attempt must never win over a genuine
+      // document once storage actually has one -- storage is only ever populated by a SUCCESSFUL
+      // fetch, so its presence is authoritative regardless of what the negative cache still says.
+      const cache = memoryCache();
+      const failingFetch = buildFetch("not found", { status: 404 });
+      const config = buildConfig(failingFetch, { cache });
+      await expect(resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true })).rejects.toThrow(/404/);
+
+      // Simulates the client's document having been registered through some other path (e.g. a
+      // prior successful fetch on another instance sharing this cache/storage) without waiting
+      // out the negative-cache TTL.
+      await config.storage.createClient({
+        clientId: CIMD_URL,
+        clientName: "Recovered Client",
+        redirectUris: [REDIRECT_URI],
+        grantTypes: null,
+        responseTypes: null,
+        logoUri: null,
+        clientUri: null,
+        tokenEndpointAuthMethod: "none",
+      });
+
+      const doc = await resolveCimdClient(config, CIMD_URL, { allowPrivateHosts: true });
+      expect(doc.client_name).toBe("Recovered Client");
+      expect(failingFetch).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("SSRF guard: private, loopback, and reserved address families", () => {

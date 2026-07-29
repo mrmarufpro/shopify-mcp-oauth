@@ -63,6 +63,50 @@ describe("resolveConfig", () => {
     expect(resolved.revokeRateLimit).toEqual({ limit: 2, windowMs: 2000 });
   });
 
+  // A default nothing pins is exactly how rateLimit.ts's own maxEntries default nearly shipped
+  // unbounded — this is that lesson applied here, not a hypothetical.
+  it("defaults the CIMD fetch concurrency cap to 10", () => {
+    expect(resolveConfig(buildConfig()).cimdFetchConcurrency).toBe(10);
+  });
+
+  it("keeps an explicit cimdFetchConcurrency instead of the default", () => {
+    expect(resolveConfig(buildConfig({ cimdFetchConcurrency: 3 })).cimdFetchConcurrency).toBe(3);
+  });
+
+  it("builds a cimdFetchLimiter from the resolved cimdFetchConcurrency", async () => {
+    // Not just "a limiter exists" — it must actually enforce the configured number, not some
+    // other hardcoded value. See services/cimd.test.ts for the request-level version of this same
+    // proof, driven through resolveCimdClient rather than the limiter's own run() directly.
+    const resolved = resolveConfig(buildConfig({ cimdFetchConcurrency: 1 }));
+    const started = new Set<string>();
+    function buildTask(name: string): { task: () => Promise<void>; release: () => void } {
+      let releaseFn: (() => void) | undefined;
+      return {
+        task: () => {
+          started.add(name);
+          return new Promise<void>((resolve) => {
+            releaseFn = resolve;
+          });
+        },
+        release: () => releaseFn?.(),
+      };
+    }
+    const first = buildTask("first");
+    const second = buildTask("second");
+
+    const results = Promise.all([
+      resolved.cimdFetchLimiter.run(first.task),
+      resolved.cimdFetchLimiter.run(second.task),
+    ]);
+    await vi.waitFor(() => expect(started.has("first")).toBe(true));
+    expect(started.has("second")).toBe(false);
+
+    first.release();
+    await vi.waitFor(() => expect(started.has("second")).toBe(true));
+    second.release();
+    await results;
+  });
+
   it("supplies a memory cache when none is given", () => {
     expect(resolveConfig(buildConfig()).cache).toBeDefined();
   });

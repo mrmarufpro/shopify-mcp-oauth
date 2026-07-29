@@ -6,6 +6,15 @@ import { buildRouter, type BuildRouterOptions } from "./router";
 
 export interface ShopifyMcpOAuth {
   router: Router;
+  /**
+   * Mount on any route this server considers protected, after `app.use(oauth.router)`. On success,
+   * populates `req.mcp` (see the exported `McpAuthContext` type -- `shopId`, `shopDomain`,
+   * `tokenId`) and calls `next()`; on failure, answers 401 with a `WWW-Authenticate` header naming
+   * where to start the login flow. `req.mcp` typechecks because this package augments
+   * `Express.Request` globally the moment it's imported (see `types.ts`) -- no separate import or
+   * setup needed beyond `import "shopify-mcp-oauth"` (or any of its named exports) somewhere in
+   * your program.
+   */
   requireAuth: RequestHandler;
   /**
    * Mount this as the LAST `app.use(...)` call on YOUR OWN top-level Express app -- after your

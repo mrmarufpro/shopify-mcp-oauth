@@ -2,20 +2,9 @@ import type { RequestHandler, Response } from "express";
 import { asyncHandler } from "../controllers/asyncHandler";
 import type { ResolvedConfig } from "../config";
 import { sha256Hex } from "../crypto";
-import type { McpAuthContext } from "../types";
-
-// Declared against the global Express namespace, not `declare module "express-serve-static-core"`:
-// that module is only a transitive dependency of @types/express, not one of this package's own,
-// so under pnpm's strict node_modules it doesn't resolve from here and tsc fails with TS2664. The
-// module-scoped `Request<...>` type (what RequestHandler's `req` actually is) extends
-// `Express.Request`, so augmenting the namespace below reaches it the same way.
-declare global {
-  namespace Express {
-    interface Request {
-      mcp?: McpAuthContext;
-    }
-  }
-}
+// The Express.Request augmentation that makes `req.mcp` typecheck lives in ../types, not here --
+// see the comment there for why it has to be colocated with a re-exported symbol rather than with
+// the function that actually populates it at runtime.
 
 export function requireAuth(config: ResolvedConfig): RequestHandler {
   const resourceMetadata = `${config.host}/.well-known/oauth-protected-resource`;
