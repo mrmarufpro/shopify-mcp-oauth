@@ -161,6 +161,32 @@ export interface McpAuthContext {
   shopDomain: string;
   tokenId: string;
 }
+
+// Declared against the global Express namespace, not `declare module "express-serve-static-core"`:
+// that module is only a transitive dependency of @types/express, not one of this package's own,
+// so under pnpm's strict node_modules it doesn't resolve from here and tsc fails with TS2664. The
+// module-scoped `Request<...>` type (what RequestHandler's `req` actually is) extends
+// `Express.Request`, so augmenting the namespace below reaches it the same way.
+//
+// Colocated with McpAuthContext here, not with middlewares/requireAuth.ts (the function that
+// actually populates `req.mcp` at runtime) -- tsup's dts bundler (rollup-plugin-dts) only includes
+// a source file's declarations, ambient blocks included, when at least one of that file's OWN
+// exports is reachable from the public API surface it's bundling. requireAuth.ts's only export is
+// the `requireAuth` factory, which is used internally by createShopifyMcpOAuth but never
+// re-exported by name -- so the whole file, augmentation included, was silently dropped from
+// dist/index.d.ts, and every consumer's `req.mcp` access failed TS2339 despite compiling cleanly
+// inside this package's own test suite (which compiles requireAuth.ts directly, not through the
+// bundled output). types.ts's exports (McpAuthContext among them) are already re-exported from
+// index.ts, which is what guarantees this file -- and this block -- survive bundling. Verified by
+// compiling an external strict-mode consumer against the built dist/ output, not by reading the
+// emitted .d.ts from inside this package: that check is what caught this in the first place.
+declare global {
+  namespace Express {
+    interface Request {
+      mcp?: McpAuthContext;
+    }
+  }
+}
 ```
 
 ```ts
@@ -175,6 +201,7 @@ export interface ShopifyMcpOAuthConfig {
   openaiAppsChallengeToken?: string | null;
   registerRateLimit?: { limit: number; windowMs: number };
   revokeRateLimit?: { limit: number; windowMs: number };
+  cimdFetchConcurrency?: number;
   logger?: Logger;
   fetchImpl?: typeof fetch;
 }
@@ -190,6 +217,8 @@ export interface ResolvedConfig {
   openaiAppsChallengeToken: string | null;
   registerRateLimit: { limit: number; windowMs: number };
   revokeRateLimit: { limit: number; windowMs: number };
+  cimdFetchConcurrency: number;
+  cimdFetchLimiter: ConcurrencyLimiter; // see services/concurrencyLimiter.ts
   logger: Logger;
   fetchImpl: typeof fetch;
 }
@@ -2551,7 +2580,9 @@ git commit -m "feat: resolve shops through Shopify's SessionStorage interface"
 
 **Files:**
 - Create: `packages/shopify-mcp-oauth/src/config.ts`
+- Create: `packages/shopify-mcp-oauth/src/services/concurrencyLimiter.ts`
 - Test: `packages/shopify-mcp-oauth/src/config.test.ts`
+- Test: `packages/shopify-mcp-oauth/src/services/concurrencyLimiter.test.ts`
 
 **Interfaces:**
 - Consumes: `OAuthStorage`, `CacheStore`, `Logger` from `./types`; `memoryCache` from `./adapters/memoryCache`
@@ -2845,6 +2876,196 @@ Expected: PASS, 11 tests.
 ```bash
 git add packages/shopify-mcp-oauth/src/config.ts packages/shopify-mcp-oauth/src/config.test.ts
 git commit -m "feat: validate and resolve package config at construction time"
+```
+
+- [ ] **Step 6: Write the failing test for the CIMD concurrency limiter**
+
+Added after the initial release, alongside `cimdFetchConcurrency`/`cimdFetchLimiter` on `ResolvedConfig`
+(see **Locked Interfaces**) and the concurrency cap wrapping `resolveCimdClient`'s fetch (see Task 12).
+`config.ts` imports `createConcurrencyLimiter` from here to build `cimdFetchLimiter`; nothing in
+Task 12 imports this module directly, since `cimd.ts` only ever sees the already-built limiter off
+`config`.
+
+`src/services/concurrencyLimiter.test.ts`:
+
+```ts
+import { describe, expect, it, vi } from "vitest";
+import { createConcurrencyLimiter } from "./concurrencyLimiter";
+
+// A task the test controls the completion of: it records its own name into `started` the moment
+// its body actually runs, then hangs until this file explicitly releases it. `started` is a Set,
+// not a counter -- once a name is in it, that fact never becomes false again, so a test can
+// `vi.waitFor` on it without a race against a counter that's transiently equal to the target value
+// for the wrong reason (e.g. still mid-teardown from an earlier task finishing).
+function buildControllableTask(
+  name: string,
+  started: Set<string>
+): { task: () => Promise<string>; release: () => void } {
+  let releaseFn: (() => void) | undefined;
+  const task = async (): Promise<string> => {
+    started.add(name);
+    await new Promise<void>((resolve) => {
+      releaseFn = resolve;
+    });
+    return "done";
+  };
+  return {
+    task,
+    release: () => releaseFn?.(),
+  };
+}
+
+describe("createConcurrencyLimiter", () => {
+  it("runs up to maxConcurrent tasks at once without queueing", async () => {
+    const limiter = createConcurrencyLimiter(2);
+    const started = new Set<string>();
+    const first = buildControllableTask("first", started);
+    const second = buildControllableTask("second", started);
+
+    const results = Promise.all([limiter.run(first.task), limiter.run(second.task)]);
+    await vi.waitFor(() => expect(started.has("first") && started.has("second")).toBe(true));
+
+    first.release();
+    second.release();
+    expect(await results).toEqual(["done", "done"]);
+  });
+
+  it("queues a task beyond maxConcurrent until a running one finishes", async () => {
+    const limiter = createConcurrencyLimiter(2);
+    const started = new Set<string>();
+    const first = buildControllableTask("first", started);
+    const second = buildControllableTask("second", started);
+    const third = buildControllableTask("third", started);
+
+    const results = Promise.all([limiter.run(first.task), limiter.run(second.task), limiter.run(third.task)]);
+    await vi.waitFor(() => expect(started.has("first") && started.has("second")).toBe(true));
+    // The third task's own body must not have started yet -- proven by checking this explicitly,
+    // not merely inferred from the pair above having started, which says nothing about a third.
+    expect(started.has("third")).toBe(false);
+
+    first.release();
+    await vi.waitFor(() => expect(started.has("third")).toBe(true));
+
+    second.release();
+    third.release();
+    expect(await results).toEqual(["done", "done", "done"]);
+  });
+
+  it("serves queued tasks in FIFO order", async () => {
+    const limiter = createConcurrencyLimiter(1);
+    const order: string[] = [];
+    const started = new Set<string>();
+    const blocker = buildControllableTask("blocker", started);
+
+    const first = limiter.run(blocker.task);
+    const second = limiter.run(async () => {
+      order.push("second");
+    });
+    const third = limiter.run(async () => {
+      order.push("third");
+    });
+
+    // Release only once the blocker's task body has actually run -- releasing before that (a
+    // bug this test's first draft had) calls into a releaseFn that was never assigned yet, so
+    // the blocker never actually unblocks and the whole chain hangs.
+    await vi.waitFor(() => expect(started.has("blocker")).toBe(true));
+    blocker.release();
+    await Promise.all([first, second, third]);
+    expect(order).toEqual(["second", "third"]);
+  });
+
+  it("lets a later task run once an earlier one rejects, rather than leaking its slot", async () => {
+    const limiter = createConcurrencyLimiter(1);
+    const failing = limiter.run(async () => {
+      throw new Error("task failed");
+    });
+    const following = limiter.run(async () => "ok");
+
+    await expect(failing).rejects.toThrow("task failed");
+    expect(await following).toBe("ok");
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity])("rejects a non-positive-integer maxConcurrent (%s)", (invalid) => {
+    expect(() => createConcurrencyLimiter(invalid)).toThrow(/positive integer/);
+  });
+});
+```
+
+- [ ] **Step 7: Run the test to verify it fails**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/concurrencyLimiter.test.ts`
+Expected: FAIL — cannot resolve `./concurrencyLimiter`.
+
+- [ ] **Step 8: Write `src/services/concurrencyLimiter.ts`**
+
+```ts
+export interface ConcurrencyLimiter {
+  run<T>(task: () => Promise<T>): Promise<T>;
+}
+
+// This module isn't part of the public export surface today, so a caller has no schema in front
+// of them the way resolveConfig's zod validation guards config.cimdFetchConcurrency -- guard
+// here too, matching createRateLimiter's own defense against the same gap.
+function assertValidMaxConcurrent(maxConcurrent: number): void {
+  if (!Number.isInteger(maxConcurrent) || maxConcurrent <= 0) {
+    throw new Error("createConcurrencyLimiter: maxConcurrent must be a positive integer");
+  }
+}
+
+// A minimal counting semaphore: at most maxConcurrent tasks run their work at once; callers
+// beyond that queue in arrival order and each runs as soon as an earlier one finishes. No timers,
+// no external dependency -- just what's needed to bound how many of something expensive (an
+// outbound fetch, here) can be in flight at once, independent of how many callers are waiting.
+export function createConcurrencyLimiter(maxConcurrent: number): ConcurrencyLimiter {
+  assertValidMaxConcurrent(maxConcurrent);
+  let active = 0;
+  const queue: Array<() => void> = [];
+
+  function acquire(): Promise<void> {
+    if (active < maxConcurrent) {
+      active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => queue.push(resolve));
+  }
+
+  function release(): void {
+    // A queued waiter inherits the just-freed slot directly, rather than this decrementing
+    // `active` and the waiter separately re-incrementing it through acquire() -- that two-step
+    // handoff would let `active` observably dip below maxConcurrent for an instant between one
+    // task finishing and the next starting, which a caller polling `active` between ticks could
+    // catch even though the invariant (never more than maxConcurrent truly concurrent) still held.
+    const next = queue.shift();
+    if (next) {
+      next();
+      return;
+    }
+    active -= 1;
+  }
+
+  return {
+    async run<T>(task: () => Promise<T>): Promise<T> {
+      await acquire();
+      try {
+        return await task();
+      } finally {
+        release();
+      }
+    },
+  };
+}
+```
+
+- [ ] **Step 9: Run the test to verify it passes**
+
+Run: `pnpm --filter shopify-mcp-oauth test src/services/concurrencyLimiter.test.ts`
+Expected: PASS, 9 tests.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add packages/shopify-mcp-oauth/src/services/concurrencyLimiter.ts packages/shopify-mcp-oauth/src/services/concurrencyLimiter.test.ts
+git commit -m "feat: add a FIFO concurrency limiter for the CIMD fetch cap"
 ```
 
 ---
@@ -3727,10 +3948,12 @@ const CIMD_URL = "https://client.example/metadata.json";
 const REDIRECT_URI = "https://client.example/callback";
 const CIMD_DOC = { client_name: "Fetched Client", redirect_uris: [REDIRECT_URI] };
 
-// The package's byte cap and fetch timeout on a fetched CIMD document (see cimd.ts). Duplicated
-// here, not imported, because neither is part of this task's public export surface.
+// The package's byte cap, fetch timeout, and negative-cache TTL on a fetched CIMD document (see
+// cimd.ts). Duplicated here, not imported, because none is part of this task's public export
+// surface.
 const CIMD_BYTE_CAP = 64 * 1024;
 const CIMD_FETCH_TIMEOUT_MS = 3000;
+const CIMD_NEGATIVE_CACHE_TTL_SECONDS = 60;
 
 // Silent by default so the no-cache warning does not spray stderr across every case, matching
 // the convention in config.test.ts.
@@ -4233,6 +4456,13 @@ const MAX_BYTES = 64 * 1024;
 const TIMEOUT_MS = 3000;
 const CACHE_TTL_SECONDS = 3600;
 const CACHE_PREFIX = "mcp:oauth:cimd:";
+// Deliberately much shorter than CACHE_TTL_SECONDS above: a merchant's CIMD endpoint that's down
+// for a minute and back shouldn't leave their client_id rejected for an hour. Negative-caching a
+// recently-failed URL at all is the natural companion to the concurrency cap below — a client
+// hammering the same known-bad URL is the same resource-exhaustion shape as one spreading load
+// across many distinct URLs, just concentrated on one instead.
+const NEGATIVE_CACHE_TTL_SECONDS = 60;
+const NEGATIVE_CACHE_PREFIX = "mcp:oauth:cimd:failed:";
 
 export function isCimdClientId(value: string): boolean {
   return value.startsWith("https://");
@@ -4549,7 +4779,32 @@ export async function resolveCimdClient(
     return doc;
   }
 
-  const doc = await fetchCimd(config, url, opts.allowPrivateHosts ?? false);
+  // Checked only once neither cache above nor storage already has a real document -- a URL that
+  // failed recently and has since been fixed (and so now HAS a real document) must never be
+  // shadowed by a stale failure marker; storage/the success cache winning first, unconditionally,
+  // is what guarantees that.
+  const negativeCacheKey = `${NEGATIVE_CACHE_PREFIX}${url}`;
+  try {
+    const cachedFailureDescription = await config.cache.get(negativeCacheKey);
+    if (cachedFailureDescription) throw new OAuthError("invalid_client", cachedFailureDescription);
+  } catch (error) {
+    if (error instanceof OAuthError) throw error;
+    // A cache outage here must not break resolution; fall through to a real fetch attempt.
+  }
+
+  // The concurrency cap bounds the whole fetchCimd call, not just the initial fetchImpl request --
+  // the resource being protected (an open outbound socket) stays held through the body read and
+  // its own TIMEOUT_MS-bounded wait too, so a cap that released after the headers arrived would
+  // leave the slower, still-expensive tail of the same request uncapped.
+  let doc: CimdDocument;
+  try {
+    doc = await config.cimdFetchLimiter.run(() => fetchCimd(config, url, opts.allowPrivateHosts ?? false));
+  } catch (error) {
+    if (error instanceof OAuthError) {
+      await config.cache.set(negativeCacheKey, error.description, NEGATIVE_CACHE_TTL_SECONDS).catch(() => {});
+    }
+    throw error;
+  }
 
   try {
     await upsertCimdClient(config, url, doc);
@@ -5677,12 +5932,16 @@ export function revokeController(config: ResolvedConfig): RequestHandler {
     }
     // RFC 7009 §2.2: answer 200 whether or not the token existed, so the endpoint cannot be
     // used to test token guesses.
-    if (parsed.data.token_type_hint === "refresh_token") {
-      await revokeByRefreshToken(config, parsed.data.token);
-    } else {
-      await revokeByAccessToken(config, parsed.data.token);
-      await revokeByRefreshToken(config, parsed.data.token);
-    }
+    //
+    // Both lookups always run, regardless of token_type_hint. RFC 7009 §2.1 allows a hint as a
+    // lookup optimization but requires falling back to the other token types when it doesn't
+    // resolve -- access and refresh tokens are both opaque, same-shape random strings (see
+    // services/tokens.ts), so a client that submits an access token but hints "refresh_token" (or
+    // vice versa) is entirely plausible, not just a hypothetical. A hint-only lookup would answer
+    // 200 -- the same success response as a real revocation -- while the submitted token stays
+    // live: the caller is told it's revoked when it isn't.
+    await revokeByAccessToken(config, parsed.data.token);
+    await revokeByRefreshToken(config, parsed.data.token);
     res.status(200).json({});
   });
 }
@@ -7805,20 +8064,9 @@ import type { RequestHandler, Response } from "express";
 import { asyncHandler } from "../controllers/asyncHandler";
 import type { ResolvedConfig } from "../config";
 import { sha256Hex } from "../crypto";
-import type { McpAuthContext } from "../types";
-
-// Declared against the global Express namespace, not `declare module "express-serve-static-core"`:
-// that module is only a transitive dependency of @types/express, not one of this package's own,
-// so under pnpm's strict node_modules it doesn't resolve from here and tsc fails with TS2664. The
-// module-scoped `Request<...>` type (what RequestHandler's `req` actually is) extends
-// `Express.Request`, so augmenting the namespace below reaches it the same way.
-declare global {
-  namespace Express {
-    interface Request {
-      mcp?: McpAuthContext;
-    }
-  }
-}
+// The Express.Request augmentation that makes `req.mcp` typecheck lives in ../types, not here --
+// see the comment there for why it has to be colocated with a re-exported symbol rather than with
+// the function that actually populates it at runtime.
 
 export function requireAuth(config: ResolvedConfig): RequestHandler {
   const resourceMetadata = `${config.host}/.well-known/oauth-protected-resource`;
