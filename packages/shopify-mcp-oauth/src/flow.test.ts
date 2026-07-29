@@ -118,7 +118,7 @@ async function authorizeAndGetShopifyState(
   app: ReturnType<typeof express>,
   input: { clientId: string; redirectUri: string; clientState: string; codeVerifier: string },
   path = "/authorize"
-): Promise<string> {
+): Promise<{ stateJwt: string; callbackPath: string }> {
   const response = await request(app)
     .get(path)
     .query({
@@ -136,7 +136,16 @@ async function authorizeAndGetShopifyState(
   // helper, since nothing previously looked at where the redirect actually points.
   expect(shopPickerUrl.origin).toBe(SHOPIFY_ADMIN_ORIGIN);
   const shopPickerRedirect = shopPickerUrl.searchParams.get("redirect") ?? "";
-  return new URLSearchParams(shopPickerRedirect.split("?")[1]).get("state") ?? "";
+  const embeddedShopifyQuery = new URLSearchParams(shopPickerRedirect.split("?")[1]);
+  // callbackPath is read from the SAME query /authorize embedded for Shopify to replay -- not a
+  // "/oauth/shopify-callback" literal -- so a bug that changed where /authorize tells Shopify to
+  // call back would actually break the flow that reads it, rather than being silently ignored by
+  // every caller posting straight to an unrelated hardcoded path.
+  const callbackUrl = embeddedShopifyQuery.get("redirect_uri") ?? "";
+  return {
+    stateJwt: embeddedShopifyQuery.get("state") ?? "",
+    callbackPath: new URL(callbackUrl).pathname,
+  };
 }
 
 describe("full authorization flow", () => {
@@ -161,14 +170,14 @@ describe("full authorization flow", () => {
     expect(protectedResource.body.resource).toBe(`${HOST}/mcp`);
 
     const { clientId, redirectUri } = await registerClient(app, REDIRECT_URI, registrationPath);
-    const stateJwt = await authorizeAndGetShopifyState(
+    const { stateJwt, callbackPath } = await authorizeAndGetShopifyState(
       app,
       { clientId, redirectUri, clientState: CLIENT_STATE, codeVerifier: CODE_VERIFIER },
       authorizePath
     );
 
     const callbackQuery = signShopifyCallback({ shop: DEMO_SHOP, code: "shopify-code", state: stateJwt });
-    const callback = await request(app).get(`/oauth/shopify-callback?${callbackQuery}`);
+    const callback = await request(app).get(`${callbackPath}?${callbackQuery}`);
     expect(callback.status).toBe(302);
     // fetchImpl is only ever called from inside shopifyCallbackController, once the HMAC guard and
     // state verification both succeed -- this is what proves the request actually got that far.
@@ -177,8 +186,14 @@ describe("full authorization flow", () => {
     // The single call that proves the merchant actually authorised THIS app for THIS shop -- a
     // stub that swallowed the request and returned success regardless of what was sent would be
     // indistinguishable from a real one without checking what actually went out on the wire.
+    // Every field on the init object is checked, not just url/body: a GET carrying a body throws
+    // under real fetch (Shopify's endpoint is POST-only), and the wrong Content-Type would make a
+    // real Shopify reject the exchange outright -- both previously unchecked, so a regression on
+    // either would have shipped as a silent, total login outage this suite still reported green.
     const [exchangeUrl, exchangeInit] = fetchImpl.mock.calls[0] as [string, RequestInit];
     expect(exchangeUrl).toBe(`https://${DEMO_SHOP}/admin/oauth/access_token`);
+    expect(exchangeInit.method).toBe("POST");
+    expect(exchangeInit.headers).toEqual({ "Content-Type": "application/json" });
     expect(JSON.parse(exchangeInit.body as string)).toEqual({
       client_id: SHOPIFY_API_KEY,
       client_secret: API_SECRET,
@@ -279,7 +294,7 @@ describe("full authorization flow", () => {
     const { app, fetchImpl } = buildApp({ storage: memoryStorage() });
 
     const { clientId, redirectUri } = await registerClient(app, REDIRECT_URI);
-    const stateJwt = await authorizeAndGetShopifyState(app, {
+    const { stateJwt, callbackPath } = await authorizeAndGetShopifyState(app, {
       clientId,
       redirectUri,
       clientState: CLIENT_STATE,
@@ -287,7 +302,7 @@ describe("full authorization flow", () => {
     });
 
     const callbackQuery = signShopifyCallback({ shop: DEMO_SHOP, code: "shopify-code", state: stateJwt });
-    const callback = await request(app).get(`/oauth/shopify-callback?${callbackQuery}`);
+    const callback = await request(app).get(`${callbackPath}?${callbackQuery}`);
 
     expect(callback.status).toBe(403);
     expect(callback.text).toContain(DEMO_SHOP);
@@ -316,12 +331,14 @@ describe("the errorHandler mount this file's buildApp includes is not decorative
 
     expect(response.status).toBe(500);
     expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
-    // "a caught error's .message must never reach a response body" -- checked directly, not just
-    // inferred from the generic body matching: a handler that logged the real message but still
-    // happened to answer with the generic shape would pass the assertion above.
-    const raw = JSON.stringify(response.body);
-    expect(raw).not.toContain("SyntaxError");
-    expect(raw).not.toContain(".ts:");
+    // Checked against response.TEXT, not response.body: the leak this test guards against is
+    // Express's own default HTML error page, which lands entirely outside the parsed JSON body --
+    // response.body stays `{}` for that response regardless, so asserting against it can never
+    // fail no matter what leaked. ".js:" (a real stack frame reads like
+    // "body-parser/lib/types/json.js:91:21"), not ".ts:" -- this package ships compiled JS, and a
+    // TypeScript-only needle would silently never match either the safe or the leaking response.
+    expect(response.text).not.toContain("SyntaxError");
+    expect(response.text).not.toContain(".js:");
   });
 });
 
@@ -343,9 +360,14 @@ describe("two shops stay distinct across independent flows", () => {
     const { clientId, redirectUri } = await registerClient(app, REDIRECT_URI);
 
     async function completeFlowFor(shop: string, clientState: string, codeVerifier: string): Promise<string> {
-      const stateJwt = await authorizeAndGetShopifyState(app, { clientId, redirectUri, clientState, codeVerifier });
+      const { stateJwt, callbackPath } = await authorizeAndGetShopifyState(app, {
+        clientId,
+        redirectUri,
+        clientState,
+        codeVerifier,
+      });
       const callbackQuery = signShopifyCallback({ shop, code: `shopify-code-for-${shop}`, state: stateJwt });
-      const callback = await request(app).get(`/oauth/shopify-callback?${callbackQuery}`);
+      const callback = await request(app).get(`${callbackPath}?${callbackQuery}`);
       expect(callback.status).toBe(302);
 
       // Each shop's own callback must send ITS OWN shop and code to Shopify -- not, say, the
@@ -389,7 +411,7 @@ describe("the shopify callback rejects a forged HMAC even when the state it carr
     const { app } = buildApp({ fetchImpl });
 
     const { clientId, redirectUri } = await registerClient(app, REDIRECT_URI);
-    const stateJwt = await authorizeAndGetShopifyState(app, {
+    const { stateJwt, callbackPath } = await authorizeAndGetShopifyState(app, {
       clientId,
       redirectUri,
       clientState: CLIENT_STATE,
@@ -403,7 +425,7 @@ describe("the shopify callback rejects a forged HMAC even when the state it carr
       code: "shopify-code",
       state: stateJwt,
     }).toString()}&hmac=${"0".repeat(64)}`;
-    const callback = await request(app).get(`/oauth/shopify-callback?${forgedQuery}`);
+    const callback = await request(app).get(`${callbackPath}?${forgedQuery}`);
 
     expect(callback.status).toBe(400);
     // fetchImpl is only ever called from inside shopifyCallbackController -- it staying uncalled
