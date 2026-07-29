@@ -1946,7 +1946,10 @@ Other decisions worth knowing:
 - Client-metadata documents are fetched with SSRF guards: HTTPS only, no private or loopback
   addresses, no redirects followed, a size cap, and a hard timeout.
 - Refresh rotates: redeeming a refresh token revokes it and issues a new pair.
-- `/revoke` always answers 200, per RFC 7009, so it cannot be used to probe which tokens exist.
+- `/revoke` answers 200 whether or not the submitted token existed, per RFC 7009, so it cannot be
+  used to probe which tokens exist. A rate limiter sits in front of the endpoint (`revokeRateLimit`
+  above) and can answer 429 under heavy call volume from one caller — that carries no information
+  about any particular token's validity, so it doesn't reopen the oracle RFC 7009 guards against.
 
 ## Development
 

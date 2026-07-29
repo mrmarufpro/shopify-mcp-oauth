@@ -2188,7 +2188,12 @@ function codeChallengeFor(verifier: string): string {
 }
 
 function signShopifyCallback(params: Record<string, string>): string {
-  const message = new URLSearchParams(params).toString();
+  // Sorted by key, mirroring the algorithm shopify-mcp-oauth's own verifyShopifyHmac applies (see
+  // that package's verifyShopifyHmac.test.ts) -- an insertion-order message produces a different
+  // digest, and this fixture would 400 at the package's own HMAC gate before the rest of the
+  // fixture (a real shop, a real code) ever mattered.
+  const sortedEntries = Object.entries(params).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  const message = new URLSearchParams(sortedEntries).toString();
   const hmac = crypto.createHmac("sha256", API_SECRET).update(message).digest("hex");
   return `${message}&hmac=${hmac}`;
 }
