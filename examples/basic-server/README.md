@@ -12,6 +12,13 @@ shop's domain, `echo` returns its input. No Admin API calls — this example is 
 
 ## Setup
 
+**0. Get the code.**
+
+```bash
+cd examples/basic-server
+pnpm install
+```
+
 **1. Create a Partner app.** In the Shopify Partner dashboard, create an app and copy its API key and
 API secret key.
 
@@ -134,10 +141,20 @@ Copy `src/tools/echo.ts`, change the schema and handler, and register it in `src
 Its optional `narrate` hook appends a line to successful results — useful if you want the calling
 agent to credit your app by name.
 
+`withAuditLog` writes your tool's input and output to the audit sink verbatim, with no redaction.
+That's fine for `whoami`/`echo`, but the moment a tool touches real customer data or the Admin API,
+redact or omit the sensitive fields before returning them, since whatever the handler returns is
+what lands in the audit log.
+
 ## Notes
 
 - The example uses Prisma 6 because `@shopify/shopify-app-session-storage-prisma@9` requires it.
-- The transport is stateless: no session IDs, no `GET`/`DELETE` handlers, any instance serves any
-  request. Tools that need to hold state across calls would need session-ful mode instead.
+- The transport is stateless: no session IDs, no MCP-level session handling for `GET`/`DELETE`, any
+  instance serves any request. Tools that need to hold state across calls would need session-ful
+  mode instead.
 - `prisma/migrations/0_init` was generated with `prisma migrate diff`, so cloning this repository
   never requires a running database.
+- This app calls `createShopifyMcpOAuth` without a `cache`, so `shopify-mcp-oauth` falls back to an
+  in-memory cache (it logs a warning on startup). That cache is single-process: authorization codes
+  written by one instance are invisible to another, so login fails intermittently the moment you run
+  more than one instance. Pass a shared `cache` such as `redisCache` before deploying more than one.

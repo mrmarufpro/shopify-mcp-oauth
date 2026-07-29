@@ -16,6 +16,7 @@ export interface AppDeps {
 const methodNotAllowed: RequestHandler = (_req, res) => {
   res
     .status(405)
+    .set("Allow", "POST")
     .json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. Use POST /mcp." }, id: null });
 };
 

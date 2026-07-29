@@ -85,10 +85,15 @@ export function withAuditLog<TSchema extends z.ZodTypeAny>(
 
     // After the audit write, so the logged payload stays free of presentation text.
     if (status === "success" && narrate) {
-      result = {
-        ...result,
-        content: [...result.content, { type: "text", text: narrate(toolName) }],
-      };
+      try {
+        result = {
+          ...result,
+          content: [...result.content, { type: "text", text: narrate(toolName) }],
+        };
+      } catch {
+        // Best effort, same as the audit write above: the audit entry already recorded success,
+        // so a broken narrate must not turn that into an unshaped SDK-level error for the client.
+      }
     }
 
     return result;

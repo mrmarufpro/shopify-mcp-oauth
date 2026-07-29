@@ -201,6 +201,29 @@ describe("withAuditLog", () => {
     expect(result.content).toHaveLength(1);
   });
 
+  it("falls back to the un-narrated result when narrate throws, keeping the success audit entry", async () => {
+    const audit = buildAuditSpy();
+    const callback = withAuditLog({
+      toolName: "echo",
+      schema: ECHO_SCHEMA,
+      handler: async () => ({ content: [{ type: "text", text: "ok" }] }),
+      narrate: () => {
+        throw new Error("narrate blew up");
+      },
+    });
+
+    const result = (await runTool(callback, { message: "hello" }, audit.sink)) as {
+      isError?: boolean;
+      content: Array<{ text: string }>;
+    };
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toHaveLength(1);
+    expect(result.content[0]!.text).toBe("ok");
+    expect(audit.entries).toHaveLength(1);
+    expect(audit.entries[0]!.status).toBe("success");
+  });
+
   it("refuses to run outside an authenticated request and logs nothing", async () => {
     const audit = buildAuditSpy();
     const callback = withAuditLog({
