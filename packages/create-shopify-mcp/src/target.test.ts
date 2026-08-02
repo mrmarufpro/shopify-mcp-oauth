@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile, stat } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -23,8 +23,15 @@ describe("prepareTarget", () => {
   });
 
   it("returns an absolute path even for a relative argument", async () => {
-    const target = await prepareTarget(path.join(workspace, PROJECT_NAME));
-    expect(path.isAbsolute(target)).toBe(true);
+    const previousCwd = process.cwd();
+    process.chdir(workspace);
+    try {
+      const target = await prepareTarget(PROJECT_NAME);
+      const expectedPath = path.join(await realpath(workspace), PROJECT_NAME);
+      expect(target).toBe(expectedPath);
+    } finally {
+      process.chdir(previousCwd);
+    }
   });
 
   it("accepts an existing empty directory", async () => {
