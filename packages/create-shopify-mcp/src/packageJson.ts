@@ -22,6 +22,7 @@ export async function rewritePackageJson(targetDir: string, options: { name: str
     ...((manifest.dependencies as Record<string, string> | undefined) ?? {}),
     ...((manifest.devDependencies as Record<string, string> | undefined) ?? {}),
   };
+  // If a workspace specifier survives into the template, the pack script was skipped and the user's pnpm install will fail on an unknown protocol. Fail here instead with the actual cause.
   const unresolved = Object.entries(specs)
     .filter(([, spec]) => spec.startsWith("workspace:"))
     .map(([name]) => name);
