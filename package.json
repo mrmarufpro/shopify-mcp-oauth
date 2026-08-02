@@ -9,7 +9,8 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "sync:template": "node packages/create-shopify-mcp/scripts/sync-template.mjs"
   },
   "devDependencies": {
     "prettier": "^3.3.3",
