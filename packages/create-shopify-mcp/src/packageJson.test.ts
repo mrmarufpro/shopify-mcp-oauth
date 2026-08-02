@@ -6,6 +6,13 @@ import { rewritePackageJson, toPackageName } from "./packageJson";
 
 const OAUTH_PACKAGE = "shopify-mcp-oauth";
 
+interface TemplateManifest {
+  name: string;
+  private: boolean;
+  dependencies: Record<string, string>;
+  devDependencies: Record<string, string>;
+}
+
 let workspace: string;
 
 async function writeTemplatePackageJson(overrides: Record<string, unknown> = {}): Promise<void> {
@@ -26,7 +33,7 @@ async function writeTemplatePackageJson(overrides: Record<string, unknown> = {})
   );
 }
 
-async function readTemplatePackageJson(): Promise<Record<string, never>> {
+async function readTemplatePackageJson(): Promise<TemplateManifest> {
   return JSON.parse(await readFile(path.join(workspace, "package.json"), "utf8"));
 }
 
