@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The example imports the package through its exports map, which points at dist/.
+      - run: pnpm build
+
+      - run: pnpm lint
+
+      - run: pnpm typecheck
+
+      - run: pnpm test
+
+      # Proves the scaffold template still generates cleanly from the example.
+      - run: pnpm sync:template
+
+      - name: Fail if the template carries a workspace specifier
+        run: |
+          if grep -q '"workspace:' packages/create-shopify-mcp/templates/default/package.json; then
+            echo "templates/default still pins a workspace dependency"
+            exit 1
+          fi

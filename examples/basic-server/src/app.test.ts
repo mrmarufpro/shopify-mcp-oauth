@@ -65,14 +65,16 @@ async function loginAndGetAccessToken(app: ReturnType<typeof buildApp>, shopDoma
     .post("/register")
     .send({ client_name: "Example Test Client", redirect_uris: [REDIRECT_URI] });
 
-  const authorize = await request(app).get("/authorize").query({
-    response_type: "code",
-    client_id: registration.body.client_id,
-    redirect_uri: REDIRECT_URI,
-    state: CLIENT_STATE,
-    code_challenge: codeChallengeFor(CODE_VERIFIER),
-    code_challenge_method: "S256",
-  });
+  const authorize = await request(app)
+    .get("/authorize")
+    .query({
+      response_type: "code",
+      client_id: registration.body.client_id,
+      redirect_uri: REDIRECT_URI,
+      state: CLIENT_STATE,
+      code_challenge: codeChallengeFor(CODE_VERIFIER),
+      code_challenge_method: "S256",
+    });
 
   const shopifyRedirect = new URL(redirectLocation(authorize)).searchParams.get("redirect") ?? "";
   const stateJwt = new URLSearchParams(shopifyRedirect.split("?")[1]).get("state") ?? "";
@@ -150,15 +152,19 @@ describe("basic-server app", () => {
 
   it("stops a shop that never installed the app, even though Shopify's bounce succeeded", async () => {
     const app = buildApp();
-    const registration = await request(app).post("/register").send({ redirect_uris: [REDIRECT_URI] });
-    const authorize = await request(app).get("/authorize").query({
-      response_type: "code",
-      client_id: registration.body.client_id,
-      redirect_uri: REDIRECT_URI,
-      state: CLIENT_STATE,
-      code_challenge: codeChallengeFor(CODE_VERIFIER),
-      code_challenge_method: "S256",
-    });
+    const registration = await request(app)
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI] });
+    const authorize = await request(app)
+      .get("/authorize")
+      .query({
+        response_type: "code",
+        client_id: registration.body.client_id,
+        redirect_uri: REDIRECT_URI,
+        state: CLIENT_STATE,
+        code_challenge: codeChallengeFor(CODE_VERIFIER),
+        code_challenge_method: "S256",
+      });
 
     const shopifyRedirect = new URL(redirectLocation(authorize)).searchParams.get("redirect") ?? "";
     const stateJwt = new URLSearchParams(shopifyRedirect.split("?")[1]).get("state") ?? "";
