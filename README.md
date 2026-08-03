@@ -83,9 +83,10 @@ app.use(oauth.errorHandler);
 | `host`                         | yes      | —                                  | Public origin, HTTPS in production, no trailing slash. Every issued URL derives from this.                          |
 | `shopify.apiKey` / `apiSecret` | yes      | —                                  | Your Shopify app's credentials — the same app the merchant installed.                                               |
 | `shopify.scopes`               | yes      | —                                  | Comma-separated. Must match the installed app's scopes or Shopify re-prompts.                                       |
-| `stateSecret`                  | yes      | —                                  | HS256 signing key for the state JWT. At least 32 bytes.                                                             |
+| `stateSecret`                  | yes      | —                                  | HS256 signing key for the state JWT. At least 32 characters.                                                        |
 | `storage`                      | yes      | —                                  | An `OAuthStorage`. See [docs/storage-adapters.md](docs/storage-adapters.md).                                        |
 | `cache`                        | no       | `memoryCache()`                    | Holds authorization codes and fetched client metadata documents.                                                    |
+| `cimdFetchConcurrency`         | no       | `10`                               | Caps concurrent fetches of client-metadata documents; requests beyond the cap queue for a free slot.                |
 | `tokenTtl.access`              | no       | `3600`                             | Seconds.                                                                                                            |
 | `tokenTtl.refresh`             | no       | `2592000`                          | Seconds — 30 days.                                                                                                  |
 | `openaiAppsChallengeToken`     | no       | `null`                             | Only needed to list the server as a ChatGPT app. The route is omitted when null.                                    |
