@@ -329,8 +329,15 @@ describe("the errorHandler mount this file's buildApp includes is not decorative
       .set("Content-Type", "application/json")
       .send('{"redirect_uris": [invalid');
 
-    expect(response.status).toBe(500);
-    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    // 400, not 500: body-parser marks its parse failure as the client's error and errorHandler
+    // honours that status (RFC 6749 §5.2 requires a malformed request to be refused, not blamed on
+    // the server). The status is incidental to what this case is for -- what matters is that the
+    // response came from this package's handler at all rather than from Express's default one.
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: "invalid_request",
+      error_description: "The request body could not be parsed",
+    });
     // Checked against response.TEXT, not response.body: the leak this test guards against is
     // Express's own default HTML error page, which lands entirely outside the parsed JSON body --
     // response.body stays `{}` for that response regardless, so asserting against it can never

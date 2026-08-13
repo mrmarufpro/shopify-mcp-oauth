@@ -23,9 +23,15 @@ export interface BuildRouterOptions {
 // request that carried one -- rather than anything that names a missing parser.
 //
 // Applied per-route, not with router.use(...), so this can never consume the body of a request on
-// the consumer's own routes; an MCP transport that wants the raw stream keeps it. Safe to run
-// after a consumer's own parser too: body-parser flags a request it has handled and skips it, so
-// the second parse is a no-op rather than a re-read of a consumed stream.
+// the consumer's own routes; an MCP transport that wants the raw stream keeps it. Safe to run after
+// a consumer's own body-parser: body-parser skips a request whose stream is already drained
+// (`onFinished.isFinished(req)`, lib/read.js) rather than re-reading a consumed one, so the second
+// parse is a no-op. Note that the guard is drained-stream, NOT an "already parsed" flag --
+// body-parser 1.x's `req._body` is gone in the 2.x this package runs on (Express >= 5). It holds
+// for any parser that actually consumed the stream, which is every body-parser-family parser and
+// every transport that read the request; a hypothetical consumer parser that populated `req.body`
+// without draining `req` would be double-read here. None is known, and there is no reliable
+// cross-library flag to check instead, so this is documented rather than guarded against.
 const parseJsonBody = express.json();
 const parseFormBody = express.urlencoded({ extended: false });
 

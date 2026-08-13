@@ -24,12 +24,54 @@ import type { Logger } from "../types";
 // package mounts itself, or a future controller that forgets to wrap with asyncHandler) even if
 // the consumer never wires the app-level one. Don't "simplify" this down to one mount — see
 // router.ts's own mutation-tested proof that each one guards a different origin.
+// A body-parser rejection is the client's fault, not this server's, and it carries the status that
+// says so: 400 entity.parse.failed, 413 entity.too.large, 415 charset.unsupported (http-errors sets
+// `status` on all three). Answering 500 for them is wrong twice over. On /token it breaks RFC 6749
+// §5.2, which requires a malformed token request to be refused with 400 invalid_request — a client
+// told "server_error" retries a request that can never succeed. And because router.ts now mounts
+// those parsers on the router's own routes, these arrive as ordinary traffic rather than as a
+// symptom of a broken deployment, so logging every one of them at `error` buries real faults under
+// noise an unauthenticated caller can generate at will (neither /token nor the parse step of any
+// route is rate limited).
+//
+// Only the status is taken from the error, never its message: body-parser's text names the parser
+// and the byte offset it gave up at, which is detail about this server's internals that an
+// unauthenticated caller has no business reading.
+const CLIENT_ERROR_DESCRIPTIONS: Record<number, string> = {
+  400: "The request body could not be parsed",
+  413: "The request body is too large",
+  415: "The request content type is not supported",
+};
+const GENERIC_CLIENT_ERROR_DESCRIPTION = "The request could not be processed";
+
+function clientErrorStatus(err: unknown): number | null {
+  const status = (err as { status?: unknown; statusCode?: unknown } | null)?.status;
+  const fallback = (err as { statusCode?: unknown } | null)?.statusCode;
+  const value = typeof status === "number" ? status : typeof fallback === "number" ? fallback : null;
+  if (value === null || !Number.isInteger(value) || value < 400 || value > 499) return null;
+  return value;
+}
+
 export function errorHandler(logger: Logger): ErrorRequestHandler {
   return (err, _req, res, next) => {
     if (res.headersSent) {
       next(err);
       return;
     }
+
+    const clientStatus = clientErrorStatus(err);
+    if (clientStatus !== null) {
+      // `warn`, not `error`: this is worth seeing when a client is misbehaving, but it is not a
+      // fault of this server and must not page anyone. `invalid_request` is the RFC 6749 §5.2 code
+      // for a malformed request, and is also the closest fit on /register (RFC 7591) and /revoke.
+      logger.warn("shopify-mcp-oauth: rejected a malformed request", { status: clientStatus });
+      res.status(clientStatus).json({
+        error: "invalid_request",
+        error_description: CLIENT_ERROR_DESCRIPTIONS[clientStatus] ?? GENERIC_CLIENT_ERROR_DESCRIPTION,
+      });
+      return;
+    }
+
     logger.error("shopify-mcp-oauth: unhandled error", err);
     res.status(500).json(GENERIC_SERVER_ERROR_BODY);
   };

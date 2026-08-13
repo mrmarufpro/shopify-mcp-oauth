@@ -4,6 +4,7 @@ import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "./adapters/memoryStorage";
 import { resolveConfig } from "./config";
+import { errorHandler as oauthErrorHandler } from "./middlewares/errorHandler";
 import type { BuildRouterOptions } from "./router";
 import { signOuterState } from "./services/stateJwt";
 import { issueTokens } from "./services/tokens";
@@ -223,9 +224,10 @@ describe("the router parses its own request bodies", () => {
     expect(response.status).toBe(200);
   });
 
-  // body-parser marks a request it has already handled and skips it, so the router's own parsers
-  // are a no-op on a consumer that mounts theirs first -- but that has to stay true, because
-  // double-reading a consumed stream would hang the request rather than fail it loudly.
+  // body-parser skips a request whose stream is already drained (`onFinished.isFinished(req)` in
+  // its lib/read.js -- the 1.x `req._body` flag is gone in the 2.x Express 5 depends on), so the
+  // router's own parsers are a no-op on a consumer that mounts theirs first. That has to stay true,
+  // because double-reading a consumed stream would hang the request rather than fail it loudly.
   it("does not disturb a consumer that already mounted its own parsers", async () => {
     const response = await request(buildApp())
       .post("/register")
@@ -350,15 +352,90 @@ describe("terminal error handler", () => {
     return app;
   }
 
-  it("converts a malformed JSON body into the generic safe shape instead of Express's default HTML stack trace", async () => {
+  it("converts a malformed JSON body into a safe 400 instead of Express's default HTML stack trace", async () => {
     const response = await request(buildFullyWiredApp())
       .post("/register")
       .set("Content-Type", "application/json")
       .send('{"redirect_uris": [invalid');
 
+    // The client sent a body this server could not parse, and body-parser says so on the error it
+    // throws (`status: 400`). Answering 500 would blame the server for the caller's mistake, and on
+    // /token specifically it breaks RFC 6749 §5.2 -- a client told `server_error` retries a request
+    // that can never succeed, where `invalid_request` tells it to stop.
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: "invalid_request",
+      error_description: "The request body could not be parsed",
+    });
+    expect(response.headers["content-type"]).toContain("json");
+  });
+
+  // Same handler, the other branch: an error carrying no client status is still this server's
+  // fault and must still be the opaque 500. Without this, honouring `err.status` could regress into
+  // honouring anything at all and no test would notice.
+  it("still answers an opaque 500 for an error that carries no client status", async () => {
+    const errorLog = vi.fn();
+    const app = express();
+    app.get("/boom", () => {
+      throw new Error("synthetic non-client failure");
+    });
+    // Mounted after the route: Express only searches forward from where the error occurred, so a
+    // handler mounted above the throwing layer is never reached.
+    app.use(oauthErrorHandler({ info: () => {}, warn: () => {}, error: errorLog }));
+
+    const response = await request(app).get("/boom");
+
     expect(response.status).toBe(500);
     expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
-    expect(response.headers["content-type"]).toContain("json");
+    expect(errorLog).toHaveBeenCalled();
+  });
+
+  // Now that the parsers are mounted on the router's own routes, the throw happens INSIDE the
+  // router's stack, so the handler router.ts mounts internally catches it with no app-level mount
+  // in sight. That is a genuinely different origin from every other case in this block (all of
+  // which route through the consumer's own `app.use(oauth.errorHandler)`), and it is the one a
+  // consumer who followed the README gets, since the README does not mount a consumer parser.
+  it("answers a malformed body from inside the router even with no app-level errorHandler mounted", async () => {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const app = express();
+    app.use(oauth.router);
+    // Deliberately no app.use(oauth.errorHandler) and no consumer body-parser.
+
+    const response = await request(app).post("/token").set("Content-Type", "application/json").send("{ not json");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_request");
+    // Express's default handler would have answered an HTML page carrying this.
+    expect(response.text).not.toContain("SyntaxError");
+  });
+
+  // RFC 6749 §5.2 names /token specifically, and /token is the endpoint whose old answer to this
+  // was a 400 the OAuth client could act on. Asserted on its own route rather than folded into the
+  // /register case above, because it is the one this regressed.
+  it("refuses a malformed /token body with 400 invalid_request, not 500", async () => {
+    const response = await request(buildFullyWiredApp())
+      .post("/token")
+      .set("Content-Type", "application/json")
+      .send("{ not json");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_request");
+  });
+
+  // body-parser's other two client statuses reach this handler by exactly the same route, and a
+  // fix that special-cased only SyntaxError would leave these as 500s. 413 in particular is the one
+  // an operator needs to be able to tell apart from a genuine fault.
+  it("answers 413 for a body over the parser's size limit", async () => {
+    const response = await request(buildFullyWiredApp())
+      .post("/token")
+      .set("Content-Type", "application/json")
+      .send(JSON.stringify({ grant_type: "x".repeat(200_000) }));
+
+    expect(response.status).toBe(413);
+    expect(response.body).toEqual({
+      error: "invalid_request",
+      error_description: "The request body is too large",
+    });
   });
 
   it("never leaks the SyntaxError message or a stack trace in that response", async () => {
@@ -380,18 +457,24 @@ describe("terminal error handler", () => {
   // side channel the response can't prove one way or the other; this drives the configured
   // logger's spy directly.
   it("threads the caller's configured logger into the exported errorHandler, not a hardcoded one", async () => {
+    const warnLog = vi.fn();
     const errorLog = vi.fn();
     const oauth = createShopifyMcpOAuth(
-      buildBaseConfig({ logger: { info: () => {}, warn: () => {}, error: errorLog } })
+      buildBaseConfig({ logger: { info: () => {}, warn: warnLog, error: errorLog } })
     );
     const app = express();
     app.use(express.json());
     app.use(oauth.router);
     app.use(oauth.errorHandler);
+    warnLog.mockClear(); // resolveConfig's own no-cache warning fires during construction.
 
     await request(app).post("/register").set("Content-Type", "application/json").send('{"redirect_uris": [invalid');
 
-    expect(errorLog).toHaveBeenCalledTimes(1);
+    // `warn`, not `error`: a body this caller could not encode is not a fault of this server, and
+    // /token and the parse step generally are reachable unauthenticated and unrated-limited -- so
+    // logging each one at `error` hands an anonymous caller a way to bury real faults under noise.
+    expect(warnLog).toHaveBeenCalledTimes(1);
+    expect(errorLog).not.toHaveBeenCalled();
   });
 
   it("leaks Express's own HTML stack trace when the consumer does not mount oauth.errorHandler, proving that mount is load-bearing", async () => {
@@ -410,14 +493,13 @@ describe("terminal error handler", () => {
     expect(response.text).toContain("SyntaxError");
   });
 
-  // Every controller mounted on `oauth.router` is already wrapped in asyncHandler, and none of
-  // the middlewares router.ts mounts directly (requireShopifyHmac, createRateLimiter) ever throw
-  // synchronously or call next(err) in this codebase today -- so there is currently no request
-  // that can make the router-internal errorHandler mount actually fire. Its value is structural:
-  // it protects a *future* controller that forgets to wrap with asyncHandler, or a synchronous
-  // throw added later to one of those middlewares. That can't be pinned by sending a request (there
-  // isn't one that reaches it), so this asserts the thing that actually matters -- an error-
-  // handling (4-arg) layer sits LAST in the router's own stack -- directly on the router's shape.
+  // The router-internal mount IS reachable by a real request now that router.ts mounts body parsers
+  // on its own routes: a malformed body throws inside the router's stack, so this handler answers
+  // it even when the consumer never mounted the app-level one ("answers a malformed body from
+  // inside the router..." below drives exactly that). It still also protects what it always did --
+  // a future controller that forgets asyncHandler, or a synchronous throw added to
+  // requireShopifyHmac/createRateLimiter -- and neither of those can be pinned by sending a
+  // request, so this keeps asserting the structural property directly on the router's shape.
   it("mounts an error-handling (4-arg) layer as the last layer in the router's own stack", () => {
     const oauth = createShopifyMcpOAuth(buildBaseConfig());
     const stack = (oauth.router as unknown as { stack: Array<{ handle: (...args: unknown[]) => unknown }> }).stack;

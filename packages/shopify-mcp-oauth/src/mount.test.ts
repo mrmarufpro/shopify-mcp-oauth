@@ -79,10 +79,17 @@ describe("mountShopifyMcpOAuth", () => {
 
     const response = await request(app).post("/mcp").set("Content-Type", "application/json").send("{ not json");
 
-    expect(response.status).toBe(500);
-    expect(response.body).toEqual({ error: "server_error", error_description: "An unexpected error occurred" });
+    // 400, not 500: a body this server could not parse is the client's error, and errorHandler
+    // reads the status body-parser put on it. What this case is really pinning is the shape --
+    // this package's JSON, from this package's handler, rather than Express's default HTML.
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({
+      error: "invalid_request",
+      error_description: "The request body could not be parsed",
+    });
     expect(response.text).not.toContain("SyntaxError");
   });
+});
 
   it("registers routes with no callback at all", async () => {
     const app = express();
