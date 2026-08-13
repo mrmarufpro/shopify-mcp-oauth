@@ -69,6 +69,12 @@ export function createShopifyMcpOAuth(
  * error handler, so an error it throws escapes to Express's default handler. Add every route from
  * inside the callback, or mount by hand.
  *
+ * `registerProtectedRoutes` is required rather than optional for that same reason. Defaulting it to
+ * a no-op reads as "routes are optional here" and invites the one call shape this helper exists to
+ * rule out -- `const oauth = mountShopifyMcpOAuth(app, config)` followed by `app.post("/mcp", ...)`
+ * on the next line, which lands the route below the error handler and restores the exact failure
+ * described above. A server with genuinely nothing to protect passes `() => {}` and says so.
+ *
  * Body parsing is not mounted for you here -- the router parses its own routes' bodies (see
  * router.ts), and what your MCP endpoint needs is yours to choose. Mount your own parsers on `app`
  * before calling this.
@@ -76,7 +82,7 @@ export function createShopifyMcpOAuth(
 export function mountShopifyMcpOAuth(
   app: Application,
   config: ShopifyMcpOAuthConfig,
-  registerProtectedRoutes: (oauth: ShopifyMcpOAuth) => void = () => {},
+  registerProtectedRoutes: (oauth: ShopifyMcpOAuth) => void,
   options: BuildRouterOptions = {}
 ): ShopifyMcpOAuth {
   const oauth = createShopifyMcpOAuth(config, options);
