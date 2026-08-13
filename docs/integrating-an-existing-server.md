@@ -273,6 +273,14 @@ that here too.
 Returning a shop admits the merchant, so this hook *is* the gate now — do the work your install
 would have done, and return `null` (or throw, for a 500) if it fails.
 
+Return the shop your write actually produced, never one you assemble by hand. The `id` must be the
+same id `findShopByDomain` will return for this domain from then on — every authenticated request
+re-resolves the shop by domain and compares that row's id against the one baked into the token. An
+id that lookup won't produce makes the login succeed and every subsequent tool call answer 401,
+which an MCP client treats as "log in again", so it re-runs the flow and loops. The `domain` must
+match the one passed in as well; a mismatch has the callback refuse the login rather than hand this
+merchant a token scoped to someone else's store.
+
 Omit the hook and you get the strict default. `allowAnyShop()` removes the gate entirely; only
 reach for it if your app genuinely keeps no per-shop record at all.
 

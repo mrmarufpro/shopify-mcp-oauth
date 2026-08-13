@@ -200,6 +200,15 @@ their own state (a shop row, a billing record, webhook registrations) do that he
 Returning a shop admits this merchant, so the hook **is** the gate now. Do the work your install
 would have done, and return `null` if it fails.
 
+**Return the shop your write actually produced, not one you build by hand.** The `id` has to be the
+same id `findShopByDomain` will return for this domain from then on: every authenticated request
+re-resolves the shop by domain and checks that row's id against the one in the token. Return an id
+that lookup won't produce and the login _succeeds_ while every tool call answers 401 — which the MCP
+client reads as "log in again", so it runs the whole flow again, and loops. Returning
+`findShopByDomain(domain)` (as above) or the row your insert returned is what avoids that; the
+`domain` you return must match the one passed in too, or the callback refuses the login rather than
+issue a token scoped to a different store.
+
 ## Read this before deploying
 
 **The default cache is single-process.** Authorization codes live in the cache, so with more than one

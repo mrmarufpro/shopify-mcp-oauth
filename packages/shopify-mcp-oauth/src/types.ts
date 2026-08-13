@@ -67,6 +67,20 @@ export interface OAuthStorage {
  * app that means storing the offline session (all the Shopify app template keeps), plus whatever
  * else its own install does, and then returns the resulting shop.
  *
+ * **The `id` you return must be the same id `findShopByDomain` will return for this domain from now
+ * on.** Every authenticated request re-resolves the shop by domain and compares that row's id with
+ * the one baked into the token (see authenticate.ts -- it is what stops a token minted before an
+ * uninstall/reinstall from working against the new install). Return an id that lookup won't produce
+ * -- a locally-constructed placeholder, a session key, the domain itself -- and the login *succeeds*
+ * while every subsequent request answers 401 `invalid_token`, which an MCP client reads as "log in
+ * again", so it re-runs the whole flow and loops. Returning the shop your own write just produced
+ * (`return storage.findShopByDomain(domain)` after registering, or the row your insert returned) is
+ * what satisfies this; anything you synthesize by hand does not.
+ *
+ * The `domain` you return must also match the `domain` passed in (compared case-insensitively) --
+ * that one is HMAC-verified, and a hook that resolves to a different shop has the callback refuse
+ * the login rather than issue this merchant a token scoped to someone else's store.
+ *
  * The package itself never persists the token -- it is handed to this hook and dropped.
  */
 export type ShopNotFoundHandler = (shop: { domain: string; accessToken: string }) => Promise<ShopRef | null>;

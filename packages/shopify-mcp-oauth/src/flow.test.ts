@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "./adapters/memoryStorage";
 import { sha256Base64Url } from "./crypto";
 import { createShopifyMcpOAuth } from "./index";
-import type { OAuthStorage, Logger } from "./types";
+import type { OAuthStorage, Logger, ShopNotFoundHandler } from "./types";
 
 // Every prior test file drives one unit against fakes. This one is the only place that drives the
 // whole login end to end through a real, fully-wired app -- discovery, /register, /authorize, the
@@ -40,6 +40,7 @@ function shopifyExchangeResponse(): Response {
 interface BuildAppOptions {
   storage?: OAuthStorage;
   fetchImpl?: ReturnType<typeof vi.fn>;
+  onShopNotFound?: ShopNotFoundHandler;
 }
 
 // Mounts oauth.errorHandler LAST, at the top level, after the consumer's own body-parsers and
@@ -62,6 +63,7 @@ function buildApp(options: BuildAppOptions = {}) {
     storage: options.storage ?? memoryStorage({ shops: [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] }),
     logger: silentLogger,
     fetchImpl: fetchImpl as unknown as typeof fetch,
+    onShopNotFound: options.onShopNotFound,
   });
 
   const app = express();
@@ -439,5 +441,75 @@ describe("the shopify callback rejects a forged HMAC even when the state it carr
     // proves requireShopifyHmac rejected this before the controller ever ran, not that the
     // controller ran and failed downstream for some unrelated reason.
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+// Nothing previously drove onShopNotFound past the redirect it produces. Every test of the hook
+// stopped at "a code was issued", which is exactly the point before the only thing that can
+// disagree with it -- requireAuth re-resolves the shop by domain on every request and compares that
+// row's id with the one baked into the token (see authenticate.ts). A hook returning an id that
+// lookup will never produce therefore passes every existing test and still leaves the merchant
+// unable to make a single tool call. See ShopNotFoundHandler's doc comment for the invariant.
+describe("a shop admitted by onShopNotFound has to survive the requests that follow", () => {
+  const LATE_REGISTERED_SHOP = "late.myshopify.com";
+  const LATE_REGISTERED_SHOP_ID = "shop_late";
+
+  // Registers the shop the way a host actually would -- writing it into the same storage the
+  // resource server reads back -- and returns the row that write produced.
+  async function completeLoginWithHook(hookResult: (storage: ReturnType<typeof memoryStorage>) => ShopNotFoundHandler) {
+    const storage = memoryStorage({ shops: [] });
+    const { app } = buildApp({ storage, onShopNotFound: hookResult(storage) });
+
+    const { clientId, redirectUri } = await registerClient(app, REDIRECT_URI);
+    const { stateJwt, callbackPath } = await authorizeAndGetShopifyState(app, {
+      clientId,
+      redirectUri,
+      clientState: CLIENT_STATE,
+      codeVerifier: CODE_VERIFIER,
+    });
+
+    const callbackQuery = signShopifyCallback({
+      shop: LATE_REGISTERED_SHOP,
+      code: "shopify-code",
+      state: stateJwt,
+    });
+    const callback = await request(app).get(`${callbackPath}?${callbackQuery}`);
+    expect(callback.status).toBe(302);
+
+    const authorizationCode = new URL(redirectLocation(callback)).searchParams.get("code") ?? "";
+    const tokenResponse = await request(app).post("/token").type("form").send({
+      grant_type: "authorization_code",
+      code: authorizationCode,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      code_verifier: CODE_VERIFIER,
+    });
+    expect(tokenResponse.status).toBe(200);
+
+    return request(app).post("/mcp").set("Authorization", `Bearer ${tokenResponse.body.access_token}`).send({});
+  }
+
+  it("authenticates real MCP calls when the hook returns the id storage will keep serving", async () => {
+    const call = await completeLoginWithHook((storage) => async ({ domain }) => {
+      storage.addShop({ id: LATE_REGISTERED_SHOP_ID, domain });
+      return { id: LATE_REGISTERED_SHOP_ID, domain };
+    });
+
+    expect(call.status).toBe(200);
+    expect(call.body.shop).toBe(LATE_REGISTERED_SHOP);
+  });
+
+  it("401s every call when the hook returns an id findShopByDomain will not produce", async () => {
+    // The failure this pins: login succeeds, a token is minted, and every request with it is
+    // refused. An MCP client reads that 401 as "log in again" and re-runs the whole flow, so the
+    // merchant sees an endless login loop rather than an error naming the misconfiguration. This
+    // test exists to make the invariant observable, not to bless the behaviour.
+    const call = await completeLoginWithHook((storage) => async ({ domain }) => {
+      storage.addShop({ id: LATE_REGISTERED_SHOP_ID, domain });
+      return { id: `synthesized:${domain}`, domain };
+    });
+
+    expect(call.status).toBe(401);
+    expect(call.body.error).toBe("invalid_token");
   });
 });
