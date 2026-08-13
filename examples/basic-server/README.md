@@ -158,7 +158,7 @@ what lands in the audit log.
   mode instead.
 - `prisma/migrations/0_init` was generated with `prisma migrate diff`, so cloning this repository
   never requires a running database.
-- This app calls `createShopifyMcpOAuth` without a `cache`, so `shopify-mcp-oauth` falls back to an
+- This app calls `mountShopifyMcpOAuth` without a `cache`, so `shopify-mcp-oauth` falls back to an
   in-memory cache (it logs a warning on startup). That cache is single-process: authorization codes
   written by one instance are invisible to another, so login fails intermittently the moment you run
   more than one instance. Pass a shared `cache` such as `redisCache` before deploying more than one.

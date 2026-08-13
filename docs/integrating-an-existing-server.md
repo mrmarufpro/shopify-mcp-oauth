@@ -43,8 +43,7 @@ Everything else has a default or a compile error waiting for it. See the
 
 ## 2. Give it somewhere to store clients and tokens
 
-Two new tables. Nothing here overlaps your existing schema, so this is additive — no data migration
-unless you're replacing an implementation of your own (see [step 8](#8-if-youre-replacing-your-own-oauth)).
+Two new tables. Nothing here overlaps your existing schema, so this is additive — no data migration.
 
 ```sql
 CREATE TABLE mcp_oauth_clients (
@@ -276,27 +275,6 @@ would have done, and return `null` (or throw, for a 500) if it fails.
 
 Omit the hook and you get the strict default. `allowAnyShop()` removes the gate entirely; only
 reach for it if your app genuinely keeps no per-shop record at all.
-
-## 8. If you're replacing your own OAuth
-
-Tokens you already issued live in your old table with your old column names. Two options:
-
-1. **Let them expire.** Point the package at fresh tables and leave the old ones read-only until the
-   longest refresh TTL passes. Nobody re-logs in until their refresh token dies.
-2. **Migrate the rows.** Copy them into the new shape. The one column your old implementation
-   probably doesn't have is `resource` — backfill it with `<host>/mcp` for every row:
-
-   ```sql
-   UPDATE mcp_oauth_tokens SET resource = 'https://mcp.example.com/mcp' WHERE resource IS NULL;
-   ```
-
-   Get this wrong and every connected merchant is silently logged out on your next deploy, because
-   the audience check rejects a `NULL` resource. Make the backfill fail loudly if the host isn't
-   configured rather than writing `NULL`.
-
-Your old `/authorize`, `/token`, `/register`, `/revoke`, state signing, PKCE verification, CIMD
-resolution, and Shopify HMAC middleware all come out. Delete them rather than leaving them mounted —
-a second `/token` route that still works is a second thing to keep secure.
 
 ## Gotchas worth knowing before you hit them
 
