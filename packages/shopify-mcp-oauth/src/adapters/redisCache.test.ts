@@ -4,7 +4,20 @@ import { redisCache, type RedisLikeClient, type RedisMultiLike } from "./redisCa
 
 const KEY = "mcp:oauth:code:abc";
 
-function buildFakeRedis(overrides: Record<string, unknown> = {}): RedisLikeClient {
+// The override parameter is typed, not `Record<string, unknown>`: these cases turn on exactly which
+// of `getDel` / `multi` the fake exposes, so a typo in an override key (`getDell`, `mutli`) would
+// silently leave the base client's canned `getDel` in place and have the MULTI tests assert against
+// the fallback path -- passing for the wrong reason, on the very tests that guard the atomicity
+// claim. Naming the two optional capabilities here makes that a compile error instead.
+type FakeRedisOverrides = Partial<{
+  get: RedisLikeClient["get"];
+  set: RedisLikeClient["set"];
+  del: RedisLikeClient["del"];
+  getDel: ((key: string) => Promise<string | null>) | undefined;
+  multi: (() => RedisMultiLike) | undefined;
+}>;
+
+function buildFakeRedis(overrides: FakeRedisOverrides = {}): RedisLikeClient {
   return {
     get: vi.fn().mockResolvedValue(null),
     set: vi.fn().mockResolvedValue("OK"),

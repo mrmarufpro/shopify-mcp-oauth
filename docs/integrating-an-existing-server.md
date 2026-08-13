@@ -76,8 +76,11 @@ CREATE TABLE mcp_oauth_tokens (
   created_at                 TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
 
-CREATE INDEX ON mcp_oauth_tokens (access_token_hash);
-CREATE INDEX ON mcp_oauth_tokens (refresh_token_hash);
+-- UNIQUE, not a plain index: findTokenByAccessHash/findTokenByRefreshHash each return one row, so
+-- two rows sharing a hash means one grant is reachable and the other is invisible -- including to
+-- /revoke, which would report success while leaving a live token behind.
+CREATE UNIQUE INDEX ON mcp_oauth_tokens (access_token_hash);
+CREATE UNIQUE INDEX ON mcp_oauth_tokens (refresh_token_hash);
 ```
 
 Four columns are easy to get wrong:
@@ -88,9 +91,10 @@ Four columns are easy to get wrong:
   rows, not in production traffic — which is worse, because it looks like a passing system.)
 - **`resource`** is the RFC 8707 audience. It must equal `<host>/mcp` on every row, and the resource
   server compares it with strict equality on every request — a `NULL` here rejects the token.
-- **`shop_id`** is a copy of your own shop table's id, not a foreign key the package requires.
-  Whatever type your shop ids are (`BIGINT`, `UUID`, `VARCHAR`) is fine; the package treats it as
-  `string | number` and compares it stringified.
+- **`shop_id`** is a copy of your own shop table's id, not a foreign key the package requires. The
+  `BIGINT` above is only what a numeric-id shop table would use — change it to match your own ids
+  (`UUID`, `VARCHAR`, whatever they are) rather than copying it verbatim. The package treats the
+  value as `string | number` and compares it stringified, so any of those work.
 
 ## 3. Wire storage
 
