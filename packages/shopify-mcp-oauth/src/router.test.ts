@@ -171,6 +171,70 @@ describe("requireAuth accepts a token this server actually issued", () => {
   });
 });
 
+// Every controller under this router reads req.body, but nothing in Express parses one by
+// default. Leaving that to the consumer meant a server whose own app only mounts express.json()
+// -- the obvious thing to mount, and what this project's own README used to show -- served a
+// /token endpoint that saw an empty body for the form encoding RFC 6749 §4.1.3 clients actually
+// send, and answered "grant_type is required" to a request that carried one. The router mounts
+// what its own routes need, on its own routes only.
+describe("the router parses its own request bodies", () => {
+  function buildAppWithoutBodyParsers() {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const app = express();
+    app.use(oauth.router);
+    app.use(oauth.errorHandler);
+    return app;
+  }
+
+  it("reads a form-encoded /token body with no consumer-mounted parser", async () => {
+    const response = await request(buildAppWithoutBodyParsers())
+      .post("/token")
+      .type("form")
+      .send({ grant_type: "refresh_token", refresh_token: "not-a-real-token", client_id: "some-client" });
+
+    // The point is that the body arrived at all: a request whose grant_type never landed is
+    // rejected as invalid_request instead, which is what an unparsed body produces.
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_grant");
+  });
+
+  it("reads a JSON /token body with no consumer-mounted parser", async () => {
+    const response = await request(buildAppWithoutBodyParsers())
+      .post("/token")
+      .send({ grant_type: "refresh_token", refresh_token: "not-a-real-token", client_id: "some-client" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe("invalid_grant");
+  });
+
+  it("reads a JSON /register body with no consumer-mounted parser", async () => {
+    const response = await request(buildAppWithoutBodyParsers())
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI], client_name: "Parser Test Client" });
+
+    expect(response.status).toBe(201);
+    expect(response.body.client_id).toEqual(expect.any(String));
+  });
+
+  it("reads a form-encoded /revoke body with no consumer-mounted parser", async () => {
+    const response = await request(buildAppWithoutBodyParsers()).post("/revoke").type("form").send({ token: "abc" });
+
+    // RFC 7009: 200 whether or not the token existed. An unparsed body would be a 400 instead.
+    expect(response.status).toBe(200);
+  });
+
+  // body-parser marks a request it has already handled and skips it, so the router's own parsers
+  // are a no-op on a consumer that mounts theirs first -- but that has to stay true, because
+  // double-reading a consumed stream would hang the request rather than fail it loudly.
+  it("does not disturb a consumer that already mounted its own parsers", async () => {
+    const response = await request(buildApp())
+      .post("/register")
+      .send({ redirect_uris: [REDIRECT_URI], client_name: "Double Parser Client" });
+
+    expect(response.status).toBe(201);
+  });
+});
+
 describe("createShopifyMcpOAuth", () => {
   it("throws on an invalid host before any request is served", () => {
     expect(() =>

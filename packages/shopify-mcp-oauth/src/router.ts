@@ -1,4 +1,4 @@
-import { Router } from "express";
+import express, { Router } from "express";
 import type { ResolvedConfig } from "./config";
 import { authorizeController } from "./controllers/authorize";
 import { authorizationServerMetadataController, protectedResourceMetadataController } from "./controllers/metadata";
@@ -15,6 +15,19 @@ export interface BuildRouterOptions {
   /** Test-only escape hatch: skips the CIMD private-address guard. Never set this in production. */
   allowPrivateCimdHosts?: boolean;
 }
+
+// Every POST route below reads req.body, and Express parses none by default. Mounted here rather
+// than left to the consumer for two reasons: a consumer has no way to know from the outside that
+// /token needs *both* encodings (RFC 6749 §4.1.3 clients post a form; some post JSON), and the
+// failure when one is missing is a plausible-looking OAuth error -- "grant_type is required" for a
+// request that carried one -- rather than anything that names a missing parser.
+//
+// Applied per-route, not with router.use(...), so this can never consume the body of a request on
+// the consumer's own routes; an MCP transport that wants the raw stream keeps it. Safe to run
+// after a consumer's own parser too: body-parser flags a request it has handled and skips it, so
+// the second parse is a no-op rather than a re-read of a consumed stream.
+const parseJsonBody = express.json();
+const parseFormBody = express.urlencoded({ extended: false });
 
 export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions = {}): Router {
   const router = Router();
@@ -38,6 +51,8 @@ export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions 
   router.post(
     "/register",
     createRateLimiter({ limit: config.registerRateLimit.limit, windowMs: config.registerRateLimit.windowMs }),
+    parseJsonBody,
+    parseFormBody,
     registerController(config)
   );
 
@@ -50,7 +65,7 @@ export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions 
     requireShopifyHmac(config.shopify.apiSecret),
     shopifyCallbackController(config)
   );
-  router.post("/token", tokenController(config));
+  router.post("/token", parseJsonBody, parseFormBody, tokenController(config));
   // RFC 7009 requires this to answer 200 regardless of whether the token existed, so it can't be
   // used as a token-guessing oracle -- but it's still free unauthenticated work (two hash +
   // storage lookups per request), the same shape /register's limiter guards against. Its own
@@ -59,6 +74,8 @@ export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions 
   router.post(
     "/revoke",
     createRateLimiter({ limit: config.revokeRateLimit.limit, windowMs: config.revokeRateLimit.windowMs }),
+    parseJsonBody,
+    parseFormBody,
     revokeController(config)
   );
 
