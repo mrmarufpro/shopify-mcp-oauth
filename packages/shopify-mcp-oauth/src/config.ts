@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { memoryCache } from "./adapters/memoryCache";
 import { createConcurrencyLimiter, type ConcurrencyLimiter } from "./services/concurrencyLimiter";
-import type { CacheStore, Logger, OAuthStorage } from "./types";
+import type { CacheStore, Logger, OAuthStorage, ShopNotFoundHandler } from "./types";
 
 const DEFAULT_ACCESS_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30;
@@ -26,6 +26,12 @@ export interface ShopifyMcpOAuthConfig {
   stateSecret: string;
   storage: OAuthStorage;
   cache?: CacheStore;
+  /**
+   * Last-chance shop resolution during the Shopify callback -- see `ShopNotFoundHandler`. Omit it
+   * and a shop `findShopByDomain` doesn't know is refused, which is the right default: the hook
+   * hands out the access token this package otherwise drops.
+   */
+  onShopNotFound?: ShopNotFoundHandler;
   tokenTtl?: { access?: number; refresh?: number };
   openaiAppsChallengeToken?: string | null;
   /**
@@ -65,6 +71,7 @@ export interface ResolvedConfig {
   stateSecret: string;
   storage: OAuthStorage;
   cache: CacheStore;
+  onShopNotFound: ShopNotFoundHandler | null;
   tokenTtl: { access: number; refresh: number };
   openaiAppsChallengeToken: string | null;
   registerRateLimit: { limit: number; windowMs: number };
@@ -160,6 +167,7 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
     stateSecret: parsed.data.stateSecret,
     storage: input.storage,
     cache: input.cache ?? memoryCache(),
+    onShopNotFound: input.onShopNotFound ?? null,
     tokenTtl: {
       access: parsed.data.tokenTtl?.access ?? DEFAULT_ACCESS_TTL_SECONDS,
       refresh: parsed.data.tokenTtl?.refresh ?? DEFAULT_REFRESH_TTL_SECONDS,

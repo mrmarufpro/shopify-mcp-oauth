@@ -5,7 +5,7 @@ import { memoryStorage } from "../adapters/memoryStorage";
 import { resolveConfig, type ResolvedConfig } from "../config";
 import { consumeCode } from "../services/codes";
 import { signOuterState } from "../services/stateJwt";
-import type { Logger } from "../types";
+import type { Logger, ShopNotFoundHandler } from "../types";
 import { shopifyCallbackController } from "./shopifyCallback";
 
 const HOST = "https://mcp.example.com";
@@ -26,7 +26,12 @@ const SHOPIFY_ACCESS_TOKEN = "shpua_exchanged_token";
 const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 
 function buildConfig(
-  overrides: { installed?: boolean; fetchImpl?: typeof fetch; logger?: Logger } = {}
+  overrides: {
+    installed?: boolean;
+    fetchImpl?: typeof fetch;
+    logger?: Logger;
+    onShopNotFound?: ShopNotFoundHandler;
+  } = {}
 ): ResolvedConfig {
   const installed = overrides.installed ?? true;
   const storage = memoryStorage({ shops: installed ? [{ id: DEMO_SHOP_ID, domain: DEMO_SHOP }] : [] });
@@ -46,6 +51,7 @@ function buildConfig(
     storage,
     fetchImpl,
     logger: overrides.logger,
+    onShopNotFound: overrides.onShopNotFound,
   });
 }
 
@@ -128,13 +134,71 @@ describe("shopifyCallbackController", () => {
     expect(vi.mocked(fetchImpl).mock.calls[0]?.[0]).toBe(`https://${DEMO_SHOP}/admin/oauth/access_token`);
   });
 
-  it("answers 403 when the shop is not installed", async () => {
+  it("answers 403 naming the shop when the host has no record of it", async () => {
     const response = await request(buildApp(buildConfig({ installed: false })))
       .get("/oauth/shopify-callback")
       .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
 
     expect(response.status).toBe(403);
-    expect(response.text).toMatch(/install/i);
+    expect(response.text).toContain(DEMO_SHOP);
+    // Reaching this point means Shopify DID grant the app -- it installs on approval -- so the
+    // refusal must not tell the merchant to install it. That is the step they just completed, and
+    // repeating it back leaves them circling with nothing else to try.
+    expect(response.text).not.toMatch(/install (it|this app|the app)/i);
+  });
+
+  it("issues a code for a shop that onShopNotFound registers on the spot", async () => {
+    const registeredShop = { id: "shop_registered_now", domain: DEMO_SHOP };
+    const config = buildConfig({ installed: false, onShopNotFound: async () => registeredShop });
+
+    const response = await request(buildApp(config))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(302);
+    const code = new URL(redirectLocation(response)).searchParams.get("code") ?? "";
+    // The code must be bound to the shop the hook returned, not re-read from storage: an app that
+    // registers the shop inside the hook may not have it queryable through findShopByDomain yet
+    // (a replica lag, a transaction not yet committed), and re-querying would 403 a merchant the
+    // hook just admitted.
+    expect(await consumeCode(config, code)).toMatchObject({
+      shopId: registeredShop.id,
+      shopDomain: registeredShop.domain,
+    });
+  });
+
+  it("hands onShopNotFound the shop domain and the freshly exchanged access token", async () => {
+    // The token is what lets a host write its own record of the shop -- for a template-shaped app
+    // that is the offline session, which cannot be stored without it. Nothing else in this flow
+    // could supply it, and the package itself keeps no copy.
+    const onShopNotFound = vi.fn().mockResolvedValue({ id: DEMO_SHOP_ID, domain: DEMO_SHOP });
+
+    await request(buildApp(buildConfig({ installed: false, onShopNotFound })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(onShopNotFound).toHaveBeenCalledWith({ domain: DEMO_SHOP, accessToken: SHOPIFY_ACCESS_TOKEN });
+  });
+
+  it("answers 403 when onShopNotFound declines to register the shop", async () => {
+    const response = await request(buildApp(buildConfig({ installed: false, onShopNotFound: async () => null })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(403);
+    expect(response.text).toContain(DEMO_SHOP);
+  });
+
+  it("does not call onShopNotFound when the host already has a record of the shop", async () => {
+    // The hook is a fallback for the miss, not a step in the happy path: a host that registers
+    // (and re-runs install side effects) on every login would re-register on every reconnect.
+    const onShopNotFound = vi.fn().mockResolvedValue({ id: DEMO_SHOP_ID, domain: DEMO_SHOP });
+
+    await request(buildApp(buildConfig({ installed: true, onShopNotFound })))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(onShopNotFound).not.toHaveBeenCalled();
   });
 
   it("rejects a state signed with a different secret", async () => {

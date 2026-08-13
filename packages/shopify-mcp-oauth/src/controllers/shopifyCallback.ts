@@ -62,14 +62,29 @@ export function shopifyCallbackController(config: ResolvedConfig): RequestHandle
       return;
     }
 
-    const shop = await config.storage.findShopByDomain(query.shop);
+    // A miss here is not necessarily "not a customer": under Shopify's managed install the app is
+    // granted without the merchant ever opening it, so a host whose record is written when the
+    // merchant first opens the embedded app legitimately has nothing yet. onShopNotFound is that
+    // host's chance to write it -- typically the offline session, all the Shopify app template
+    // keeps. It gets the access token because storing that session (and any Shopify call the
+    // host's own install would make) needs it, and nothing else in this flow could supply it.
+    const shop =
+      (await config.storage.findShopByDomain(query.shop)) ??
+      (await config.onShopNotFound?.({ domain: query.shop, accessToken })) ??
+      null;
     if (!shop) {
-      // Shopify installs the app on approval, so reaching this point does not prove the shop was
-      // ever a customer. This lookup is the only install gate.
+      // Reaching here does NOT mean the app is uninstalled -- Shopify grants it on approval, so by
+      // now it is installed. What's missing is the host's own record of the shop: this callback,
+      // not the host's, received the grant, and the Shopify token is discarded rather than stored,
+      // so nothing the host's install flow normally writes (an offline session at minimum) exists.
+      // The message must therefore not say "install it" -- that is what the merchant just did, and
+      // repeating it sends them in a circle with no way out.
       res
         .status(403)
         .type("text/plain")
-        .send(`${query.shop} has not installed this app. Install it first, then connect again.`);
+        .send(
+          `This app is not set up for ${query.shop}. Open it in your Shopify admin to finish setup, then try again.`
+        );
       return;
     }
 

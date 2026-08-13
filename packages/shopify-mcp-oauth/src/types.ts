@@ -53,6 +53,24 @@ export interface OAuthStorage {
   findShopByDomain(domain: string): Promise<ShopRef | null>;
 }
 
+/**
+ * Called during the Shopify callback when `findShopByDomain` misses, with the access token just
+ * exchanged for this shop -- proof the merchant controls it. Return a `ShopRef` to let the login
+ * continue as if the shop had been found, or `null` to keep the install gate's 403.
+ *
+ * This exists for one specific case: Shopify's managed install grants the app without the merchant
+ * ever opening it, so an app whose record of a shop is written when the merchant first opens the
+ * embedded app has nothing yet for one who installed and went straight to an MCP client. Without
+ * the hook such a merchant is refused -- for an app they have, in fact, already installed.
+ *
+ * A host that implements it writes that record here using the passed token: for a template-shaped
+ * app that means storing the offline session (all the Shopify app template keeps), plus whatever
+ * else its own install does, and then returns the resulting shop.
+ *
+ * The package itself never persists the token -- it is handed to this hook and dropped.
+ */
+export type ShopNotFoundHandler = (shop: { domain: string; accessToken: string }) => Promise<ShopRef | null>;
+
 export interface CacheStore {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ttlSeconds: number): Promise<void>;
