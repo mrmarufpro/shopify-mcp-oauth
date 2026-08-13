@@ -57,7 +57,7 @@ Three details carry weight:
 | `shopifySessionStorage(sessionStorage)` | Shop lookup against any `@shopify/shopify-app-session-storage` adapter. |
 | `allowAnyShop()` | Explicit opt-out of the install gate. |
 | `memoryCache()` | Default cache. Single-process. |
-| `redisCache(client)` | Production cache. |
+| `redisCache(client)` | Production cache. Issues a queued `MULTI GET+DEL`, atomic on every Redis version. |
 
 ## Where the shop comes from
 
@@ -91,30 +91,202 @@ section](../README.md#the-install-gate) before reaching for it.
 
 ## Writing your own
 
-Any object matching `OAuthStorage` works: Drizzle, Sequelize, TypeORM, Mongo, raw SQL, Redis. A
-sketch, with the parts that are easy to get wrong:
+Any object matching `OAuthStorage` works: Drizzle, Sequelize, TypeORM, Mongo, raw SQL, Redis. It's
+about 150 lines of mechanical query code — and since the package ships the suite that proves it
+correct, you can write it test-first and know when you're done.
+
+### The tables it needs
+
+See [the DDL in the integration guide](integrating-an-existing-server.md#2-give-it-somewhere-to-store-clients-and-tokens)
+for the full schema. Column names are entirely yours — the adapter is the mapping layer — but four
+column *types* carry real consequences:
+
+| Column                              | Watch out for                                                                                                                                |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `access_token_hash` / `refresh_token_hash` | A SHA-256 hex digest, 64 chars. Use `VARCHAR(64)`, not `CHAR(64)`: Postgres blank-pads `CHAR` on read and the padded value won't match. |
+| `resource`                          | Long enough for a URL (`VARCHAR(2048)`). Compared with strict equality; a `NULL` rejects the token.                                          |
+| token `id`                          | Any type. It crosses the interface as an opaque `string`, so convert at the boundary, both ways.                                             |
+| `shop_id`                           | A copy of your own shop id, `string \| number`. The package only ever compares it stringified.                                               |
+
+### A worked adapter
+
+Sequelize, snake_case columns, `BIGINT` ids, and the shop domain joined rather than denormalized —
+i.e. deliberately none of the shapes `prismaStorage` assumes. This is a real adapter that passes the
+contract suite; the comments mark every place a shortcut would have been wrong.
 
 ```ts
-const storage: OAuthStorage = {
-  async findTokenByAccessHash(hash) {
-    // Filter here — the package does not re-check.
-    return db.token.findFirst({
-      where: { accessTokenHash: hash, revokedAt: null, accessTokenExpiresAt: { gt: new Date() } },
-    });
-  },
+import { Op } from "sequelize";
+import type { NewOAuthClient, NewToken, OAuthClient, OAuthStorage, ShopRef, StoredToken } from "shopify-mcp-oauth";
 
-  async revokeToken(id) {
-    // Conditional, so two concurrent refreshes cannot both succeed.
-    const { count } = await db.token.updateMany({
-      where: { id, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
-    return count > 0;
-  },
+// StoredToken.shopDomain is denormalized in the package's own schema and joined here. `required:
+// true` (an INNER JOIN) means a token whose shop row vanished reads as "no such token" — the safe
+// reading, and the same answer requireAuth would reach a moment later anyway.
+const WITH_SHOP_DOMAIN = { model: Shop, as: "shop", attributes: ["domain"], required: true };
 
-  // ...the rest
+// Token ids are opaque strings to the package, and /revoke feeds it whatever a caller submitted.
+// Postgres raises `invalid input syntax for type bigint` on a non-numeric value rather than simply
+// matching nothing, so an unparseable id must become "no such row" before it reaches SQL.
+function toRowId(id: string): number | null {
+  const parsed = Number(id);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function toToken(row: TokenRow, shopDomain: string): StoredToken {
+  return {
+    id: String(row.id), // BIGINT out, string in
+    shopId: Number(row.shop_id),
+    shopDomain,
+    clientId: row.client_id,
+    accessTokenHash: row.access_token_hash,
+    refreshTokenHash: row.refresh_token_hash ?? null,
+    accessTokenExpiresAt: row.access_token_expires_at,
+    refreshTokenExpiresAt: row.refresh_token_expires_at ?? null,
+    scope: row.scope ?? null,
+    resource: row.resource ?? null,
+    revokedAt: row.revoked_at ?? null,
+    rotatedFromId: row.rotated_from_id == null ? null : String(row.rotated_from_id),
+  };
+}
+
+export function sequelizeOauthStorage(): OAuthStorage {
+  return {
+    async findClient(clientId) {
+      const row = await McpOauthClient.findOne({ where: { client_id: clientId, revoked_at: null } });
+      return row ? toClient(row.get({ plain: true })) : null;
+    },
+
+    async createClient(client) {
+      const row = await McpOauthClient.create(toClientRow(client));
+      return toClient(row.get({ plain: true }));
+    },
+
+    async upsertClient(client) {
+      // First write wins. Re-registration must NOT let a caller holding an existing client_id
+      // rewrite that client's redirect URIs — findOrCreate, not upsert.
+      const [row] = await McpOauthClient.findOrCreate({
+        where: { client_id: client.clientId },
+        defaults: toClientRow(client),
+      });
+      return toClient(row.get({ plain: true }));
+    },
+
+    async createToken(token) {
+      const row = await McpOauthToken.create({
+        shop_id: token.shopId,
+        client_id: token.clientId,
+        access_token_hash: token.accessTokenHash,
+        refresh_token_hash: token.refreshTokenHash,
+        access_token_expires_at: token.accessTokenExpiresAt,
+        refresh_token_expires_at: token.refreshTokenExpiresAt,
+        scope: token.scope,
+        resource: token.resource, // never drop this — a NULL fails the audience check
+        rotated_from_id: token.rotatedFromId === null ? null : Number(token.rotatedFromId),
+      });
+      // The caller just handed us the domain; re-reading it through the association would cost a
+      // second query to learn something we already know.
+      return toToken(row.get({ plain: true }), token.shopDomain);
+    },
+
+    async findTokenByAccessHash(hash) {
+      // Expiry and revocation are filtered HERE. The package trusts what comes back.
+      const row = await McpOauthToken.findOne({
+        where: { access_token_hash: hash, revoked_at: null, access_token_expires_at: { [Op.gt]: new Date() } },
+        include: [WITH_SHOP_DOMAIN],
+      });
+      if (!row) return null;
+      const plain = row.get({ plain: true });
+      return toToken(plain, plain.shop.domain);
+    },
+
+    async findTokenByAccessHashIgnoringExpiry(hash) {
+      // Same query minus the expiry clause — /revoke must still be able to kill a grant whose
+      // access token has expired but whose refresh token is alive. Still excludes revoked rows.
+      const row = await McpOauthToken.findOne({
+        where: { access_token_hash: hash, revoked_at: null },
+        include: [WITH_SHOP_DOMAIN],
+      });
+      if (!row) return null;
+      const plain = row.get({ plain: true });
+      return toToken(plain, plain.shop.domain);
+    },
+
+    async findTokenByRefreshHash(hash) {
+      const row = await McpOauthToken.findOne({
+        where: { refresh_token_hash: hash, revoked_at: null, refresh_token_expires_at: { [Op.gt]: new Date() } },
+        include: [WITH_SHOP_DOMAIN],
+      });
+      if (!row) return null;
+      const plain = row.get({ plain: true });
+      return toToken(plain, plain.shop.domain);
+    },
+
+    async revokeToken(id) {
+      const rowId = toRowId(id);
+      if (rowId === null) return false;
+      // Conditional update, NOT read-then-write: of two concurrent refreshes only the one that
+      // flips revoked_at from NULL sees `true`. That is what makes a refresh token single-use.
+      const [affected] = await McpOauthToken.update(
+        { revoked_at: new Date() },
+        { where: { id: rowId, revoked_at: null } }
+      );
+      return affected > 0;
+    },
+
+    async touchToken(id, lastUsedAt) {
+      const rowId = toRowId(id);
+      if (rowId === null) return;
+      // Best-effort telemetry; the package calls it without awaiting.
+      await McpOauthToken.update({ last_used_at: lastUsedAt }, { where: { id: rowId } });
+    },
+
+    async findShopByDomain(domain) {
+      const shop = await Shop.findOne({ where: { domain }, attributes: ["id", "domain"] });
+      return shop ? { id: Number(shop.id), domain: shop.domain } : null;
+    },
+  };
+}
+```
+
+### The five mistakes worth naming
+
+1. **Filtering in the wrong place.** `findTokenByAccessHash` and `findTokenByRefreshHash` must
+   exclude expired and revoked rows themselves. Return one and it authenticates.
+2. **`revokeToken` as read-then-write.** Two concurrent refreshes both read `revokedAt === null`,
+   both write, both mint a new token pair. One conditional `UPDATE ... WHERE revoked_at IS NULL`.
+3. **`upsertClient` that actually updates.** It must not let a re-registration overwrite an existing
+   client's redirect URIs — that's an open redirect handed to whoever guesses a client id.
+4. **Dropping `resource` on write.** The row stores fine and the token 401s on first use, which
+   reads as "login is broken" rather than "one column isn't persisted".
+5. **Leaking your id type.** Return `id` as a string, take it back as a string, convert in one
+   place. A number that survives to `req.mcp.tokenId` produces type errors nowhere near the cause.
+
+### Writing a CacheStore
+
+Four methods, and only one is interesting:
+
+```ts
+const cache: CacheStore = {
+  async get(key) { /* ... */ },
+  async set(key, value, ttlSeconds) { /* must reject ttlSeconds <= 0 */ },
+  async del(key) { /* ... */ },
+  async getdel(key) { /* MUST be atomic — see below */ },
 };
 ```
+
+If your backend has no native atomic read-and-delete, a transaction is the substitute. A queued
+`MULTI` is exactly as atomic as `GETDEL` and works on every Redis version — `redisCache` does this
+for you, but the shape generalizes:
+
+```ts
+async getdel(key) {
+  const [value] = await redis.multi().get(key).del(key).exec();
+  return (value as string | null) ?? null;
+}
+```
+
+On SQL, a single `DELETE ... RETURNING value`. What you cannot do is `get()` and then `del()`: both
+concurrent callers read the value before either delete lands, and the authorization code becomes
+replayable.
 
 ## Proving it
 

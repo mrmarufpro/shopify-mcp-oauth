@@ -13,6 +13,13 @@ Two packages:
 Plus [`examples/basic-server`](examples/basic-server), which is both the demo and the scaffolder's
 template.
 
+**Guides:**
+
+| Doc                                                                             | Read it when                                                  |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| [Adding this to an existing MCP server](docs/integrating-an-existing-server.md) | You already have an MCP endpoint and want Shopify login on it |
+| [Storage adapters](docs/storage-adapters.md)                                    | You're not on Prisma, or your cache isn't Redis               |
+
 ## Quickstart
 
 ```bash
@@ -41,40 +48,80 @@ Code, VS Code, Cursor, and ChatGPT each fail in a different, silent way.
 
 This ships that layer, and leaves the tools to you.
 
-## Using the package directly
+## Adding it to a server you already have
+
+Already have an MCP endpoint? This replaces its auth and touches nothing else — your tools,
+transport, and business logic stay as they are. Full walkthrough, including the schema it needs and
+how to keep a token scheme you already support:
+**[docs/integrating-an-existing-server.md](docs/integrating-an-existing-server.md)**.
+
+The wiring itself:
 
 ```ts
 import express from "express";
-import { createShopifyMcpOAuth, prismaStorage, shopifySessionStorage, redisCache } from "shopify-mcp-oauth";
-
-const oauth = createShopifyMcpOAuth({
-  host: "https://mcp.example.com",
-  shopify: {
-    apiKey: process.env.SHOPIFY_API_KEY!,
-    apiSecret: process.env.SHOPIFY_API_SECRET!,
-    scopes: "read_products,write_products",
-  },
-  stateSecret: process.env.OAUTH_STATE_SECRET!,
-  storage: {
-    ...prismaStorage(prisma),
-    findShopByDomain: shopifySessionStorage(sessionStorage),
-  },
-  cache: redisCache(redis),
-});
+import { mountShopifyMcpOAuth, prismaStorage, shopifySessionStorage, redisCache } from "shopify-mcp-oauth";
 
 const app = express();
-app.use(express.json());
-app.use(oauth.router);
-app.post("/mcp", oauth.requireAuth, myMcpHandler);
+app.use(express.json()); // for YOUR routes; the OAuth router parses its own
 
-// Must be the LAST app.use(...) call, after every body-parser and route above (oauth.router
-// included) -- a body-parser's SyntaxError on malformed JSON is thrown before Express ever
-// reaches oauth.router, so an error handler mounted inside that router can't catch it. Only an
-// error handler registered here, at this app's own outermost level, sees it.
-app.use(oauth.errorHandler);
+mountShopifyMcpOAuth(
+  app,
+  {
+    host: "https://mcp.example.com",
+    shopify: {
+      apiKey: process.env.SHOPIFY_API_KEY!,
+      apiSecret: process.env.SHOPIFY_API_SECRET!,
+      scopes: "read_products,write_products",
+    },
+    stateSecret: process.env.OAUTH_STATE_SECRET!,
+    storage: {
+      ...prismaStorage(prisma),
+      findShopByDomain: shopifySessionStorage(sessionStorage),
+    },
+    cache: redisCache(redis),
+  },
+  (oauth) => {
+    app.post("/mcp", oauth.requireAuth, myMcpHandler);
+  }
+);
 ```
 
 `requireAuth` sets `req.mcp = { shopId, shopDomain, tokenId }`.
+
+`mountShopifyMcpOAuth` mounts the router, then your routes, then the error handler **last**. That
+last position is the one that matters: Express only looks for an error handler at the stack level
+where the error was thrown, so a body-parser `SyntaxError` on malformed JSON never reaches one
+mounted inside a router — and Express's default handler answers an HTML stack trace on an
+unauthenticated endpoint instead. The helper makes that ordering structural. Its one rule: register
+every route inside the callback, because anything added to `app` afterwards sits below the error
+handler.
+
+`createShopifyMcpOAuth` returns the same handle without mounting anything, if you'd rather place the
+three pieces yourself.
+
+### If you already have a token scheme
+
+`requireAuth` answers the request itself on failure, so nothing can run after it. To accept a second
+credential — a personal access token most merchants still use, say — compose the same logic
+directly:
+
+```ts
+app.post("/mcp", async (req, res, next) => {
+  const pat = await myOwnScheme(req);
+  if (pat) {
+    req.mcp = pat;
+    return next();
+  }
+
+  const result = await oauth.authenticate(req); // resolves, never responds
+  if (!result.ok) return oauth.challenge(res, result.reason); // 401 + WWW-Authenticate
+  req.mcp = result.context;
+  next();
+});
+```
+
+`challenge` isn't decoration: the `WWW-Authenticate` header it writes is how a client that has never
+seen your server finds out where to log in (RFC 9728).
 
 ## Configuration
 
@@ -86,6 +133,7 @@ app.use(oauth.errorHandler);
 | `stateSecret`                  | yes      | —                                  | HS256 signing key for the state JWT. At least 32 characters.                                                        |
 | `storage`                      | yes      | —                                  | An `OAuthStorage`. See [docs/storage-adapters.md](docs/storage-adapters.md).                                        |
 | `cache`                        | no       | `memoryCache()`                    | Holds authorization codes and fetched client metadata documents.                                                    |
+| `onShopNotFound`               | no       | `null`                             | Last-chance shop resolution when the install gate misses. See [The install gate](#the-install-gate).                |
 | `cimdFetchConcurrency`         | no       | `10`                               | Caps concurrent fetches of client-metadata documents; requests beyond the cap queue for a free slot.                |
 | `tokenTtl.access`              | no       | `3600`                             | Seconds.                                                                                                            |
 | `tokenTtl.refresh`             | no       | `2592000`                          | Seconds — 30 days.                                                                                                  |
@@ -107,7 +155,7 @@ naming the field — never at the first request.
 4. We redirect to Shopify's shop picker. The merchant chooses a store and approves.
 5. Shopify calls /oauth/shopify-callback. We verify its HMAC and exchange the code —
    proof the merchant controls that shop. The Shopify token is then discarded.
-6. We check the shop is one you know. If not: 403 shop_not_installed.
+6. We check the shop is one you know. If not, `onShopNotFound` gets a last word; otherwise 403.
 7. We issue a 60-second authorization code, the client redeems it at /token with its
    PKCE verifier, and gets an access token and a refresh token.
 8. The client calls POST /mcp with `Authorization: Bearer <access_token>`.
@@ -117,16 +165,51 @@ The merchant's browser is the only participant that talks to Shopify during cons
 
 ## The install gate
 
-Step 6 is load-bearing. Completing Shopify's flow does **not** prove the app was already installed —
-Shopify installs it on approval if it was not. Without the shop lookup, any merchant on Shopify could
-mint a token for your server. `allowAnyShop()` removes that check; only use it if your app genuinely
-keeps no per-shop record.
+Step 6 is load-bearing, and it is worth being precise about what it checks.
+
+Reaching it means the app **is** installed on that shop — Shopify grants it on approval, so a
+merchant who wasn't a customer a moment ago is one now. What it does not mean is that **your app has
+any record of it**. The grant landed on this MCP server's `/oauth/shopify-callback`, and the package
+deliberately discards the Shopify token rather than persisting it, so nothing your own install flow
+normally writes gets written: no offline session (all the Shopify app template stores), no shop or
+store row if your app keeps one, no billing subscription, no webhook registrations, no `afterAuth`.
+
+Without the lookup, that merchant gets tool access anyway — skipping whatever your real install does,
+billing first among them, against a shop your app has never heard of. So the gate asks "does my app
+already know this shop", not "did Shopify grant the app". `allowAnyShop()` removes it; only use it if
+your app genuinely keeps no per-shop record at all.
+
+A miss still isn't always "not a customer". Shopify's managed install grants the app without the
+merchant ever opening it, so an app whose record is written when the merchant first opens the
+embedded app has nothing yet for a merchant who installed and went straight to an MCP client — and
+telling them to install an app they already installed is a dead end. Same principle as above,
+arrived at from the other side: the grant exists, your record doesn't. `onShopNotFound` runs at
+exactly that point, with the access token just exchanged for the shop:
+
+```ts
+onShopNotFound: async ({ domain, accessToken }) => {
+  await registerShop(domain, accessToken); // store the offline session; run your own install work
+  return storage.findShopByDomain(domain); // null keeps the 403
+};
+```
+
+For a template-shaped app, "register" is usually just storing the offline session — the thing your
+own callback would have stored, which is why the token is handed over here. Apps that keep more of
+their own state (a shop row, a billing record, webhook registrations) do that here too.
+
+Returning a shop admits this merchant, so the hook **is** the gate now. Do the work your install
+would have done, and return `null` if it fails.
 
 ## Read this before deploying
 
 **The default cache is single-process.** Authorization codes live in the cache, so with more than one
 instance a login started on one instance fails on another, and the client reports an opaque
-`invalid_grant`. Pass `cache: redisCache(redis)` before you scale past one process.
+`invalid_grant`. Pass `cache: redisCache(redis)` before you scale past one process. `redisCache`
+takes a node-redis v4-shaped client and issues a queued `MULTI GET+DEL` — atomic, which is what keeps
+an authorization code single-use, and available on every Redis version. It does not prefer `GETDEL`:
+a client library defining `getDel` says nothing about whether the server implements the command,
+which arrived only in 6.2, so on a 6.0/6.1 server that path fails at every login with `ERR unknown
+command 'GETDEL'`. `getDel` is used only for a client exposing no `multi()`.
 
 Other decisions worth knowing:
 

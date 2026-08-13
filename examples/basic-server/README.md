@@ -79,12 +79,15 @@ Pick a store in Shopify's picker that has no seeded session, approve the install
 callback answers with a plain-text `403`:
 
 ```
-your-store.myshopify.com has not installed this app. Install it first, then connect again.
+This app is not set up for your-store.myshopify.com. Open it in your Shopify admin to finish setup, then try again.
 ```
 
-That's not a bug — it means no offline session exists for that shop. The install gate is deliberate:
-completing Shopify's flow does **not** prove the app was installed beforehand — Shopify installs it on
-approval — so without this check any merchant on Shopify could mint a token for your server.
+That's not a bug — it means no offline session exists for that shop. Note what it does **not** mean:
+by approving that screen you did install the app, because Shopify grants it on approval. What's
+missing is this server's own record of the shop. The grant went to `/oauth/shopify-callback` here,
+and the package discards the Shopify token rather than storing it, so nothing a real install flow
+would have written exists. That's the install gate, and it's deliberate — without it any merchant on
+Shopify could mint a token against a shop your app knows nothing about.
 
 Fix it by picking the store you seeded, or by seeding the store you picked:
 
@@ -92,7 +95,8 @@ Fix it by picking the store you seeded, or by seeding the store you picked:
 DEMO_SHOP_DOMAIN=your-store.myshopify.com pnpm db:seed
 ```
 
-In a real app the row already exists, written by your install flow.
+In a real app the session already exists, written by your own install flow — or you supply
+`onShopNotFound` and write it right there in the callback.
 
 ## How it fits together
 
