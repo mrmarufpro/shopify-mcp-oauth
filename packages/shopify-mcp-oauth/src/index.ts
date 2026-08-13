@@ -35,12 +35,18 @@ export function createShopifyMcpOAuth(
   options: BuildRouterOptions = {}
 ): ShopifyMcpOAuth {
   const resolved = resolveConfig(config);
-  return {
+  // One Authenticator, and the returned handle *is* it -- Object.assign mutates and returns its
+  // first argument, so `oauth.authenticate` and the function `requireAuth` calls are the same
+  // property of the same object. Building a second Authenticator for requireAuth (or spreading this
+  // one into a fresh object literal) would leave `oauth.authenticate` a detached copy, and the
+  // documented equivalence -- requireAuth *is* authenticate + challenge -- would quietly stop
+  // holding for anyone who wraps `oauth.authenticate` to add logging or force a failure in a test.
+  const authenticator = createAuthenticator(resolved);
+  return Object.assign(authenticator, {
     router: buildRouter(resolved, options),
-    requireAuth: requireAuth(resolved),
+    requireAuth: requireAuth(resolved, authenticator),
     errorHandler: errorHandler(resolved.logger),
-    ...createAuthenticator(resolved),
-  };
+  });
 }
 
 /**

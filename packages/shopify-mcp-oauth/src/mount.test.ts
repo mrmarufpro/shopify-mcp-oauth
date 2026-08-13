@@ -91,10 +91,32 @@ describe("mountShopifyMcpOAuth", () => {
   });
 });
 
-  it("registers routes with no callback at all", async () => {
+// `requireAuth` is documented as the mount-and-forget form of `authenticate` + `challenge`. It was
+// built from a SECOND Authenticator, so that claim was only true by coincidence of both copies
+// behaving alike -- wrapping `oauth.authenticate` (tenant-scoped logging, a forced failure in a
+// test) left the protected route running the untouched copy, which is the failure mode that makes
+// a security seam look wired when it isn't.
+describe("requireAuth and oauth.authenticate are the same seam", () => {
+  it("routes a protected request through a replacement assigned to oauth.authenticate", async () => {
     const app = express();
-    mountShopifyMcpOAuth(app, buildConfig());
+    const downstream = vi.fn();
+    const oauth = mountShopifyMcpOAuth(app, buildConfig(), (mounted) => {
+      app.post("/mcp", mounted.requireAuth, (req, res) => {
+        downstream();
+        res.status(200).json(req.mcp);
+      });
+    });
 
-    expect((await request(app).get("/.well-known/oauth-authorization-server")).status).toBe(200);
+    const stubbedContext = { shopId: DEMO_SHOP_ID, shopDomain: DEMO_SHOP, tokenId: "token-from-the-wrapper" };
+    oauth.authenticate = vi.fn().mockResolvedValue({ ok: true, context: stubbedContext });
+
+    // No Authorization header at all: the real authenticate would refuse this with 401, so a 200
+    // carrying the wrapper's own context is only reachable if requireAuth went through it.
+    const response = await request(app).post("/mcp").send({});
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(stubbedContext);
+    expect(downstream).toHaveBeenCalledTimes(1);
+    expect(oauth.authenticate).toHaveBeenCalledTimes(1);
   });
 });

@@ -2,6 +2,7 @@ import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "../adapters/memoryStorage";
+import { createAuthenticator } from "../authenticate";
 import { resolveConfig, type ResolvedConfig } from "../config";
 import { sha256Hex } from "../crypto";
 import { issueTokens } from "../services/tokens";
@@ -46,7 +47,7 @@ function buildConfig(
 function buildApp(config: ResolvedConfig, downstream: () => void = () => {}) {
   const app = express();
   app.use(express.json());
-  app.post("/mcp", requireAuth(config), (req, res) => {
+  app.post("/mcp", requireAuth(config, createAuthenticator(config)), (req, res) => {
     downstream();
     res.status(200).json(req.mcp);
   });
