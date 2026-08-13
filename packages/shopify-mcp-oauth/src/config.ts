@@ -149,6 +149,22 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
   }
   if (!input.storage) throw new Error('shopify-mcp-oauth config invalid at "storage": storage is required');
 
+  // Not expressible in configSchema above (zod would have to own a function type in an otherwise
+  // data-shaped schema), but checked here for the same reason redisCache validates its client at
+  // construction: left alone, a JavaScript caller who passes the wrong thing — an object, a promise,
+  // a misspelled property — boots perfectly cleanly and then fails with
+  // `config.onShopNotFound is not a function` inside the Shopify callback, i.e. as a 500 during a
+  // real merchant's login, with nothing naming the misconfiguration.
+  if (
+    input.onShopNotFound !== undefined &&
+    input.onShopNotFound !== null &&
+    typeof input.onShopNotFound !== "function"
+  ) {
+    throw new Error(
+      'shopify-mcp-oauth config invalid at "onShopNotFound": must be a function returning a ShopRef or null'
+    );
+  }
+
   // validateHost already proved this parses; re-derive from the URL (not the raw string) so the
   // scheme and hostname are lowercased and a default port is dropped — token-audience matching
   // against `resource` is plain string equality, so an unnormalized host would fail it silently.

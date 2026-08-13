@@ -199,3 +199,25 @@ describe("resolveConfig", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 });
+
+// Symmetric with redisCache's construction-time client check: a JavaScript caller who passes the
+// wrong thing here otherwise boots clean and fails as `config.onShopNotFound is not a function`
+// inside the Shopify callback -- a 500 during a real merchant's login, naming nothing actionable.
+describe("resolveConfig validates onShopNotFound", () => {
+  it("rejects a non-function onShopNotFound at construction time", () => {
+    expect(() =>
+      resolveConfig(
+        buildConfig({ onShopNotFound: { domain: "x" } as unknown as ShopifyMcpOAuthConfig["onShopNotFound"] })
+      )
+    ).toThrow(/onShopNotFound/);
+  });
+
+  it("accepts an omitted onShopNotFound and resolves it to null", () => {
+    expect(resolveConfig(buildConfig()).onShopNotFound).toBeNull();
+  });
+
+  it("keeps a real handler as-is", () => {
+    const handler = vi.fn().mockResolvedValue(null);
+    expect(resolveConfig(buildConfig({ onShopNotFound: handler })).onShopNotFound).toBe(handler);
+  });
+});
