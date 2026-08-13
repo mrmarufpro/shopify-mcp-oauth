@@ -150,7 +150,7 @@ describe("basic-server app", () => {
     expect(JSON.parse(result.content[0]!.text).message).toBe("hello from the merchant");
   });
 
-  it("stops a shop that never installed the app, even though Shopify's bounce succeeded", async () => {
+  it("stops a shop this app has no record of, even though Shopify's bounce succeeded", async () => {
     const app = buildApp();
     const registration = await request(app)
       .post("/register")
@@ -177,7 +177,12 @@ describe("basic-server app", () => {
     );
 
     expect(callback.status).toBe(403);
-    expect(callback.text).toContain("has not installed this app");
+    // Reaching this point means Shopify DID grant the app -- it installs on approval. So the
+    // refusal must not tell the merchant to install it; that's advice they just followed, and it
+    // sends them in a circle. It has to name the missing setup instead.
+    expect(callback.text).toContain(UNINSTALLED_SHOP);
+    expect(callback.text).toContain("not set up");
+    expect(callback.text).not.toContain("Install it first");
   });
 
   it("answers 405 on GET /mcp so a browser gets a clear error", async () => {

@@ -1,10 +1,11 @@
-import type { ErrorRequestHandler, RequestHandler, Router } from "express";
+import type { Application, ErrorRequestHandler, RequestHandler, Router } from "express";
+import { createAuthenticator, type Authenticator } from "./authenticate";
 import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
 import { errorHandler } from "./middlewares/errorHandler";
 import { requireAuth } from "./middlewares/requireAuth";
 import { buildRouter, type BuildRouterOptions } from "./router";
 
-export interface ShopifyMcpOAuth {
+export interface ShopifyMcpOAuth extends Authenticator {
   router: Router;
   /**
    * Mount on any route this server considers protected, after `app.use(oauth.router)`. On success,
@@ -38,14 +39,53 @@ export function createShopifyMcpOAuth(
     router: buildRouter(resolved, options),
     requireAuth: requireAuth(resolved),
     errorHandler: errorHandler(resolved.logger),
+    ...createAuthenticator(resolved),
   };
 }
 
+/**
+ * `createShopifyMcpOAuth` with the mounting done for you, in the one order that works.
+ *
+ * Three things have to happen in sequence, and getting the third wrong is silent until it matters:
+ * the router mounts, then your protected routes, then the error handler LAST -- see
+ * `ShopifyMcpOAuth.errorHandler` for why nothing but your app's own final middleware can catch a
+ * body-parser error. Register your routes inside `registerProtectedRoutes` and that ordering is
+ * structural rather than something to remember:
+ *
+ * ```ts
+ * const app = express();
+ * mountShopifyMcpOAuth(app, config, (oauth) => {
+ *   app.post("/mcp", oauth.requireAuth, mcpHandler);
+ * });
+ * ```
+ *
+ * The one rule this can't enforce: any route you add to `app` AFTER this returns sits below the
+ * error handler, so an error it throws escapes to Express's default handler. Add every route from
+ * inside the callback, or mount by hand.
+ *
+ * Body parsing is not mounted for you here -- the router parses its own routes' bodies (see
+ * router.ts), and what your MCP endpoint needs is yours to choose. Mount your own parsers on `app`
+ * before calling this.
+ */
+export function mountShopifyMcpOAuth(
+  app: Application,
+  config: ShopifyMcpOAuthConfig,
+  registerProtectedRoutes: (oauth: ShopifyMcpOAuth) => void = () => {},
+  options: BuildRouterOptions = {}
+): ShopifyMcpOAuth {
+  const oauth = createShopifyMcpOAuth(config, options);
+  app.use(oauth.router);
+  registerProtectedRoutes(oauth);
+  app.use(oauth.errorHandler);
+  return oauth;
+}
+
 export { allowAnyShop } from "./adapters/allowAnyShop";
+export type { AuthenticatableRequest, Authenticator, AuthFailureReason, AuthResult } from "./authenticate";
 export { memoryCache } from "./adapters/memoryCache";
 export { memoryStorage, type MemoryStorage } from "./adapters/memoryStorage";
 export { prismaStorage, type PrismaLikeClient, type PrismaShopMapping } from "./adapters/prismaStorage";
-export { redisCache, type RedisLikeClient } from "./adapters/redisCache";
+export { redisCache, type RedisLikeClient, type RedisMultiLike } from "./adapters/redisCache";
 export {
   shopifySessionStorage,
   type ShopifySessionLike,
@@ -63,6 +103,7 @@ export type {
   NewToken,
   OAuthClient,
   OAuthStorage,
+  ShopNotFoundHandler,
   ShopRef,
   StoredToken,
 } from "./types";
