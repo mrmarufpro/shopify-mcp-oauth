@@ -93,6 +93,14 @@ export function createAuthenticator(config: ResolvedConfig): Authenticator {
     },
 
     challenge(res, reason = "invalid_token") {
+      // `requireAuth` can only reach this before anything has been written, but the composition
+      // pattern documented above hands it to host code that ran its own credential scheme first --
+      // and that scheme may already have answered, streamed an SSE preamble, or timed out. Calling
+      // setHeader after headers are flushed throws ERR_HTTP_HEADERS_SENT from inside the host's own
+      // async middleware, where nothing in this package is wrapped around it to catch it: an
+      // unhandled rejection or a hung request in place of what was meant to be a 401. There is no
+      // useful response left to send at that point, so the only correct action is to not try.
+      if (res.headersSent) return;
       res.setHeader("WWW-Authenticate", `Bearer error="${reason}", resource_metadata="${resourceMetadata}"`);
       res.status(401).json({ error: reason });
     },

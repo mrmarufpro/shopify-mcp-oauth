@@ -22,10 +22,14 @@ function buildConfig(): ResolvedConfig {
 }
 
 /** Only the two methods `challenge` touches — enough to assert what it wrote without a real server. */
-function buildFakeResponse() {
+function buildFakeResponse(headersSent = false) {
   const headers: Record<string, string> = {};
   const response = {
+    headersSent,
+    // Throws the way a real ServerResponse does once headers are flushed, so a missing guard shows
+    // up here as the same error it would be in production rather than as a silent no-op.
     setHeader: vi.fn((name: string, value: string) => {
+      if (response.headersSent) throw new Error("ERR_HTTP_HEADERS_SENT");
       headers[name] = value;
     }),
     status: vi.fn(() => response),
@@ -120,5 +124,19 @@ describe("challenge", () => {
     challenge(response);
 
     expect(headers["WWW-Authenticate"]).toContain('error="invalid_token"');
+  });
+
+  // requireAuth can only reach challenge before anything is written, but the composition pattern
+  // this package documents hands it to host code that ran its own credential scheme first -- and
+  // that scheme may already have answered, streamed, or timed out. There is nothing wrapped around
+  // the host's middleware to catch a throw from here, so it would surface as an unhandled rejection
+  // or a hung request in place of the 401 it was meant to send.
+  it("does nothing instead of throwing when the response has already been sent", () => {
+    const { challenge } = createAuthenticator(buildConfig());
+    const { response, spies } = buildFakeResponse(true);
+
+    expect(() => challenge(response, "invalid_token")).not.toThrow();
+    expect(spies.setHeader).not.toHaveBeenCalled();
+    expect(spies.status).not.toHaveBeenCalled();
   });
 });
