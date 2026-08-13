@@ -88,6 +88,25 @@ export function shopifyCallbackController(config: ResolvedConfig): RequestHandle
       return;
     }
 
+    // `query.shop` is the only shop identity in this request that anything actually verified: the
+    // HMAC guard proved Shopify signed it (see middlewares/verifyShopifyHmac.ts), and the token
+    // exchange above proved the merchant controls it. `shop.domain` is whatever the storage adapter
+    // or the onShopNotFound hook handed back, and a hook is ordinary host code that can return a
+    // ShopRef for a different shop entirely -- a lookup keyed on the wrong column, a normalization
+    // that silently matched a neighbouring row. Binding the authorization code to that unchecked
+    // value would issue this merchant a token scoped to another merchant's shop, which is exactly
+    // what the HMAC check exists to make impossible. Compared case-insensitively so an adapter that
+    // stores the canonical casing still passes; a genuine mismatch is a host bug, and refusing the
+    // login is the only safe answer to it.
+    if (shop.domain.toLowerCase() !== query.shop.toLowerCase()) {
+      config.logger.error("shopify-mcp-oauth: shop lookup returned a different domain than the callback named", {
+        callbackShop: query.shop,
+        resolvedShop: shop.domain,
+      });
+      res.status(500).type("text/plain").send("shop resolution returned a different shop; login refused");
+      return;
+    }
+
     const { code } = await issueCode(config, {
       shopId: shop.id,
       shopDomain: shop.domain,

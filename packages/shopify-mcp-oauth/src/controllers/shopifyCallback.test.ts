@@ -312,3 +312,59 @@ describe("shopifyCallbackController", () => {
     expect(raw).not.toContain(STATE_SECRET);
   });
 });
+
+// `query.shop` is the only shop identity in the callback that anything verified -- Shopify signed
+// it, and the token exchange proved the merchant controls it. `onShopNotFound` is ordinary host
+// code, so the ShopRef it returns is not evidence of anything on its own.
+describe("the shop a lookup resolves to must be the shop the callback named", () => {
+  const OTHER_SHOP = "other-store.myshopify.com";
+
+  it("refuses to issue a code when onShopNotFound returns a different shop's domain", async () => {
+    const config = buildConfig({
+      installed: false,
+      logger: silentLogger,
+      onShopNotFound: async () => ({ id: "shop_other", domain: OTHER_SHOP }),
+    });
+
+    const response = await request(buildApp(config))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    // Without the guard this is a 302 carrying a code bound to OTHER_SHOP -- the merchant who
+    // authenticated as DEMO_SHOP walks away holding tool access to someone else's store.
+    expect(response.status).toBe(500);
+    expect(redirectLocation(response)).toBe("");
+  });
+
+  it("still admits a hook that returns the same domain in a different case", async () => {
+    // Adapters normalize; an uppercase or mixed-case echo of the same shop is not a mismatch.
+    const config = buildConfig({
+      installed: false,
+      onShopNotFound: async () => ({ id: DEMO_SHOP_ID, domain: DEMO_SHOP.toUpperCase() }),
+    });
+
+    const response = await request(buildApp(config))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(response.status).toBe(302);
+  });
+
+  it("logs the mismatch so the host can find the hook bug behind the refusal", async () => {
+    const errorLog = vi.fn();
+    const config = buildConfig({
+      installed: false,
+      logger: { info: () => {}, warn: () => {}, error: errorLog },
+      onShopNotFound: async () => ({ id: "shop_other", domain: OTHER_SHOP }),
+    });
+
+    await request(buildApp(config))
+      .get("/oauth/shopify-callback")
+      .query({ shop: DEMO_SHOP, code: "shopify-code", state: buildState(), hmac: "checked-elsewhere" });
+
+    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("different domain"), {
+      callbackShop: DEMO_SHOP,
+      resolvedShop: OTHER_SHOP,
+    });
+  });
+});
