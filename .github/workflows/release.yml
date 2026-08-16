@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write # push tags and create GitHub releases
+  pull-requests: write # open and update the Version Packages PR
+  id-token: write # mint the OIDC token for trusted publishing
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      # Node 22 ships npm 10.x; OIDC trusted publishing needs npm >= 11.5.1.
+      - run: npm install -g npm@latest
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: changesets/action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          version-script: pnpm version-packages
+          publish-script: pnpm release
+          create-github-releases: true
+          push-git-tags: true
+        env:
+          # @changesets/changelog-github reads this from the environment when it builds
+          # CHANGELOG entries and throws if it is missing. The github-token input above is
+          # consumed by the action itself and does not cover the version script.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
