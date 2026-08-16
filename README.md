@@ -247,8 +247,15 @@ pnpm lint
 ## Releasing
 
 Releases run on [Changesets](https://github.com/changesets/changesets). Publishing happens in CI over
-npm trusted publishing (OIDC), so there is no npm token in repository secrets and every release
-carries a provenance attestation.
+npm trusted publishing (OIDC), so there is no npm token in repository secrets, and every release
+published by the workflow carries a provenance attestation. `0.1.0` of each package is the exception —
+npm's trusted publishing can only attach to a package that already exists on the registry, so the
+first release of each package was published by hand, before there was anything to attach to.
+
+**One-time repository setting:** Settings → Actions → General → Workflow permissions must have "Allow
+GitHub Actions to create and approve pull requests" checked. It is off by default in many orgs, and
+without it step 2 below fails with "GitHub Actions is not permitted to create or approve pull
+requests."
 
 1. A pull request that changes either package includes a changeset — run `pnpm changeset`, pick the
    packages and the bump, and commit the generated file. Details in
