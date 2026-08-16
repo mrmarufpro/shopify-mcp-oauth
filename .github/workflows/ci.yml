@@ -41,9 +41,5 @@ jobs:
       # Proves the scaffold template still generates cleanly from the example.
       - run: pnpm sync:template
 
-      - name: Fail if the template carries a workspace specifier
-        run: |
-          if grep -q '"workspace:' packages/create-shopify-mcp/templates/default/package.json; then
-            echo "templates/default still pins a workspace dependency"
-            exit 1
-          fi
+      - name: Fail if the generated template does not pin the current library version
+        run: node scripts/check-template-pin.mjs
