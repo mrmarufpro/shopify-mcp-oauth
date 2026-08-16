@@ -14,7 +14,7 @@
     "sync:template": "node packages/create-shopify-mcp/scripts/sync-template.mjs",
     "changeset": "changeset",
     "version-packages": "changeset version && pnpm install --lockfile-only",
-    "release": "pnpm build && changeset publish"
+    "release": "pnpm build && pnpm typecheck && pnpm test && pnpm sync:template && node scripts/check-template-pin.mjs && node scripts/check-package-metadata.mjs && changeset publish"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^1.0.0",
