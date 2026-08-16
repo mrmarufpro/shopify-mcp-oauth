@@ -32,6 +32,8 @@ jobs:
 
       - run: pnpm lint
 
+      - run: node scripts/check-package-metadata.mjs
+
       - run: pnpm typecheck
 
       - run: pnpm test
