@@ -9,3 +9,7 @@ packages/create-shopify-mcp/templates/
 # tracked files today, but not previously ignored either -- a single `git add .` would have swept
 # in every ledger and review, including internal reasoning and app names.
 .superpowers/
+
+# Superpowers-generated design docs: specs and implementation plans written during development.
+# Useful locally, but they are working notes rather than published documentation.
+docs/superpowers/
