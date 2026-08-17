@@ -63,7 +63,7 @@ describe("scaffolding the real template", () => {
     const manifest = await readManifest(await scaffold("named-app"));
 
     expect(manifest.name).toBe("named-app");
-    expect(manifest.dependencies[OAUTH_PACKAGE]).toMatch(/^\^\d+\.\d+\.\d+$/);
+    expect(manifest.dependencies[OAUTH_PACKAGE]).toBe("latest");
   });
 
   it("leaves no workspace specifier anywhere in the scaffold", async () => {
