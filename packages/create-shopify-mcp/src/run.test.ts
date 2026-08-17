@@ -157,4 +157,35 @@ describe("run --example", () => {
     );
     expect(existsSync(target)).toBe(false);
   });
+
+  it("removes the directory it created when the download fails", async () => {
+    const target = path.join(workspace, "failed-mcp");
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/releases/latest")) {
+        return new Response(JSON.stringify({ tag_name: RELEASE_TAG }), { status: 200 });
+      }
+      if (url.includes("/contents/")) return new Response(null, { status: 200 });
+      return new Response(null, { status: 500 });
+    });
+
+    await expect(run(["--example", EXAMPLE_NAME, target, "--no-git"], { templateDir, fetch })).rejects.toThrow(/500/);
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("leaves a directory that was already there, even when the download fails", async () => {
+    const target = path.join(workspace, "preexisting-mcp");
+    await mkdir(path.join(target, ".git"), { recursive: true });
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/releases/latest")) {
+        return new Response(JSON.stringify({ tag_name: RELEASE_TAG }), { status: 200 });
+      }
+      if (url.includes("/contents/")) return new Response(null, { status: 200 });
+      return new Response(null, { status: 500 });
+    });
+
+    await expect(run(["--example", EXAMPLE_NAME, target, "--no-git"], { templateDir, fetch })).rejects.toThrow(/500/);
+    expect(existsSync(path.join(target, ".git"))).toBe(true);
+  });
 });

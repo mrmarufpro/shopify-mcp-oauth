@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { HELP_TEXT, parseArgs } from "./args";
@@ -66,17 +66,27 @@ export async function run(argv: string[], options: RunOptions = {}): Promise<num
     }
   }
 
+  // prepareTarget accepts a directory that already exists (and may hold a .git), so only a
+  // directory we created ourselves is ours to remove if the scaffold fails.
+  const targetExisted = existsSync(path.resolve(args.targetDir));
   const targetDir = await prepareTarget(args.targetDir);
   const projectName = toPackageName(targetDir);
 
-  if (source) {
-    console.log(`\nDownloading ${args.example} from ${source.owner}/${source.repo}@${source.ref}…`);
-    await retry(() => downloadAndExtract(source as ExampleSource, targetDir, deps));
-  } else {
-    await copyTemplate(options.templateDir ?? bundledTemplateDir(), targetDir);
-  }
+  try {
+    if (source) {
+      console.log(`\nDownloading ${args.example} from ${source.owner}/${source.repo}@${source.ref}…`);
+      await retry(() => downloadAndExtract(source as ExampleSource, targetDir, deps));
+    } else {
+      await copyTemplate(options.templateDir ?? bundledTemplateDir(), targetDir);
+    }
 
-  await rewritePackageJson(targetDir, { name: projectName });
+    await rewritePackageJson(targetDir, { name: projectName });
+  } catch (thrown) {
+    if (!targetExisted) {
+      await rm(targetDir, { recursive: true, force: true });
+    }
+    throw thrown;
+  }
 
   const git = args.git ? await initGit(targetDir) : { initialized: false, committed: false };
 
