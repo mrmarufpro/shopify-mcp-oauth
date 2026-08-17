@@ -29,8 +29,8 @@ export async function rewritePackageJson(targetDir: string, options: { name: str
 
   if (unresolved.length > 0) {
     throw new Error(
-      `Template still pins ${unresolved.join(", ")} to a workspace version. ` +
-        "It was packed without running scripts/sync-template.mjs."
+      `This example pins ${unresolved.join(", ")} to a workspace version, which only resolves ` +
+        "inside its own repository. It cannot be scaffolded as-is."
     );
   }
 

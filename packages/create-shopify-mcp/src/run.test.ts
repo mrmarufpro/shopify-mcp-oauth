@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { c } from "tar";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { run } from "./run";
 
@@ -85,5 +86,75 @@ describe("run", () => {
     await writeFile(path.join(target, "README.md"), "mine");
 
     await expect(run([target, "--no-git"], { templateDir })).rejects.toThrow(/not empty/);
+  });
+});
+
+const EXAMPLE_NAME = "basic-server";
+const RELEASE_TAG = "shopify-mcp-oauth@0.2.0";
+
+async function buildExampleArchive(): Promise<Buffer> {
+  const staging = path.join(workspace, "archive-staging");
+  const exampleDir = path.join(staging, "repo-root", "examples", EXAMPLE_NAME);
+
+  await mkdir(path.join(exampleDir, "src"), { recursive: true });
+  await writeFile(
+    path.join(exampleDir, "package.json"),
+    JSON.stringify({ name: EXAMPLE_NAME, dependencies: { [OAUTH_PACKAGE]: "latest" } }, null, 2)
+  );
+  await writeFile(path.join(exampleDir, ".env.example"), "MCP_HOST=\n");
+  await writeFile(path.join(exampleDir, "src", "index.ts"), "export {};\n");
+
+  const chunks: Buffer[] = [];
+  const stream = c({ gzip: true, cwd: staging }, ["repo-root"]);
+  stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+  await new Promise<void>((resolve, reject) => stream.on("end", () => resolve()).on("error", reject));
+
+  return Buffer.concat(chunks);
+}
+
+function fetchStubFor(archive: Buffer, options: { exists?: boolean } = {}) {
+  return vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("/releases/latest")) {
+      return new Response(JSON.stringify({ tag_name: RELEASE_TAG }), { status: 200 });
+    }
+    if (url.includes("/contents/")) {
+      return new Response(null, { status: options.exists === false ? 404 : 200 });
+    }
+    return new Response(archive, { status: 200 });
+  });
+}
+
+describe("run --example", () => {
+  it("downloads the named example at the newest release tag", async () => {
+    const target = path.join(workspace, "fetched-mcp");
+    const fetch = fetchStubFor(await buildExampleArchive());
+
+    const code = await run(["--example", EXAMPLE_NAME, target, "--no-git"], { templateDir, fetch });
+
+    expect(code).toBe(0);
+    expect(existsSync(path.join(target, "src", "index.ts"))).toBe(true);
+    expect(JSON.parse(await readFile(path.join(target, "package.json"), "utf8")).name).toBe("fetched-mcp");
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes(RELEASE_TAG))).toBe(true);
+  });
+
+  it("uses the bundled template and no network when --example says default", async () => {
+    const target = path.join(workspace, "default-mcp");
+    const fetch = vi.fn();
+
+    await run(["--example", "default", target, "--no-git"], { templateDir, fetch });
+
+    expect(existsSync(path.join(target, "src", "tools.ts"))).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("names a misspelled example and leaves no directory behind", async () => {
+    const target = path.join(workspace, "typo-mcp");
+    const fetch = fetchStubFor(await buildExampleArchive(), { exists: false });
+
+    await expect(run(["--example", "bsic-servr", target, "--no-git"], { templateDir, fetch })).rejects.toThrow(
+      /bsic-servr/
+    );
+    expect(existsSync(target)).toBe(false);
   });
 });
