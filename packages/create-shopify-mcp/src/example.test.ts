@@ -92,7 +92,7 @@ describe("resolveRef", () => {
 
     expect(source.ref).toBe(RELEASE_TAG);
     expect(source.subpath).toBe(`examples/${EXAMPLE_NAME}`);
-    expect(vi.mocked(fetch).mock.calls[0][0]).toContain(
+    expect(vi.mocked(fetch).mock.calls[0]![0]).toContain(
       `/repos/${EXAMPLE_REPO.owner}/${EXAMPLE_REPO.repo}/releases/latest`
     );
   });

@@ -35,7 +35,7 @@ async function buildArchive(): Promise<Buffer> {
   const chunks: Buffer[] = [];
   const stream = c({ gzip: true, cwd: staging }, [ARCHIVE_ROOT]);
   stream.on("data", (chunk: Buffer) => chunks.push(chunk));
-  await new Promise((resolve, reject) => stream.on("end", resolve).on("error", reject));
+  await new Promise<void>((resolve, reject) => stream.on("end", () => resolve()).on("error", reject));
 
   return Buffer.concat(chunks);
 }
@@ -56,7 +56,7 @@ describe("exampleExists", () => {
 
     await expect(exampleExists(BASIC_SERVER, { fetch })).resolves.toBe(true);
 
-    const [url, init] = vi.mocked(fetch).mock.calls[0];
+    const [url, init] = vi.mocked(fetch).mock.calls[0]!;
     expect(url).toContain("/contents/examples/basic-server/package.json");
     expect(url).toContain(`ref=${encodeURIComponent(BASIC_SERVER.ref)}`);
     expect(init).toMatchObject({ method: "HEAD" });
