@@ -20,6 +20,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "tar": "^7.4.3"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsup": "^8.3.0",
