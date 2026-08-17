@@ -5,35 +5,31 @@ const PROJECT_DIR = "my-mcp";
 
 describe("nextSteps", () => {
   it("starts by entering the project and installing", () => {
-    const steps = nextSteps(PROJECT_DIR, "prisma");
+    const steps = nextSteps(PROJECT_DIR);
     expect(steps).toContain(`cd ${PROJECT_DIR}`);
     expect(steps).toContain("pnpm install");
   });
 
-  it("tells the Prisma user to start the database, migrate, and seed", () => {
-    const steps = nextSteps(PROJECT_DIR, "prisma");
-    expect(steps).toContain("docker compose up -d");
-    expect(steps).toContain("pnpm db:migrate");
-    expect(steps).toContain("pnpm db:seed");
-  });
-
-  it("omits the database steps for the memory variant", () => {
-    const steps = nextSteps(PROJECT_DIR, "memory");
+  it("names no database step — the template is in-memory only", () => {
+    const steps = nextSteps(PROJECT_DIR);
     expect(steps).not.toContain("docker compose");
     expect(steps).not.toContain("db:migrate");
+    expect(steps).not.toContain("db:seed");
   });
 
-  it("warns the memory user that tokens vanish and a second instance breaks login", () => {
-    const steps = nextSteps(PROJECT_DIR, "memory");
+  it("warns that tokens vanish on restart and a second instance breaks login", () => {
+    const steps = nextSteps(PROJECT_DIR);
     expect(steps).toMatch(/restart/i);
-    expect(steps).toMatch(/one instance|single instance/i);
+    expect(steps).toMatch(/more than one instance/i);
   });
 
-  it("always points at the environment file and the tunnel", () => {
-    for (const choice of ["prisma", "memory"] as const) {
-      const steps = nextSteps(PROJECT_DIR, choice);
-      expect(steps).toContain("cp .env.example .env");
-      expect(steps).toMatch(/tunnel/i);
-    }
+  it("points at the environment file and the tunnel", () => {
+    const steps = nextSteps(PROJECT_DIR);
+    expect(steps).toContain("cp .env.example .env");
+    expect(steps).toMatch(/tunnel/i);
+  });
+
+  it("ends on the command that actually starts the server", () => {
+    expect(nextSteps(PROJECT_DIR)).toContain("pnpm dev");
   });
 });

@@ -12,22 +12,6 @@ describe("parseArgs", () => {
     expect(parseArgs([]).targetDir).toBeNull();
   });
 
-  it("reads a storage choice from --storage", () => {
-    expect(parseArgs([PROJECT_DIR, "--storage", "memory"]).storage).toBe("memory");
-  });
-
-  it("reads a storage choice from --storage=", () => {
-    expect(parseArgs([PROJECT_DIR, "--storage=prisma"]).storage).toBe("prisma");
-  });
-
-  it("leaves the storage choice null so the caller can prompt", () => {
-    expect(parseArgs([PROJECT_DIR]).storage).toBeNull();
-  });
-
-  it("rejects an unknown storage choice by name", () => {
-    expect(() => parseArgs([PROJECT_DIR, "--storage", "mysql"])).toThrow(/mysql/);
-  });
-
   it("enables git by default and lets --no-git turn it off", () => {
     expect(parseArgs([PROJECT_DIR]).git).toBe(true);
     expect(parseArgs([PROJECT_DIR, "--no-git"]).git).toBe(false);
@@ -46,6 +30,14 @@ describe("parseArgs", () => {
   it("names an unknown flag rather than ignoring it", () => {
     expect(() => parseArgs([PROJECT_DIR, "--force"])).toThrow(/--force/);
   });
+
+  it("rejects the retired --storage flag by name rather than ignoring it", () => {
+    expect(() => parseArgs([PROJECT_DIR, "--storage=prisma"])).toThrow(/--storage/);
+  });
+
+  it("refuses a second positional argument", () => {
+    expect(() => parseArgs([PROJECT_DIR, "extra"])).toThrow(/extra/);
+  });
 });
 
 describe("HELP_TEXT", () => {
@@ -53,8 +45,7 @@ describe("HELP_TEXT", () => {
     expect(HELP_TEXT).toContain("npx create-shopify-mcp my-mcp");
   });
 
-  it("documents both storage variants", () => {
-    expect(HELP_TEXT).toContain("prisma");
-    expect(HELP_TEXT).toContain("memory");
+  it("offers no storage choice — there is only one template", () => {
+    expect(HELP_TEXT).not.toContain("--storage");
   });
 });

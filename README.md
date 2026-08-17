@@ -10,8 +10,8 @@ Two packages:
 | [`shopify-mcp-oauth`](packages/shopify-mcp-oauth)   | The OAuth layer: authorization server, resource server, and `requireAuth` |
 | [`create-shopify-mcp`](packages/create-shopify-mcp) | `npx create-shopify-mcp my-mcp` — scaffolds a running server              |
 
-Plus [`examples/basic-server`](examples/basic-server), which is both the demo and the scaffolder's
-template.
+Plus [`examples/basic-server`](examples/basic-server) — three files, in-memory storage, two demo
+tools. It is both the demo and the scaffolder's template.
 
 **Guides:**
 
@@ -26,8 +26,6 @@ template.
 npx create-shopify-mcp my-mcp
 cd my-mcp && pnpm install
 cp .env.example .env      # add your Shopify API key and secret
-docker compose up -d
-pnpm db:migrate && pnpm db:seed
 pnpm dev
 ```
 

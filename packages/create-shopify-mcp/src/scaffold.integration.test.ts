@@ -24,9 +24,9 @@ afterAll(async () => {
   await rm(workspace, { recursive: true, force: true });
 });
 
-async function scaffold(name: string, storage: "prisma" | "memory"): Promise<string> {
+async function scaffold(name: string): Promise<string> {
   const target = path.join(workspace, name);
-  await run([target, "--storage", storage, "--no-git"], { templateDir });
+  await run([target, "--no-git"], { templateDir });
   return target;
 }
 
@@ -42,8 +42,8 @@ async function readManifest(target: string): Promise<ScaffoldedManifest> {
 }
 
 describe("scaffolding the real template", () => {
-  it("produces a prisma project with every file the README references", async () => {
-    const target = await scaffold("prisma-app", "prisma");
+  it("produces a project with every file the README references", async () => {
+    const target = await scaffold("basic-app");
 
     for (const file of [
       "package.json",
@@ -51,60 +51,55 @@ describe("scaffolding the real template", () => {
       ".env.example",
       ".gitignore",
       "README.md",
-      "docker-compose.yml",
-      "prisma/schema.prisma",
-      "prisma/seed.ts",
-      "prisma/migrations/0_init/migration.sql",
       "src/index.ts",
       "src/app.ts",
-      "src/storage.ts",
-      "src/mcp/transport.ts",
-      "src/tools/whoami.ts",
+      "src/tools.ts",
     ]) {
       expect(existsSync(path.join(target, file)), `missing ${file}`).toBe(true);
     }
   });
 
   it("names the project after its directory and resolves the oauth dependency", async () => {
-    const manifest = await readManifest(await scaffold("named-app", "prisma"));
+    const manifest = await readManifest(await scaffold("named-app"));
 
     expect(manifest.name).toBe("named-app");
     expect(manifest.dependencies[OAUTH_PACKAGE]).toMatch(/^\^\d+\.\d+\.\d+$/);
   });
 
   it("leaves no workspace specifier anywhere in the scaffold", async () => {
-    const target = await scaffold("clean-app", "prisma");
-    const manifest = await readManifest(target);
+    const manifest = await readManifest(await scaffold("clean-app"));
 
     const specs = Object.values({ ...manifest.dependencies, ...manifest.devDependencies });
     expect(specs.filter((spec: string) => spec.startsWith("workspace:"))).toEqual([]);
   });
 
   it("carries no secrets or build output from the working tree", async () => {
-    const target = await scaffold("hygiene-app", "prisma");
+    const target = await scaffold("hygiene-app");
 
     expect(existsSync(path.join(target, ".env"))).toBe(false);
     expect(existsSync(path.join(target, "node_modules"))).toBe(false);
     expect(existsSync(path.join(target, "dist"))).toBe(false);
   });
 
-  it("produces a memory project with no Prisma surface left", async () => {
-    const target = await scaffold("memory-app", "memory");
+  it("carries no database surface — the template is in-memory only", async () => {
+    const target = await scaffold("in-memory-app");
     const manifest = await readManifest(target);
 
     expect(existsSync(path.join(target, "prisma"))).toBe(false);
     expect(existsSync(path.join(target, "docker-compose.yml"))).toBe(false);
     expect(manifest.dependencies["@prisma/client"]).toBeUndefined();
     expect(manifest.scripts.postinstall).toBeUndefined();
-    expect(await readFile(path.join(target, "src", "storage.ts"), "utf8")).toContain('"./storage.memory"');
   });
 
-  it("keeps the memory project's imports resolvable — nothing points at a deleted file", async () => {
-    const target = await scaffold("resolvable-app", "memory");
-    const appTest = await readFile(path.join(target, "src", "app.test.ts"), "utf8");
+  it("keeps every relative import in the scaffold pointing at a file that exists", async () => {
+    const target = await scaffold("resolvable-app");
 
-    expect(appTest).toContain("./storage.memory");
-    expect(existsSync(path.join(target, "src", "storage.memory.ts"))).toBe(true);
-    expect(existsSync(path.join(target, "src", "storage.contract.test.ts"))).toBe(false);
+    for (const [file, imported] of [
+      ["src/index.ts", "./app"],
+      ["src/app.ts", "./tools"],
+    ] as const) {
+      expect(await readFile(path.join(target, file), "utf8")).toContain(imported);
+      expect(existsSync(path.join(target, "src", `${imported.slice("./".length)}.ts`))).toBe(true);
+    }
   });
 });

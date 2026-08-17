@@ -1,164 +1,80 @@
 # basic-server
 
-A minimal MCP server for a Shopify app, with OAuth login handled by
-[`shopify-mcp-oauth`](../../packages/shopify-mcp-oauth). Two demo tools: `whoami` returns the calling
-shop's domain, `echo` returns its input. No Admin API calls — this example is about authentication.
+The smallest MCP server that uses [`shopify-mcp-oauth`](../../packages/shopify-mcp-oauth): a merchant
+logs in through Shopify from their MCP client, and the tools know which store is calling.
 
-## What you need first
+Three files:
 
-- Node ≥ 20, pnpm, Docker (for Postgres)
-- A Shopify Partner app and a development store
-- A public HTTPS tunnel — MCP clients and Shopify both need to reach this server
+| File           | What it does                                                |
+| -------------- | ----------------------------------------------------------- |
+| `src/index.ts` | Reads `.env`, starts the server                             |
+| `src/app.ts`   | Express + `mountShopifyMcpOAuth` + the `POST /mcp` endpoint |
+| `src/tools.ts` | The tools — `whoami` and `echo`. Add yours here             |
 
-## Setup
+Storage is in-memory, so tokens are lost on restart. That is the only thing standing between this
+and something you could deploy.
 
-**0. Get the code.**
+## Run it
+
+You need Node ≥ 20.6, a Shopify Partner app, and a public HTTPS tunnel — MCP clients and Shopify
+both have to reach this server.
+
+**1. Install and configure.**
 
 ```bash
-cd examples/basic-server
 pnpm install
-```
-
-**1. Create a Partner app.** In the Shopify Partner dashboard, create an app and copy its API key and
-API secret key.
-
-**2. Start a tunnel.** Either works:
-
-```bash
-cloudflared tunnel --url http://localhost:3000
-# or
-ngrok http 3000
-```
-
-Copy the HTTPS URL it prints.
-
-**3. Configure the app URLs.** In the Partner dashboard, set:
-
-- App URL: `https://<your-tunnel>`
-- Allowed redirection URL: `https://<your-tunnel>/oauth/shopify-callback`
-
-The redirection URL must match exactly. A mismatch shows up as Shopify's own error page during login,
-before this server is ever reached.
-
-**4. Fill in the environment.**
-
-```bash
 cp .env.example .env
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # OAUTH_STATE_SECRET
 ```
 
-Set `MCP_HOST` to the tunnel URL, `SHOPIFY_API_KEY` and `SHOPIFY_API_SECRET` from step 1, and
-`DEMO_SHOP_DOMAIN` to your development store's domain (the same format as `your-store.myshopify.com`).
-
-**5. Start the database, migrate, and seed.**
+**2. Start a tunnel** and copy the HTTPS URL it prints:
 
 ```bash
-docker compose up -d
-pnpm db:migrate
-pnpm db:seed
+cloudflared tunnel --url http://localhost:3000   # or: ngrok http 3000
 ```
 
-**6. Run it.**
+**3. Point the Partner app at it.** In the Partner dashboard set:
+
+- App URL: `https://<your-tunnel>`
+- Allowed redirection URL: `https://<your-tunnel>/oauth/shopify-callback`
+
+The redirection URL has to match exactly. A mismatch shows up as Shopify's own error page during
+login, before this server is ever reached.
+
+**4. Fill in `.env`** — `MCP_HOST` is the tunnel URL, `SHOPIFY_API_KEY` and `SHOPIFY_API_SECRET`
+come from the Partner dashboard.
+
+**5. Go.**
 
 ```bash
 pnpm dev
-```
-
-## Connect a client
-
-```bash
 claude mcp add --transport http my-mcp https://<your-tunnel>/mcp
 ```
 
-The client opens a browser at Shopify's shop picker. Pick the development store from step 4, approve,
-and the browser returns to the client with a token. Then ask it to call `whoami`.
+The client opens Shopify's shop picker. Pick your development store, approve, and the browser hands
+a token back to the client. Then ask it to call `whoami`.
 
-## The one error everybody hits
+## What to change before this is real
 
-Pick a store in Shopify's picker that has no seeded session, approve the install screen, and the
-callback answers with a plain-text `403`:
+**Storage.** `memoryStorage()` keeps clients and tokens in this process — they vanish on restart,
+and a second instance cannot see them, so login fails intermittently the moment you run more than
+one. Swap it for `prismaStorage(prisma)` (or your own `OAuthStorage`) and pass a shared `cache` such
+as `redisCache`. See [storage adapters](../../docs/storage-adapters.md).
 
-```
-This app is not set up for your-store.myshopify.com. Open it in your Shopify admin to finish setup, then try again.
-```
-
-That's not a bug — it means no offline session exists for that shop. Note what it does **not** mean:
-by approving that screen you did install the app, because Shopify grants it on approval. What's
-missing is this server's own record of the shop. The grant went to `/oauth/shopify-callback` here,
-and the package discards the Shopify token rather than storing it, so nothing a real install flow
-would have written exists. That's the install gate, and it's deliberate — without it any merchant on
-Shopify could mint a token against a shop your app knows nothing about.
-
-Fix it by picking the store you seeded, or by seeding the store you picked:
-
-```bash
-DEMO_SHOP_DOMAIN=your-store.myshopify.com pnpm db:seed
-```
-
-In a real app the session already exists, written by your own install flow — or you supply
-`onShopNotFound` and write it right there in the callback.
-
-## How it fits together
-
-```
-POST /mcp
-  └─ oauth.requireAuth          ← bearer token → req.mcp = { shopId, shopDomain, tokenId }
-      └─ createMcpHandler       ← fresh McpServer + stateless transport per request
-          └─ runWithMcpContext  ← AsyncLocalStorage carrying the shop
-              └─ withAuditLog   ← validate, time, log, shape errors
-                  └─ your tool  ← reads ctx.auth.shopDomain
-```
-
-`AsyncLocalStorage` is not decoration. The MCP SDK hands a tool callback `extra.requestInfo`, which
-carries headers only — never the Express request — so without it a tool cannot tell which shop is
-calling. Most people discover this after their first tool answers for the wrong store.
-
-## Storage
-
-`src/storage.ts` wires three things:
+**The install gate.** `allowAnyShop()` hands a token to any merchant who completes Shopify's login.
+That is fine here because this example keeps no per-shop record at all, but a real app has one — an
+offline session, billing, webhooks — and should refuse a merchant it has never installed for:
 
 ```ts
-export const sessionStorage = new PrismaSessionStorage(prisma);
-
-export const storage: OAuthStorage = {
-  ...prismaStorage(prisma), // clients and tokens
-  findShopByDomain: shopifySessionStorage(sessionStorage), // the install gate
-};
-
-export const auditSink = createPrismaAuditSink(prisma);
+findShopByDomain: shopifySessionStorage(sessionStorage),   // or your own shop table
 ```
 
-`findShopByDomain` binds to Shopify's own `SessionStorage` interface rather than to a table, so
-swapping `PrismaSessionStorage` for `RedisSessionStorage`, `MongoDBSessionStorage`, or any other
-official adapter changes that one line and nothing else.
-
-If your app has its own shop table instead, map it:
-
-```ts
-prismaStorage(prisma, { shop: { model: "store", domainField: "myshopifyDomain", idField: "id" } });
-```
+With that in place a merchant with no record gets a plain-text 403 from the callback. Shopify grants
+the app on approval, so they really did install it; what is missing is your own record of them. Supply
+`onShopNotFound` to write that record right there in the callback instead of refusing.
 
 ## Adding a tool
 
-Copy `src/tools/echo.ts`, change the schema and handler, and register it in `src/tools/index.ts`.
-`withAuditLog` gives you input validation, timing, one audit row per call, and MCP-shaped errors.
-Its optional `narrate` hook appends a line to successful results — useful if you want the calling
-agent to credit your app by name.
-
-`withAuditLog` writes your tool's input and output to the audit sink verbatim, with no redaction.
-That's fine for `whoami`/`echo`, but the moment a tool touches real customer data or the Admin API,
-redact or omit the sensitive fields before returning them, since whatever the handler returns is
-what lands in the audit log.
-
-## Notes
-
-- The example uses Prisma 6 because `@shopify/shopify-app-session-storage-prisma@9` requires it.
-- The transport is stateless: no session IDs, no MCP-level session handling for `GET`/`DELETE`, any
-  instance serves any request. Tools that need to hold state across calls would need session-ful
-  mode instead.
-- `prisma/migrations/0_init` was generated with `prisma migrate diff`, so cloning this repository
-  never requires a running database.
-- This app calls `mountShopifyMcpOAuth` without a `cache`, so `shopify-mcp-oauth` falls back to an
-  in-memory cache (it logs a warning on startup). That cache is single-process: authorization codes
-  written by one instance are invisible to another, so login fails intermittently the moment you run
-  more than one instance. Pass a shared `cache` such as `redisCache` before deploying more than one.
+Add a `server.registerTool(...)` call in `src/tools.ts`. `auth.shopDomain` and `auth.shopId` name the
+store, and `auth.tokenId` names the grant. Whatever you return from the handler goes straight to the
+calling agent, so redact anything sensitive before returning it.
