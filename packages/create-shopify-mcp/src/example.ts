@@ -66,3 +66,46 @@ export function parseExampleTarget(value: string, examplePath?: string): Example
 
   return { owner, repo, subpath, ref: { kind: "explicit", ref } };
 }
+
+export interface ExampleSource {
+  owner: string;
+  repo: string;
+  ref: string;
+  subpath: string;
+}
+
+export interface GitHubDeps {
+  fetch: typeof globalThis.fetch;
+}
+
+function withRef(target: ExampleTarget, ref: string): ExampleSource {
+  return { owner: target.owner, repo: target.repo, subpath: target.subpath, ref };
+}
+
+export async function resolveRef(target: ExampleTarget, deps: GitHubDeps): Promise<ExampleSource> {
+  if (target.ref.kind === "explicit") {
+    return withRef(target, target.ref.ref);
+  }
+
+  const repository = `${target.owner}/${target.repo}`;
+
+  if (target.ref.kind === "latest-release") {
+    // No release yet is an ordinary state, not an error — fall back to the default branch.
+    const response = await deps.fetch(`https://api.github.com/repos/${repository}/releases/latest`);
+    if (response.status !== 200) {
+      return withRef(target, FALLBACK_REF);
+    }
+    const release = (await response.json()) as { tag_name?: string };
+    return withRef(target, release.tag_name ?? FALLBACK_REF);
+  }
+
+  const response = await deps.fetch(`https://api.github.com/repos/${repository}`);
+  if (response.status !== 200) {
+    throw new Error(`Could not read ${repository} from GitHub. Check the URL and try again.`);
+  }
+  const info = (await response.json()) as { default_branch?: string };
+  if (!info.default_branch) {
+    throw new Error(`GitHub did not report a default branch for ${repository}.`);
+  }
+  return withRef(target, info.default_branch);
+}
