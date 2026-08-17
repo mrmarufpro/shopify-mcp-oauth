@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +48,11 @@ export async function run(argv: string[], options: RunOptions = {}): Promise<num
   const git = args.git ? await initGit(targetDir) : { initialized: false, committed: false };
 
   console.log(`\n✓ created ${projectName}\n`);
-  console.log(nextSteps(path.relative(process.cwd(), targetDir) || projectName));
+  console.log(
+    nextSteps(path.relative(process.cwd(), targetDir) || projectName, {
+      hasEnvExample: existsSync(path.join(targetDir, ".env.example")),
+    })
+  );
   if (args.git && !git.committed) {
     console.log("\nGit: the repository was not committed — commit it yourself once you have set an identity.");
   }
