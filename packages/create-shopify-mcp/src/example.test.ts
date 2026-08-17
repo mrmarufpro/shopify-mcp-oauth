@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { EXAMPLE_REPO, parseExampleTarget, resolveRef } from "./example";
+import { EXAMPLE_REPO, FALLBACK_REF, parseExampleTarget, resolveRef } from "./example";
 
 const EXAMPLE_NAME = "basic-server";
 const THIRD_PARTY_TREE_URL = "https://github.com/acme/templates/tree/main/mcp/starter";
@@ -101,7 +101,7 @@ describe("resolveRef", () => {
     const fetch = vi.fn().mockResolvedValue(respondWith(404, { message: "Not Found" }));
 
     await expect(resolveRef(parseExampleTarget(EXAMPLE_NAME), { fetch })).resolves.toMatchObject({
-      ref: "main",
+      ref: FALLBACK_REF,
     });
   });
 
@@ -128,5 +128,11 @@ describe("resolveRef", () => {
     await expect(resolveRef(parseExampleTarget(THIRD_PARTY_ROOT_URL), { fetch })).rejects.toThrow(
       /acme\/standalone-example/
     );
+  });
+
+  it("reports a rate-limited GitHub rather than quietly falling back", async () => {
+    const fetch = vi.fn().mockResolvedValue(respondWith(403, { message: "API rate limit exceeded" }));
+
+    await expect(resolveRef(parseExampleTarget(EXAMPLE_NAME), { fetch })).rejects.toThrow(/403/);
   });
 });
