@@ -35,8 +35,9 @@ To start from a specific example instead of the default template:
 npx create-shopify-mcp --example basic-server my-mcp
 ```
 
-Examples are downloaded from the newest release, so they match a published `shopify-mcp-oauth`.
-See [`examples/`](examples) for the list.
+Examples are downloaded from the newest tagged release when there is one, and from `main`
+otherwise. See [`examples/`](examples) for the list, and for why cutting a release is what keeps
+that pairing coherent.
 
 Then expose it with a tunnel, set `MCP_HOST`, add `<MCP_HOST>/oauth/shopify-callback` to your Partner
 app's allowed redirection URLs, and connect:
