@@ -60,7 +60,9 @@ export function parseExampleTarget(value: string, examplePath?: string): Example
 
   const subpath = examplePath ? examplePath.replace(/^\//, "") : rest.join("/");
   // With an explicit --example-path, everything before that path belongs to the branch name.
-  const ref = examplePath ? `${refSegment}/${rest.join("/")}`.replace(new RegExp(`/${subpath}|/$`), "") : refSegment;
+  const combined = [refSegment, ...rest].join("/").replace(/\/$/, "");
+  const suffix = `/${subpath}`;
+  const ref = examplePath && combined.endsWith(suffix) ? combined.slice(0, -suffix.length) : refSegment;
 
   return { owner, repo, subpath, ref: { kind: "explicit", ref } };
 }

@@ -55,4 +55,24 @@ describe("parseExampleTarget", () => {
   it("refuses a GitHub URL that is neither a repository root nor a tree", () => {
     expect(() => parseExampleTarget("https://github.com/acme/templates/blob/main/README.md")).toThrow(/tree/);
   });
+
+  it("takes the last occurrence of the path, not the first, when a segment repeats", () => {
+    const target = parseExampleTarget("https://github.com/acme/templates/tree/a/b/c/b", "b");
+
+    expect(target.ref).toEqual({ kind: "explicit", ref: "a/b/c" });
+    expect(target.subpath).toBe("b");
+  });
+
+  it("treats regex characters in the path as literal text", () => {
+    const target = parseExampleTarget("https://github.com/acme/templates/tree/main/mcp(starter)", "mcp(starter)");
+
+    expect(target.ref).toEqual({ kind: "explicit", ref: "main" });
+    expect(target.subpath).toBe("mcp(starter)");
+  });
+
+  it("does not crash on a path that would be an invalid regular expression", () => {
+    const target = parseExampleTarget("https://github.com/acme/templates/tree/main/mcp[starter", "mcp[starter");
+
+    expect(target.ref).toEqual({ kind: "explicit", ref: "main" });
+  });
 });
