@@ -5,6 +5,9 @@ export interface RetryOptions {
 
 export async function retry<T>(operation: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const attempts = options.attempts ?? 3;
+  if (attempts < 1) {
+    throw new Error(`retry needs at least one attempt, but was given ${attempts}.`);
+  }
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
