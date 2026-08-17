@@ -92,8 +92,13 @@ export async function resolveRef(target: ExampleTarget, deps: GitHubDeps): Promi
   if (target.ref.kind === "latest-release") {
     // No release yet is an ordinary state, not an error — fall back to the default branch.
     const response = await deps.fetch(`https://api.github.com/repos/${repository}/releases/latest`);
-    if (response.status !== 200) {
+    if (response.status === 404) {
       return withRef(target, FALLBACK_REF);
+    }
+    if (response.status !== 200) {
+      throw new Error(
+        `Could not check ${repository} for releases — GitHub answered ${response.status}. Try again in a moment.`
+      );
     }
     const release = (await response.json()) as { tag_name?: string };
     return withRef(target, release.tag_name ?? FALLBACK_REF);
