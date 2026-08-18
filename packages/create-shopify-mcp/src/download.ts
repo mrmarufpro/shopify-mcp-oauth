@@ -24,8 +24,11 @@ export async function downloadAndExtract(source: ExampleSource, targetDir: strin
   const url = `https://codeload.github.com/${source.owner}/${source.repo}/tar.gz/${source.ref}`;
   const response = await deps.fetch(url);
 
-  if (!response.ok || !response.body) {
+  if (!response.ok) {
     throw new Error(`Could not download ${url} — GitHub answered ${response.status}.`);
+  }
+  if (!response.body) {
+    throw new Error(`Could not download ${url} — GitHub answered ${response.status} with an empty body.`);
   }
 
   // GitHub names the archive root after the repository and ref. Read it off the first entry

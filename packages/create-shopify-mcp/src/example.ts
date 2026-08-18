@@ -49,7 +49,7 @@ export function parseExampleTarget(value: string, examplePath?: string): Example
     return {
       owner,
       repo,
-      subpath: examplePath?.replace(/^\//, "") ?? "",
+      subpath: examplePath?.replace(/^\/+|\/+$/g, "") ?? "",
       ref: { kind: "default-branch" },
     };
   }
@@ -58,11 +58,11 @@ export function parseExampleTarget(value: string, examplePath?: string): Example
     throw new Error(`${value} is not a GitHub tree URL. Link to a branch or tag with /tree/.`);
   }
 
-  const subpath = examplePath ? examplePath.replace(/^\//, "") : rest.join("/");
+  const subpath = examplePath ? examplePath.replace(/^\/+|\/+$/g, "") : rest.join("/");
   // With an explicit --example-path, everything before that path belongs to the branch name.
   const combined = [refSegment, ...rest].join("/").replace(/\/$/, "");
   const suffix = `/${subpath}`;
-  const ref = examplePath && combined.endsWith(suffix) ? combined.slice(0, -suffix.length) : refSegment;
+  const ref = examplePath ? (combined.endsWith(suffix) ? combined.slice(0, -suffix.length) : combined) : refSegment;
 
   return { owner, repo, subpath, ref: { kind: "explicit", ref } };
 }
@@ -82,6 +82,16 @@ function withRef(target: ExampleTarget, ref: string): ExampleSource {
   return { owner: target.owner, repo: target.repo, subpath: target.subpath, ref };
 }
 
+async function fetchGitHub(deps: GitHubDeps, url: string, repository: string): Promise<Response> {
+  try {
+    return await deps.fetch(url);
+  } catch (thrown) {
+    throw new Error(`Could not reach GitHub to look up ${repository}. Check your network connection.`, {
+      cause: thrown,
+    });
+  }
+}
+
 export async function resolveRef(target: ExampleTarget, deps: GitHubDeps): Promise<ExampleSource> {
   if (target.ref.kind === "explicit") {
     return withRef(target, target.ref.ref);
@@ -91,7 +101,7 @@ export async function resolveRef(target: ExampleTarget, deps: GitHubDeps): Promi
 
   if (target.ref.kind === "latest-release") {
     // No release yet is an ordinary state, not an error — fall back to the default branch.
-    const response = await deps.fetch(`https://api.github.com/repos/${repository}/releases/latest`);
+    const response = await fetchGitHub(deps, `https://api.github.com/repos/${repository}/releases/latest`, repository);
     if (response.status === 404) {
       return withRef(target, FALLBACK_REF);
     }
@@ -104,7 +114,7 @@ export async function resolveRef(target: ExampleTarget, deps: GitHubDeps): Promi
     return withRef(target, release.tag_name ?? FALLBACK_REF);
   }
 
-  const response = await deps.fetch(`https://api.github.com/repos/${repository}`);
+  const response = await fetchGitHub(deps, `https://api.github.com/repos/${repository}`, repository);
   if (response.status !== 200) {
     throw new Error(`Could not read ${repository} from GitHub. Check the URL and try again.`);
   }

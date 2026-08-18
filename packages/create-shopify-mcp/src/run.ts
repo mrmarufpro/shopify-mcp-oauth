@@ -83,7 +83,8 @@ export async function run(argv: string[], options: RunOptions = {}): Promise<num
     await rewritePackageJson(targetDir, { name: projectName });
   } catch (thrown) {
     if (!targetExisted) {
-      await rm(targetDir, { recursive: true, force: true });
+      // A cleanup failure must not replace the error that actually stopped the scaffold.
+      await rm(targetDir, { recursive: true, force: true }).catch(() => {});
     }
     throw thrown;
   }
@@ -91,9 +92,14 @@ export async function run(argv: string[], options: RunOptions = {}): Promise<num
   const git = args.git ? await initGit(targetDir) : { initialized: false, committed: false };
 
   console.log(`\n✓ created ${projectName}\n`);
+  const manifest = JSON.parse(await readFile(path.join(targetDir, "package.json"), "utf8")) as {
+    scripts?: Record<string, string>;
+  };
   console.log(
     nextSteps(path.relative(process.cwd(), targetDir) || projectName, {
       hasEnvExample: existsSync(path.join(targetDir, ".env.example")),
+      hasDevScript: typeof manifest.scripts?.dev === "string",
+      hasReadme: existsSync(path.join(targetDir, "README.md")),
     })
   );
   if (args.git && !git.committed) {

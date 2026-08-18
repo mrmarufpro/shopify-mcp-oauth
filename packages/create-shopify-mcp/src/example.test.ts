@@ -48,6 +48,13 @@ describe("parseExampleTarget", () => {
     expect(target.subpath).toBe("mcp/starter");
   });
 
+  it("keeps every segment of a slash-containing branch when the path is not in the url", () => {
+    const target = parseExampleTarget("https://github.com/acme/templates/tree/release/v1", "mcp/starter");
+
+    expect(target.ref).toEqual({ kind: "explicit", ref: "release/v1" });
+    expect(target.subpath).toBe("mcp/starter");
+  });
+
   it("refuses a host that is not GitHub", () => {
     expect(() => parseExampleTarget("https://gitlab.com/acme/templates")).toThrow(/github/i);
   });
@@ -134,5 +141,11 @@ describe("resolveRef", () => {
     const fetch = vi.fn().mockResolvedValue(respondWith(403, { message: "API rate limit exceeded" }));
 
     await expect(resolveRef(parseExampleTarget(EXAMPLE_NAME), { fetch })).rejects.toThrow(/403/);
+  });
+
+  it("names GitHub and the network when the connection cannot be made", async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+
+    await expect(resolveRef(parseExampleTarget(EXAMPLE_NAME), { fetch })).rejects.toThrow(/network connection/);
   });
 });
