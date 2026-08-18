@@ -1,5 +1,7 @@
 export interface NextStepsOptions {
   hasEnvExample: boolean;
+  hasDevScript: boolean;
+  hasReadme: boolean;
 }
 
 export function nextSteps(projectDir: string, options: NextStepsOptions): string {
@@ -9,8 +11,14 @@ export function nextSteps(projectDir: string, options: NextStepsOptions): string
     lines.push("  cp .env.example .env      # fill in the values it lists");
   }
 
-  lines.push("  pnpm dev", "", `Then read ${projectDir}/README.md — it covers what this example needs`);
-  lines.push("to actually run, and what to change before you deploy it.");
+  if (options.hasDevScript) {
+    lines.push("  pnpm dev");
+  }
+
+  if (options.hasReadme) {
+    lines.push("", `Then read ${projectDir}/README.md — it covers what this example needs`);
+    lines.push("to actually run, and what to change before you deploy it.");
+  }
 
   return lines.join("\n");
 }
