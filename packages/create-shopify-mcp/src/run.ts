@@ -1,20 +1,26 @@
-import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isCancel, outro, select } from "@clack/prompts";
-import { HELP_TEXT, parseArgs, type StorageChoice } from "./args";
+import { HELP_TEXT, parseArgs } from "./args";
 import { copyTemplate } from "./copy";
+import { downloadAndExtract, exampleExists } from "./download";
+import type { ExampleSource } from "./example";
+import { parseExampleTarget, resolveRef } from "./example";
 import { initGit } from "./git";
 import { nextSteps } from "./nextSteps";
 import { rewritePackageJson, toPackageName } from "./packageJson";
+import { retry } from "./retry";
 import { prepareTarget } from "./target";
-import { applyStorageChoice } from "./variant";
+
+/** Spelling of --example that means "use the template shipped inside this package". */
+const BUNDLED_EXAMPLE = "default";
 
 export interface RunOptions {
   /** Overrides the bundled template location. Tests point this at a freshly synced directory. */
   templateDir?: string;
-  /** Replaces the interactive prompt. */
-  promptImpl?: () => Promise<StorageChoice>;
+  /** Overrides network access. Tests inject a stub so no test reaches GitHub. */
+  fetch?: typeof globalThis.fetch;
 }
 
 function bundledTemplateDir(): string {
@@ -25,22 +31,6 @@ function bundledTemplateDir(): string {
 async function readVersion(): Promise<string> {
   const manifest = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
   return (JSON.parse(await readFile(manifest, "utf8")) as { version: string }).version;
-}
-
-async function promptForStorage(): Promise<StorageChoice> {
-  const answer = await select({
-    message: "Storage",
-    options: [
-      { value: "prisma" as const, label: "Prisma + Postgres", hint: "survives a restart" },
-      { value: "memory" as const, label: "In-memory", hint: "try it out; lost on restart" },
-    ],
-  });
-
-  if (isCancel(answer)) {
-    outro("Cancelled.");
-    process.exit(0);
-  }
-  return answer;
 }
 
 export async function run(argv: string[], options: RunOptions = {}): Promise<number> {
@@ -58,18 +48,60 @@ export async function run(argv: string[], options: RunOptions = {}): Promise<num
     throw new Error("Missing project directory. Try: npx create-shopify-mcp my-mcp");
   }
 
-  const choice = args.storage ?? (await (options.promptImpl ?? promptForStorage)());
+  const deps = { fetch: options.fetch ?? globalThis.fetch };
+  const wantsBundled = args.example === null || args.example === BUNDLED_EXAMPLE;
+
+  // Resolve and verify before creating anything, so a typo never leaves an empty directory behind.
+  let source: ExampleSource | null = null;
+  if (!wantsBundled) {
+    const target = parseExampleTarget(args.example as string, args.examplePath ?? undefined);
+    source = await resolveRef(target, deps);
+
+    if (!(await exampleExists(source, deps))) {
+      throw new Error(
+        `Could not find "${args.example}" in ${source.owner}/${source.repo} at ${source.ref}. ` +
+          `Check the spelling and your network connection, or browse ` +
+          `https://github.com/${source.owner}/${source.repo}/tree/${source.ref}/examples.`
+      );
+    }
+  }
+
+  // prepareTarget accepts a directory that already exists (and may hold a .git), so only a
+  // directory we created ourselves is ours to remove if the scaffold fails.
+  const targetExisted = existsSync(path.resolve(args.targetDir));
   const targetDir = await prepareTarget(args.targetDir);
   const projectName = toPackageName(targetDir);
 
-  await copyTemplate(options.templateDir ?? bundledTemplateDir(), targetDir);
-  await rewritePackageJson(targetDir, { name: projectName });
-  await applyStorageChoice(targetDir, choice);
+  try {
+    if (source) {
+      console.log(`\nDownloading ${args.example} from ${source.owner}/${source.repo}@${source.ref}…`);
+      await retry(() => downloadAndExtract(source as ExampleSource, targetDir, deps));
+    } else {
+      await copyTemplate(options.templateDir ?? bundledTemplateDir(), targetDir);
+    }
+
+    await rewritePackageJson(targetDir, { name: projectName });
+  } catch (thrown) {
+    if (!targetExisted) {
+      // A cleanup failure must not replace the error that actually stopped the scaffold.
+      await rm(targetDir, { recursive: true, force: true }).catch(() => {});
+    }
+    throw thrown;
+  }
 
   const git = args.git ? await initGit(targetDir) : { initialized: false, committed: false };
 
   console.log(`\n✓ created ${projectName}\n`);
-  console.log(nextSteps(path.relative(process.cwd(), targetDir) || projectName, choice));
+  const manifest = JSON.parse(await readFile(path.join(targetDir, "package.json"), "utf8")) as {
+    scripts?: Record<string, string>;
+  };
+  console.log(
+    nextSteps(path.relative(process.cwd(), targetDir) || projectName, {
+      hasEnvExample: existsSync(path.join(targetDir, ".env.example")),
+      hasDevScript: typeof manifest.scripts?.dev === "string",
+      hasReadme: existsSync(path.join(targetDir, "README.md")),
+    })
+  );
   if (args.git && !git.committed) {
     console.log("\nGit: the repository was not committed — commit it yourself once you have set an identity.");
   }

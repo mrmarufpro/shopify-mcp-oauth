@@ -1,55 +1,59 @@
-import express, { type Express, type RequestHandler } from "express";
-import { mountShopifyMcpOAuth, type OAuthStorage } from "shopify-mcp-oauth";
-import type { AuditSink } from "./audit";
-import { createMcpHandler } from "./mcp/transport";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express, { type Express } from "express";
+import { allowAnyShop, memoryStorage, mountShopifyMcpOAuth } from "shopify-mcp-oauth";
+import { buildMcpServer } from "./tools";
 
-export interface AppDeps {
+export interface AppOptions {
   host: string;
   shopify: { apiKey: string; apiSecret: string; scopes: string };
   stateSecret: string;
-  storage: OAuthStorage;
-  audit: AuditSink;
-  /** Test seam: the OAuth package uses this for Shopify's token exchange. */
-  fetchImpl?: typeof fetch;
 }
 
-const methodNotAllowed: RequestHandler = (_req, res) => {
-  res
-    .status(405)
-    .set("Allow", "POST")
-    .json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. Use POST /mcp." }, id: null });
-};
-
-export function createApp(deps: AppDeps): Express {
+export function createApp(options: AppOptions): Express {
   const app = express();
   app.set("trust proxy", 1);
-  // For this app's own /mcp route. The OAuth router parses its own routes' bodies.
+  // The OAuth router parses its own routes' bodies; this one is for /mcp below.
   app.use(express.json());
 
-  app.get("/health", (_req, res) => {
-    res.json({ ok: true });
-  });
-
-  // Mounts the OAuth router, then the callback's routes, then the package's error handler last --
-  // that final position is the one that matters and the one this helper exists to guarantee. A
-  // body-parser's SyntaxError on malformed JSON is thrown at this app's level, before Express ever
-  // reaches the OAuth router, so an error handler mounted inside that router cannot catch it; with
-  // nothing at the outermost level, Express's default handler answers an HTML stack trace on an
-  // unauthenticated endpoint instead. Every route this app serves therefore goes inside the
-  // callback -- one added after this call would sit below the error handler and lose that cover.
+  // Mounts the OAuth endpoints (/.well-known/…, /register, /authorize, /token, /revoke, and the
+  // Shopify callback), then your protected routes, then the package's error handler last. Passing
+  // routes in the callback is what guarantees that order — a route added after this call would sit
+  // below the error handler and lose its cover.
   mountShopifyMcpOAuth(
     app,
     {
-      host: deps.host,
-      shopify: deps.shopify,
-      stateSecret: deps.stateSecret,
-      storage: deps.storage,
-      fetchImpl: deps.fetchImpl,
+      host: options.host,
+      shopify: options.shopify,
+      stateSecret: options.stateSecret,
+      storage: {
+        // Clients and tokens live in this process: fine to try out, lost on restart, and invisible
+        // to a second instance. Swap in `prismaStorage(prisma)` before deploying.
+        ...memoryStorage(),
+        // No install gate: any merchant who completes Shopify's login gets a token. A real app
+        // resolves the shop against its own records here so a merchant it has never installed for
+        // is refused — see the README.
+        findShopByDomain: allowAnyShop(),
+      },
     },
     (oauth) => {
-      app.post("/mcp", oauth.requireAuth, createMcpHandler({ audit: deps.audit }));
-      app.get("/mcp", methodNotAllowed);
-      app.delete("/mcp", methodNotAllowed);
+      app.post("/mcp", oauth.requireAuth, async (req, res) => {
+        // requireAuth already answered 401 if the bearer token was missing, expired, or scoped to
+        // another resource, so req.mcp is set by the time this runs.
+        const auth = req.mcp!;
+
+        // Stateless: a fresh McpServer and transport per request, both closed with the response.
+        // Because the server is built per request, tools can close over `auth` directly.
+        const server = buildMcpServer(auth);
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
+        res.on("close", () => {
+          void transport.close();
+          void server.close();
+        });
+
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      });
     }
   );
 

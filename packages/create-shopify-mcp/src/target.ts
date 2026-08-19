@@ -1,6 +1,9 @@
 import { mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 
+/** Entries an operating system or editor leaves behind, which do not mean the directory is in use. */
+const IGNORABLE_ENTRIES: ReadonlySet<string> = new Set([".DS_Store", "Thumbs.db", ".git", ".idea", ".vscode"]);
+
 export async function prepareTarget(dir: string): Promise<string> {
   const absolute = path.resolve(dir);
 
@@ -19,7 +22,8 @@ export async function prepareTarget(dir: string): Promise<string> {
     throw error;
   }
 
-  if (entries.length > 0) {
+  const occupied = entries.filter((entry) => !IGNORABLE_ENTRIES.has(entry));
+  if (occupied.length > 0) {
     throw new Error(`${absolute} is not empty. Choose another directory or empty this one first.`);
   }
   return absolute;

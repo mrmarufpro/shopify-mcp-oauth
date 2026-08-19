@@ -5,13 +5,13 @@ copy-pasting a token.
 
 Two packages:
 
-| Package                                             | What it is                                                                |
-| --------------------------------------------------- | ------------------------------------------------------------------------- |
-| [`shopify-mcp-oauth`](packages/shopify-mcp-oauth)   | The OAuth layer: authorization server, resource server, and `requireAuth` |
-| [`create-shopify-mcp`](packages/create-shopify-mcp) | `npx create-shopify-mcp my-mcp` — scaffolds a running server              |
+| Package                                             | What it is                                                                                      |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| [`shopify-mcp-oauth`](packages/shopify-mcp-oauth)   | The OAuth layer: authorization server, resource server, and `requireAuth`                       |
+| [`create-shopify-mcp`](packages/create-shopify-mcp) | `npx create-shopify-mcp my-mcp` — scaffolds a running server, or `--example <name>` to pick one |
 
-Plus [`examples/basic-server`](examples/basic-server), which is both the demo and the scaffolder's
-template.
+Plus [`examples/basic-server`](examples/basic-server) — three files, in-memory storage, two demo
+tools. It is both the demo and the scaffolder's template.
 
 **Guides:**
 
@@ -26,10 +26,18 @@ template.
 npx create-shopify-mcp my-mcp
 cd my-mcp && pnpm install
 cp .env.example .env      # add your Shopify API key and secret
-docker compose up -d
-pnpm db:migrate && pnpm db:seed
 pnpm dev
 ```
+
+To start from a specific example instead of the default template:
+
+```bash
+npx create-shopify-mcp --example basic-server my-mcp
+```
+
+Examples are downloaded from the newest tagged release when there is one, and from `main`
+otherwise. See [`examples/`](examples) for the list, and for why cutting a release is what keeps
+that pairing coherent.
 
 Then expose it with a tunnel, set `MCP_HOST`, add `<MCP_HOST>/oauth/shopify-callback` to your Partner
 app's allowed redirection URLs, and connect:

@@ -21,7 +21,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@clack/prompts": "^1.7.0"
+    "tar": "^7.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
