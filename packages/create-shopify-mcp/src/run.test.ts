@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { c } from "tar";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { run } from "./run";
 
@@ -12,12 +13,10 @@ let templateDir: string;
 
 async function buildFakeTemplate(): Promise<void> {
   await mkdir(path.join(templateDir, "src"), { recursive: true });
-  await mkdir(path.join(templateDir, "prisma"), { recursive: true });
 
-  await writeFile(path.join(templateDir, "src", "storage.ts"), 'import { PrismaClient } from "@prisma/client";');
-  await writeFile(path.join(templateDir, "src", "storage.memory.ts"), "export const storage = {};");
-  await writeFile(path.join(templateDir, "prisma", "schema.prisma"), "model Session {}");
-  await writeFile(path.join(templateDir, "docker-compose.yml"), "services: {}");
+  await writeFile(path.join(templateDir, "src", "index.ts"), 'import { createApp } from "./app";');
+  await writeFile(path.join(templateDir, "src", "app.ts"), "export function createApp() {}");
+  await writeFile(path.join(templateDir, "src", "tools.ts"), "export function buildMcpServer() {}");
   await writeFile(path.join(templateDir, "gitignore"), "node_modules/\n");
   await writeFile(path.join(templateDir, ".env.example"), "MCP_HOST=https://your-tunnel.example.com\n");
   await writeFile(
@@ -26,9 +25,8 @@ async function buildFakeTemplate(): Promise<void> {
       {
         name: "basic-server",
         private: true,
-        scripts: { dev: "tsx watch src/index.ts", postinstall: "prisma generate" },
-        dependencies: { [OAUTH_PACKAGE]: "^0.1.0", "@prisma/client": "^6.19.3" },
-        devDependencies: { prisma: "^6.19.3" },
+        scripts: { dev: "tsx watch --env-file=.env src/index.ts" },
+        dependencies: { [OAUTH_PACKAGE]: "^0.1.0" },
       },
       null,
       2
@@ -49,41 +47,26 @@ afterEach(async () => {
 });
 
 describe("run", () => {
-  it("scaffolds a prisma project and reports success", async () => {
+  it("scaffolds a project and reports success", async () => {
     const target = path.join(workspace, "my-mcp");
-    const code = await run([target, "--storage", "prisma", "--no-git"], { templateDir });
+    const code = await run([target, "--no-git"], { templateDir });
 
     expect(code).toBe(0);
-    expect(existsSync(path.join(target, "prisma", "schema.prisma"))).toBe(true);
+    expect(existsSync(path.join(target, "src", "tools.ts"))).toBe(true);
     expect(JSON.parse(await readFile(path.join(target, "package.json"), "utf8")).name).toBe("my-mcp");
-  });
-
-  it("scaffolds a memory project without the prisma files", async () => {
-    const target = path.join(workspace, "memory-mcp");
-    await run([target, "--storage", "memory", "--no-git"], { templateDir });
-
-    expect(existsSync(path.join(target, "prisma"))).toBe(false);
-    expect(await readFile(path.join(target, "src", "storage.ts"), "utf8")).toContain('"./storage.memory"');
   });
 
   it("renames the undotted gitignore in the scaffolded project", async () => {
     const target = path.join(workspace, "ignored-mcp");
-    await run([target, "--storage", "prisma", "--no-git"], { templateDir });
+    await run([target, "--no-git"], { templateDir });
 
     expect(existsSync(path.join(target, ".gitignore"))).toBe(true);
+    expect(existsSync(path.join(target, "gitignore"))).toBe(false);
   });
 
-  it("asks for the storage choice only when --storage was omitted", async () => {
-    const prompt = vi.fn().mockResolvedValue("memory" as const);
-
-    await run([path.join(workspace, "asked"), "--no-git"], { templateDir, promptImpl: prompt });
-    expect(prompt).toHaveBeenCalledTimes(1);
-
-    await run([path.join(workspace, "not-asked"), "--storage", "prisma", "--no-git"], {
-      templateDir,
-      promptImpl: prompt,
-    });
-    expect(prompt).toHaveBeenCalledTimes(1);
+  it("scaffolds without prompting for anything", async () => {
+    const target = path.join(workspace, "unprompted");
+    await expect(run([target, "--no-git"], { templateDir })).resolves.toBe(0);
   });
 
   it("prints the help text and exits cleanly", async () => {
@@ -94,7 +77,7 @@ describe("run", () => {
   });
 
   it("fails with a usage message when no directory was given", async () => {
-    await expect(run(["--storage", "memory"], { templateDir })).rejects.toThrow(/directory/i);
+    await expect(run(["--no-git"], { templateDir })).rejects.toThrow(/directory/i);
   });
 
   it("refuses to scaffold over an existing project", async () => {
@@ -102,6 +85,107 @@ describe("run", () => {
     await mkdir(target, { recursive: true });
     await writeFile(path.join(target, "README.md"), "mine");
 
-    await expect(run([target, "--storage", "memory", "--no-git"], { templateDir })).rejects.toThrow(/not empty/);
+    await expect(run([target, "--no-git"], { templateDir })).rejects.toThrow(/not empty/);
+  });
+});
+
+const EXAMPLE_NAME = "basic-server";
+const RELEASE_TAG = "shopify-mcp-oauth@0.2.0";
+
+async function buildExampleArchive(): Promise<Buffer> {
+  const staging = path.join(workspace, "archive-staging");
+  const exampleDir = path.join(staging, "repo-root", "examples", EXAMPLE_NAME);
+
+  await mkdir(path.join(exampleDir, "src"), { recursive: true });
+  await writeFile(
+    path.join(exampleDir, "package.json"),
+    JSON.stringify({ name: EXAMPLE_NAME, dependencies: { [OAUTH_PACKAGE]: "latest" } }, null, 2)
+  );
+  await writeFile(path.join(exampleDir, ".env.example"), "MCP_HOST=\n");
+  await writeFile(path.join(exampleDir, "src", "index.ts"), "export {};\n");
+
+  const chunks: Buffer[] = [];
+  const stream = c({ gzip: true, cwd: staging }, ["repo-root"]);
+  stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+  await new Promise<void>((resolve, reject) => stream.on("end", () => resolve()).on("error", reject));
+
+  return Buffer.concat(chunks);
+}
+
+function fetchStubFor(archive: Buffer, options: { exists?: boolean } = {}) {
+  return vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes("/releases/latest")) {
+      return new Response(JSON.stringify({ tag_name: RELEASE_TAG }), { status: 200 });
+    }
+    if (url.includes("/contents/")) {
+      return new Response(null, { status: options.exists === false ? 404 : 200 });
+    }
+    return new Response(archive, { status: 200 });
+  });
+}
+
+describe("run --example", () => {
+  it("downloads the named example at the newest release tag", async () => {
+    const target = path.join(workspace, "fetched-mcp");
+    const fetch = fetchStubFor(await buildExampleArchive());
+
+    const code = await run(["--example", EXAMPLE_NAME, target, "--no-git"], { templateDir, fetch });
+
+    expect(code).toBe(0);
+    expect(existsSync(path.join(target, "src", "index.ts"))).toBe(true);
+    expect(JSON.parse(await readFile(path.join(target, "package.json"), "utf8")).name).toBe("fetched-mcp");
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes(RELEASE_TAG))).toBe(true);
+  });
+
+  it("uses the bundled template and no network when --example says default", async () => {
+    const target = path.join(workspace, "default-mcp");
+    const fetch = vi.fn();
+
+    await run(["--example", "default", target, "--no-git"], { templateDir, fetch });
+
+    expect(existsSync(path.join(target, "src", "tools.ts"))).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("names a misspelled example and leaves no directory behind", async () => {
+    const target = path.join(workspace, "typo-mcp");
+    const fetch = fetchStubFor(await buildExampleArchive(), { exists: false });
+
+    await expect(run(["--example", "bsic-servr", target, "--no-git"], { templateDir, fetch })).rejects.toThrow(
+      /bsic-servr/
+    );
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("removes the directory it created when the download fails", async () => {
+    const target = path.join(workspace, "failed-mcp");
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/releases/latest")) {
+        return new Response(JSON.stringify({ tag_name: RELEASE_TAG }), { status: 200 });
+      }
+      if (url.includes("/contents/")) return new Response(null, { status: 200 });
+      return new Response(null, { status: 500 });
+    });
+
+    await expect(run(["--example", EXAMPLE_NAME, target, "--no-git"], { templateDir, fetch })).rejects.toThrow(/500/);
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("leaves a directory that was already there, even when the download fails", async () => {
+    const target = path.join(workspace, "preexisting-mcp");
+    await mkdir(path.join(target, ".git"), { recursive: true });
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/releases/latest")) {
+        return new Response(JSON.stringify({ tag_name: RELEASE_TAG }), { status: 200 });
+      }
+      if (url.includes("/contents/")) return new Response(null, { status: 200 });
+      return new Response(null, { status: 500 });
+    });
+
+    await expect(run(["--example", EXAMPLE_NAME, target, "--no-git"], { templateDir, fetch })).rejects.toThrow(/500/);
+    expect(existsSync(path.join(target, ".git"))).toBe(true);
   });
 });

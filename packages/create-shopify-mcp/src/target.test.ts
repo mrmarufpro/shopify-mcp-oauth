@@ -54,4 +54,21 @@ describe("prepareTarget", () => {
 
     await expect(prepareTarget(file)).rejects.toThrow(/not a directory/);
   });
+
+  it("accepts a directory holding only files the OS put there", async () => {
+    const target = path.join(workspace, "just-metadata");
+    await prepareTarget(target);
+    await writeFile(path.join(target, ".DS_Store"), "");
+
+    await expect(prepareTarget(target)).resolves.toBe(target);
+  });
+
+  it("still names the directory when something real is in it", async () => {
+    const target = path.join(workspace, "has-work");
+    await prepareTarget(target);
+    await writeFile(path.join(target, ".DS_Store"), "");
+    await writeFile(path.join(target, "index.ts"), "export {};");
+
+    await expect(prepareTarget(target)).rejects.toThrow(/not empty/);
+  });
 });

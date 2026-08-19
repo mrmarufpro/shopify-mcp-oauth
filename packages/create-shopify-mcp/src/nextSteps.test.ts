@@ -2,38 +2,48 @@ import { describe, expect, it } from "vitest";
 import { nextSteps } from "./nextSteps";
 
 const PROJECT_DIR = "my-mcp";
+const COMPLETE_EXAMPLE = { hasEnvExample: true, hasDevScript: true, hasReadme: true };
+const WITHOUT_ENV = { hasEnvExample: false, hasDevScript: true, hasReadme: true };
+const BARE_EXAMPLE = { hasEnvExample: false, hasDevScript: false, hasReadme: false };
 
 describe("nextSteps", () => {
   it("starts by entering the project and installing", () => {
-    const steps = nextSteps(PROJECT_DIR, "prisma");
+    const steps = nextSteps(PROJECT_DIR, COMPLETE_EXAMPLE);
+
     expect(steps).toContain(`cd ${PROJECT_DIR}`);
     expect(steps).toContain("pnpm install");
   });
 
-  it("tells the Prisma user to start the database, migrate, and seed", () => {
-    const steps = nextSteps(PROJECT_DIR, "prisma");
-    expect(steps).toContain("docker compose up -d");
-    expect(steps).toContain("pnpm db:migrate");
-    expect(steps).toContain("pnpm db:seed");
+  it("offers the environment file only when the example ships one", () => {
+    expect(nextSteps(PROJECT_DIR, COMPLETE_EXAMPLE)).toContain("cp .env.example .env");
+    expect(nextSteps(PROJECT_DIR, WITHOUT_ENV)).not.toContain(".env.example");
   });
 
-  it("omits the database steps for the memory variant", () => {
-    const steps = nextSteps(PROJECT_DIR, "memory");
-    expect(steps).not.toContain("docker compose");
-    expect(steps).not.toContain("db:migrate");
+  it("sends the reader to the example's own README for anything specific", () => {
+    expect(nextSteps(PROJECT_DIR, COMPLETE_EXAMPLE)).toContain(`${PROJECT_DIR}/README.md`);
   });
 
-  it("warns the memory user that tokens vanish and a second instance breaks login", () => {
-    const steps = nextSteps(PROJECT_DIR, "memory");
-    expect(steps).toMatch(/restart/i);
-    expect(steps).toMatch(/one instance|single instance/i);
+  it("hardcodes nothing about any one example", () => {
+    const steps = nextSteps(PROJECT_DIR, COMPLETE_EXAMPLE);
+
+    expect(steps).not.toMatch(/cloudflared/i);
+    expect(steps).not.toMatch(/in-memory/i);
+    expect(steps).not.toMatch(/partner app/i);
   });
 
-  it("always points at the environment file and the tunnel", () => {
-    for (const choice of ["prisma", "memory"] as const) {
-      const steps = nextSteps(PROJECT_DIR, choice);
-      expect(steps).toContain("cp .env.example .env");
-      expect(steps).toMatch(/tunnel/i);
-    }
+  it("ends on the command that actually starts the server", () => {
+    expect(nextSteps(PROJECT_DIR, COMPLETE_EXAMPLE)).toContain("pnpm dev");
+  });
+
+  it("omits pnpm dev when the example has no dev script", () => {
+    expect(nextSteps(PROJECT_DIR, BARE_EXAMPLE)).not.toContain("pnpm dev");
+  });
+
+  it("omits the README sentence when the example ships no README", () => {
+    expect(nextSteps(PROJECT_DIR, BARE_EXAMPLE)).not.toContain("README.md");
+  });
+
+  it("still produces the cd and install line for a bare example with nothing else", () => {
+    expect(nextSteps(PROJECT_DIR, BARE_EXAMPLE)).toBe(`  cd ${PROJECT_DIR} && pnpm install`);
   });
 });
