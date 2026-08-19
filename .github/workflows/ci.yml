@@ -42,5 +42,5 @@ jobs:
       # Proves the scaffold template still generates cleanly from the example.
       - run: pnpm sync:template
 
-      - name: Fail if the generated template does not pin the current library version
+      - name: Fail if the generated template does not carry the example's pin
         run: node scripts/check-template-pin.mjs
