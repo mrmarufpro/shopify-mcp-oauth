@@ -35,9 +35,9 @@ export function createApp(options: AppOptions): Express {
         findShopByDomain: allowAnyShop(),
       },
       // /register and /revoke are unauthenticated and uncapped unless you ask for a limit, so ask
-      // for one. Counted in this process; pass a `store` to share the count across instances.
-      registerRateLimit: RECOMMENDED_RATE_LIMIT,
-      revokeRateLimit: RECOMMENDED_RATE_LIMIT,
+      // for one. One budget covers both. Counted in this process; pass a `store` to share the
+      // count across instances.
+      rateLimit: RECOMMENDED_RATE_LIMIT,
     },
     (oauth) => {
       app.post("/mcp", oauth.requireAuth, async (req, res) => {

@@ -21,9 +21,10 @@ export interface RateLimiterOptions {
    * the instance count. Supply a shared store (`rate-limit-redis`, for example) to make the limit
    * hold across instances.
    *
-   * Use a separate store instance per limiter, or give each a distinct key prefix -- express-rate-limit
-   * warns when one store object is handed to more than one limiter, because the two endpoints'
-   * counts would otherwise land in the same buckets and share a single limit.
+   * One store instance per limiter -- express-rate-limit warns when one store object is handed to
+   * more than one limiter, since their counts would land in the same buckets. (Mounting a single
+   * limiter on several routes, which is what buildRouter does, is not that case: one limiter, one
+   * store, one deliberately shared budget.)
    */
   store?: Store;
   /** Where express-rate-limit's own misconfiguration warnings go. Defaults to the console. */
@@ -46,8 +47,8 @@ const RATE_LIMITED_BODY = { error: "too_many_requests", error_description: "rate
 // missed.
 export const MAX_RATE_LIMIT_WINDOW_MS = 2 ** 31 - 1;
 
-// Config-driven limiters (registerRateLimit, revokeRateLimit) already pass through resolveConfig's
-// zod schema (z.number().int().positive()), which rules out every case rejected below. A consumer
+// The config-driven limiter (`rateLimit`) already passes through resolveConfig's zod schema
+// (z.number().int().positive()), which rules out every case rejected below. A consumer
 // calling this exported factory directly has no such schema in front of them, so it can't be
 // allowed to silently misbehave: a non-finite or non-positive windowMs (0, negative, NaN, Infinity)
 // would make every window already-expired the instant it's created, and a limit that isn't a
@@ -127,7 +128,7 @@ export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
     // WRN_ERL_MAX_ZERO only exists to flag callers who wrote `limit: 0` expecting v6's "disable the
     // limiter" meaning. Here `limit: 0` means what express-rate-limit v7+ made it mean -- block
     // every request -- and disabling a limiter is done by not configuring one at all (see
-    // registerRateLimit / revokeRateLimit in config.ts), so the warning would only ever be noise.
+    // `rateLimit` in config.ts), so the warning would only ever be noise.
     // Every other validation stays on: they diagnose real misconfigurations in the consumer's app.
     validate: { limit: false },
   });

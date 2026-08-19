@@ -146,8 +146,7 @@ seen your server finds out where to log in (RFC 9728).
 | `tokenTtl.access`              | no       | `3600`             | Seconds.                                                                                                      |
 | `tokenTtl.refresh`             | no       | `2592000`          | Seconds — 30 days.                                                                                            |
 | `openaiAppsChallengeToken`     | no       | `null`             | Only needed to list the server as a ChatGPT app. The route is omitted when null.                              |
-| `registerRateLimit`            | no       | off                | Opt-in cap on `/register`, which is unauthenticated by definition. See [Rate limiting](#rate-limiting).       |
-| `revokeRateLimit`              | no       | off                | Opt-in cap on `/revoke`, also unauthenticated by design (RFC 7009) — its own field, tuned independently.      |
+| `rateLimit`                    | no       | off                | Opt-in cap on the unauthenticated endpoints (`/register`, `/revoke`). See [Rate limiting](#rate-limiting).    |
 | `logger`                       | no       | `console`          | Anything with `info` / `warn` / `error`.                                                                      |
 | `fetchImpl`                    | no       | the global `fetch` | Test seam: the package uses this for Shopify's own token exchange and for fetching client-metadata documents. |
 
@@ -238,7 +237,7 @@ Other decisions worth knowing:
   addresses, no redirects followed, a size cap, and a hard timeout.
 - Refresh rotates: redeeming a refresh token revokes it and issues a new pair.
 - `/revoke` answers 200 whether or not the submitted token existed, per RFC 7009, so it cannot be
-  used to probe which tokens exist. A configured rate limiter (`revokeRateLimit`, see below) can
+  used to probe which tokens exist. A configured rate limiter (`rateLimit`, see below) can
   answer 429 under heavy call volume from one caller — that carries no information about any
   particular token's validity, so it doesn't reopen the oracle RFC 7009 guards against.
 
@@ -255,24 +254,27 @@ mountShopifyMcpOAuth(
   app,
   {
     // ...
-    registerRateLimit: RECOMMENDED_RATE_LIMIT, // { limit: 20, windowMs: 3_600_000 }
-    revokeRateLimit: RECOMMENDED_RATE_LIMIT,
+    rateLimit: RECOMMENDED_RATE_LIMIT, // { limit: 20, windowMs: 3_600_000 }
   },
   registerProtectedRoutes
 );
 ```
 
-Leaving either field unset logs a warning naming it at construction. If uncapped is what you want —
-you rate limit at the edge, say, or in your own middleware — set the field to `false` and the
-warning stops; `false` and omitting it behave identically otherwise.
+One setting, one limiter, **one shared budget**: `limit` is what a caller may spend across those
+endpoints _combined_ per window, not per endpoint. Both are things a legitimate client touches a
+handful of times over its whole lifetime — once at registration, once at logout — so a single
+budget is the honest shape for them, and it means a caller can't get two windows' worth of free
+work by alternating between the two.
+
+Leaving the field unset logs a warning at construction. If uncapped is what you want — you rate
+limit at the edge, say, or in your own middleware — set it to `false` and the warning stops;
+`false` and omitting it behave identically otherwise.
 
 Counting is [express-rate-limit](https://github.com/express-rate-limit/express-rate-limit)'s. Two
 consequences worth knowing:
 
 - **The limit is per process** unless you supply a store, so on a multi-instance deployment the
-  effective limit multiplies by the instance count. Pass a shared store to fix that — give each
-  endpoint its own instance or key prefix, since one store shared between two limiters puts both
-  endpoints' counts in the same buckets:
+  effective limit multiplies by the instance count. Pass a shared store to fix that:
 
   ```ts
   import { RedisStore } from "rate-limit-redis";
@@ -286,25 +288,24 @@ consequences worth knowing:
     app,
     {
       // ...
-      // Separate stores, distinct prefixes: one store object on both fields would put /register's
-      // and /revoke's counts in the same buckets.
-      registerRateLimit: { ...RECOMMENDED_RATE_LIMIT, store: new RedisStore({ sendCommand, prefix: "rl:register:" }) },
-      revokeRateLimit: { ...RECOMMENDED_RATE_LIMIT, store: new RedisStore({ sendCommand, prefix: "rl:revoke:" }) },
+      rateLimit: { ...RECOMMENDED_RATE_LIMIT, store: new RedisStore({ sendCommand, prefix: "rl:oauth:" }) },
     },
     registerProtectedRoutes
   );
   ```
 
   Spread `RECOMMENDED_RATE_LIMIT` rather than mutating it — it is frozen, and `resolveConfig` keeps
-  whichever object you pass by reference. A value that isn't a `Store` (a Redis client rather than
-  the store wrapping it, most often) is rejected at construction naming the field.
+  whichever object you pass by reference. Give this store to nothing else: one store object handed
+  to a second limiter puts both limiters' counts in the same buckets, which express-rate-limit warns
+  about. A value that isn't a `Store` (a Redis client rather than the store wrapping it, most often)
+  is rejected at construction naming the field.
 
 - **Callers are keyed by `req.ip`**, which only names the real caller when your app's Express
   [`trust proxy`](https://expressjs.com/en/guide/behind-proxies.html) setting matches your actual
   deployment — this package receives a sub-router, never your `app`, so it cannot set that for you.
   Misconfigure it and every caller shares one bucket. If `req.ip` is the wrong identity for your
   topology altogether — a tenant header from your API gateway, an authenticated account id — set
-  `keyFor` on the setting instead of abandoning these fields. Both wrong settings (unset behind a proxy, and
+  `keyFor` on the setting instead of abandoning the field. Both wrong settings (unset behind a proxy, and
   the equally wrong `trust proxy: true`) are detected and reported through your `logger`. IPv6
   callers are keyed by their /56 subnet, not the individual address, so rotating through an
   ISP-assigned subnet doesn't buy a fresh quota.

@@ -35,8 +35,7 @@ function buildConfig(
     // Explicitly declined rather than left unset: nothing here exercises /register or /revoke, and
     // an unset rate limit warns at construction (see config.ts), which would land in whichever spy
     // logger a test installed and be counted as if it were the warning under test.
-    registerRateLimit: false,
-    revokeRateLimit: false,
+    rateLimit: false,
     ...overrides,
   });
 }
