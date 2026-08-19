@@ -1,6 +1,8 @@
+import type { Request } from "express";
 import type { Store } from "express-rate-limit";
 import { z } from "zod";
 import { memoryCache } from "./adapters/memoryCache";
+import { MAX_RATE_LIMIT_WINDOW_MS } from "./middlewares/rateLimit";
 import { createConcurrencyLimiter, type ConcurrencyLimiter } from "./services/concurrencyLimiter";
 import type { CacheStore, Logger, OAuthStorage, ShopNotFoundHandler } from "./types";
 
@@ -18,6 +20,14 @@ export interface RateLimitSetting {
    * same buckets, which express-rate-limit warns about.
    */
   store?: Store;
+  /**
+   * Overrides how a caller is identified. Left unset, callers are keyed by `req.ip` (with IPv6
+   * addresses collapsed onto their /56 subnet), which is right for most deployments but assumes
+   * Express's `trust proxy` setting matches yours. Supply this when the caller's identity lives
+   * somewhere else -- a tenant header from your API gateway, an authenticated account id -- rather
+   * than abandoning these fields and hand-mounting `createRateLimiter`.
+   */
+  keyFor?: (req: Request) => string;
 }
 
 const DEFAULT_ACCESS_TTL_SECONDS = 3600;
@@ -25,7 +35,12 @@ const DEFAULT_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30;
 // Not applied automatically -- rate limiting is opt-in (see RateLimitSetting). Exported so the
 // recommended starting point is a value a consumer can pass rather than a number they have to copy
 // out of the README, and so the README and the code cannot drift apart on what "recommended" means.
-export const RECOMMENDED_RATE_LIMIT: RateLimitSetting = { limit: 20, windowMs: 60 * 60 * 1000 };
+// Frozen because `resolveConfig` stores whichever object it is given, by reference, into both
+// resolved fields -- so a single mutation of a shared constant would silently re-tune every limiter
+// built from it afterwards, and `RECOMMENDED_RATE_LIMIT.store = ...` would land one store on both
+// endpoints, which is the shared-bucket mistake RateLimitSetting.store warns against. Spread it
+// (`{ ...RECOMMENDED_RATE_LIMIT, store }`) to adjust it.
+export const RECOMMENDED_RATE_LIMIT: RateLimitSetting = Object.freeze({ limit: 20, windowMs: 60 * 60 * 1000 });
 // An unauthenticated caller can drive /authorize with an unlimited number of distinct CIMD
 // client_id URLs (see services/cimd.ts), each holding an outbound HTTPS connection open for up to
 // TIMEOUT_MS (3s) with no bound on how many run at once — real resource exhaustion on the first
@@ -166,7 +181,16 @@ function validateHost(value: string, ctx: z.RefinementCtx): void {
 }
 
 const rateLimitSettingSchema = z
-  .union([z.literal(false), z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() })])
+  .union([
+    z.literal(false),
+    z.object({
+      limit: z.number().int().positive(),
+      // Capped for the same reason createRateLimiter caps it -- see MAX_RATE_LIMIT_WINDOW_MS. The
+      // factory would reject this too, but only once buildRouter got that far, with a message
+      // naming `createRateLimiter` rather than the config field the consumer actually wrote.
+      windowMs: z.number().int().positive().max(MAX_RATE_LIMIT_WINDOW_MS),
+    }),
+  ])
   .optional();
 
 const configSchema = z.object({
@@ -210,6 +234,27 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
     throw new Error(
       'shopify-mcp-oauth config invalid at "onShopNotFound": must be a function returning a ShopRef or null'
     );
+  }
+
+  // Not expressible in configSchema either, and for a sharper reason than onShopNotFound above:
+  // zod's object schema *strips* `store` rather than rejecting it, so nothing in the schema ever
+  // sees it. Left unchecked, a plausible wrong value -- a Redis client instead of the store that
+  // wraps it, which is the exact mix-up the README's example invites -- reaches express-rate-limit
+  // and throws "An invalid store was passed", naming neither the field nor which of the two
+  // limiters it came from.
+  for (const field of ["registerRateLimit", "revokeRateLimit"] as const) {
+    const setting = input[field];
+    if (!setting || setting.store === undefined) continue;
+    const store = setting.store as Partial<Store>;
+    const implementsStore =
+      typeof store.increment === "function" &&
+      typeof store.decrement === "function" &&
+      typeof store.resetKey === "function";
+    if (!implementsStore) {
+      throw new Error(
+        `shopify-mcp-oauth config invalid at "${field}.store": must implement the express-rate-limit Store interface (increment, decrement, resetKey). A Redis client is not a store -- wrap it, e.g. new RedisStore({ sendCommand }).`
+      );
+    }
   }
 
   // validateHost already proved this parses; re-derive from the URL (not the raw string) so the

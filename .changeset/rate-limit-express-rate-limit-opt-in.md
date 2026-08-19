@@ -16,6 +16,12 @@ Why the swap, given the old limiter worked:
 - **IPv6 callers were keyed on the raw address.** An IPv6 client is routinely handed a whole /64 by its ISP and can source traffic from any address in it, so rotating through the subnet bought a fresh quota per address — a bypass, not an edge case. Callers are now keyed by their /56.
 - **Counting was unconditionally in-process, with no way for a consumer to change that.** `RateLimitSetting.store` accepts an `express-rate-limit` `Store`, so a Redis-backed store makes one limit hold across every instance instead of multiplying by the instance count. The `Store` type is re-exported as `RateLimitStore`.
 
-Also in this release: blocked responses carry standardized `RateLimit` / `RateLimit-Policy` headers (draft-7) in place of the deprecated `X-RateLimit-*` ones, `Retry-After` is unchanged, and `express-rate-limit`'s own misconfiguration findings — an unset or over-permissive Express `trust proxy` setting, most of them — are reported through your configured `logger` rather than straight to the console.
+Also in this release:
 
-`createRateLimiter`'s name, signature, input validation, `429` body shape, and `limit: 0` (block every request) behaviour are unchanged.
+- `RateLimitSetting.keyFor` overrides how a caller is identified, for deployments where `req.ip` is the wrong identity (a tenant header from an API gateway, an authenticated account id) even with Express's `trust proxy` set correctly.
+- `/register` and `/revoke` responses now carry the standardized `RateLimit` and `RateLimit-Policy` headers (draft-7). Previously these endpoints sent no rate-limit headers at all except `Retry-After` on a blocked response; the deprecated `X-RateLimit-*` family is not enabled. `Retry-After` is still sent on every blocked response, now derived from the store's reset time.
+- `windowMs` above 2147483647 ms (~24.9 days) is rejected at construction. Node clamps a `setInterval` delay past that to 1 ms, which would rotate the counter's window every millisecond and silently stop limiting.
+- A `store` that does not implement the `Store` interface is rejected at construction naming the field, rather than surfacing later as an unattributed `TypeError` from `express-rate-limit`.
+- `express-rate-limit`'s own misconfiguration findings — an unset or over-permissive Express `trust proxy` setting, most of them — are reported through your configured `logger` rather than straight to the console.
+
+`createRateLimiter`'s name, signature, `429` body shape, and `limit: 0` (block every request) behaviour are unchanged.

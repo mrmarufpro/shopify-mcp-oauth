@@ -3,7 +3,7 @@ import type { Store } from "express-rate-limit";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import type { Logger } from "../types";
-import { createRateLimiter, type RateLimiterOptions } from "./rateLimit";
+import { createRateLimiter, MAX_RATE_LIMIT_WINDOW_MS, type RateLimiterOptions } from "./rateLimit";
 
 // express-rate-limit reports misconfigurations it detects in the surrounding app (an unset or
 // over-permissive `trust proxy`, most of them) through the logger it was given. Several tests below
@@ -240,6 +240,20 @@ describe("createRateLimiter", () => {
 
     it("throws when limit is NaN", () => {
       expect(() => createRateLimiter({ limit: NaN, windowMs: 60_000 })).toThrow(/limit/);
+    });
+
+    it("throws when windowMs exceeds what setInterval can represent, which would silently stop limiting", () => {
+      // Node clamps a setInterval delay past this to 1ms instead of erroring, so the store's window
+      // rotation would fire every millisecond and forget every caller -- a limiter that answers 200
+      // to everything while looking correctly configured. express-rate-limit notices but only logs,
+      // leaving the limiter mounted, which is why this has to throw here.
+      expect(() => createRateLimiter({ limit: 1, windowMs: MAX_RATE_LIMIT_WINDOW_MS + 1 })).toThrow(/windowMs/);
+    });
+
+    it("accepts the largest window setInterval can represent", () => {
+      // The bound is the last working value, not the first broken one -- an off-by-one here would
+      // reject a window that limits perfectly well.
+      expect(() => createRateLimiter({ limit: 1, windowMs: MAX_RATE_LIMIT_WINDOW_MS })).not.toThrow();
     });
 
     it("accepts limit: 0 as a valid (if unusual) input rather than rejecting it", () => {

@@ -275,15 +275,36 @@ consequences worth knowing:
   endpoints' counts in the same buckets:
 
   ```ts
-  import RedisStore from "rate-limit-redis";
+  import { RedisStore } from "rate-limit-redis";
+  import { createClient } from "redis";
 
-  registerRateLimit: { ...RECOMMENDED_RATE_LIMIT, store: new RedisStore({ sendCommand, prefix: "rl:register:" }) },
+  const redis = createClient({ url: process.env.REDIS_URL });
+  await redis.connect();
+  const sendCommand = (...args: string[]) => redis.sendCommand(args);
+
+  mountShopifyMcpOAuth(
+    app,
+    {
+      // ...
+      // Separate stores, distinct prefixes: one store object on both fields would put /register's
+      // and /revoke's counts in the same buckets.
+      registerRateLimit: { ...RECOMMENDED_RATE_LIMIT, store: new RedisStore({ sendCommand, prefix: "rl:register:" }) },
+      revokeRateLimit: { ...RECOMMENDED_RATE_LIMIT, store: new RedisStore({ sendCommand, prefix: "rl:revoke:" }) },
+    },
+    registerProtectedRoutes
+  );
   ```
+
+  Spread `RECOMMENDED_RATE_LIMIT` rather than mutating it — it is frozen, and `resolveConfig` keeps
+  whichever object you pass by reference. A value that isn't a `Store` (a Redis client rather than
+  the store wrapping it, most often) is rejected at construction naming the field.
 
 - **Callers are keyed by `req.ip`**, which only names the real caller when your app's Express
   [`trust proxy`](https://expressjs.com/en/guide/behind-proxies.html) setting matches your actual
   deployment — this package receives a sub-router, never your `app`, so it cannot set that for you.
-  Misconfigure it and every caller shares one bucket. Both wrong settings (unset behind a proxy, and
+  Misconfigure it and every caller shares one bucket. If `req.ip` is the wrong identity for your
+  topology altogether — a tenant header from your API gateway, an authenticated account id — set
+  `keyFor` on the setting instead of abandoning these fields. Both wrong settings (unset behind a proxy, and
   the equally wrong `trust proxy: true`) are detected and reported through your `logger`. IPv6
   callers are keyed by their /56 subnet, not the individual address, so rotating through an
   ISP-assigned subnet doesn't buy a fresh quota.

@@ -68,6 +68,43 @@ describe("resolveConfig", () => {
     );
   });
 
+  it("rejects a rate-limit window too long for setInterval, naming the field", () => {
+    // The factory rejects this too, but only once buildRouter reaches it -- and then the message
+    // names createRateLimiter rather than the config field the consumer actually wrote.
+    expect(() => resolveConfig(buildConfig({ registerRateLimit: { limit: 20, windowMs: 2 ** 31 } }))).toThrow(
+      /registerRateLimit/
+    );
+  });
+
+  it("rejects a store that does not implement the express-rate-limit Store interface", () => {
+    // zod strips `store` rather than rejecting it, so without an explicit check this reaches
+    // express-rate-limit and throws "An invalid store was passed" -- naming neither the field nor
+    // which of the two limiters it came from.
+    const aRedisClientRatherThanAStore = { connect: () => {}, sendCommand: () => {} };
+    expect(() =>
+      resolveConfig(
+        buildConfig({
+          revokeRateLimit: { limit: 20, windowMs: 60_000, store: aRedisClientRatherThanAStore as never },
+        })
+      )
+    ).toThrow(/revokeRateLimit\.store/);
+  });
+
+  it("freezes the recommended setting so one mutation cannot re-tune every limiter built from it", () => {
+    // resolveConfig stores whichever object it is handed, by reference, in both resolved fields --
+    // and the example passes this same constant to both. Mutating it would otherwise reach every
+    // handle constructed afterwards.
+    expect(Object.isFrozen(RECOMMENDED_RATE_LIMIT)).toBe(true);
+  });
+
+  it("carries a supplied keyFor through to the resolved setting", () => {
+    const keyByTenantHeader = (req: { headers: Record<string, string> }) => req.headers["x-tenant"]!;
+    const resolved = resolveConfig(
+      buildConfig({ registerRateLimit: { limit: 1, windowMs: 1000, keyFor: keyByTenantHeader as never } })
+    );
+    expect(resolved.registerRateLimit?.keyFor).toBe(keyByTenantHeader);
+  });
+
   it("keeps an explicit revoke rate limit", () => {
     const revokeRateLimit = { limit: 5, windowMs: 30_000 };
     expect(resolveConfig(buildConfig({ revokeRateLimit })).revokeRateLimit).toEqual(revokeRateLimit);

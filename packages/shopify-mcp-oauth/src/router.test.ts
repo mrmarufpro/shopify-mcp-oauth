@@ -649,6 +649,44 @@ describe("mounts a rate limiter on /revoke", () => {
     expect(second.headers["retry-after"]).toBeDefined();
   });
 
+  it("keys callers by a configured keyFor rather than by IP", async () => {
+    // router.ts spreads the whole RateLimitSetting into createRateLimiter, so this is what proves
+    // the spread actually carries the identity function -- threading only limit and windowMs would
+    // leave every caller sharing one IP-keyed bucket while the config claimed otherwise.
+    const FIRST_TENANT = "tenant-one";
+    const SECOND_TENANT = "tenant-two";
+    const oauth = createShopifyMcpOAuth(
+      buildBaseConfig({
+        revokeRateLimit: {
+          limit: 1,
+          windowMs: 60_000,
+          keyFor: (req) => String(req.headers["x-tenant"]),
+        },
+      })
+    );
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+
+    const firstTenantsOneAllowedCall = await request(app)
+      .post("/revoke")
+      .set("x-tenant", FIRST_TENANT)
+      .send({ token: "first" });
+    // Same IP as the call above -- only the tenant differs, so an IP-keyed limiter would block it.
+    const secondTenantIsUnaffected = await request(app)
+      .post("/revoke")
+      .set("x-tenant", SECOND_TENANT)
+      .send({ token: "second" });
+    const firstTenantIsNowBlocked = await request(app)
+      .post("/revoke")
+      .set("x-tenant", FIRST_TENANT)
+      .send({ token: "third" });
+
+    expect(firstTenantsOneAllowedCall.status).toBe(200);
+    expect(secondTenantIsUnaffected.status).toBe(200);
+    expect(firstTenantIsNowBlocked.status).toBe(429);
+  });
+
   // Same gap as /register's windowMs test above, mirrored onto /revoke.
   it("threads the configured revokeRateLimit.windowMs into the limiter, not just the limit", async () => {
     const CONFIGURED_WINDOW_MS = 120_000;

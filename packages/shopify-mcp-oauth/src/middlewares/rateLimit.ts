@@ -35,17 +35,33 @@ export interface RateLimiterOptions {
 // text: a client that parses one endpoint's errors should not have to special-case this one.
 const RATE_LIMITED_BODY = { error: "too_many_requests", error_description: "rate limit exceeded" };
 
+// Node clamps a setInterval delay above this to 1ms rather than rejecting it, and
+// express-rate-limit's MemoryStore schedules its window rotation with setInterval(windowMs). A
+// larger window therefore rotates every millisecond, forgetting every tracked key almost
+// immediately, and the limiter silently stops limiting -- the worst possible failure for this
+// middleware, since nothing about the response says it has stopped working. express-rate-limit
+// does detect it, but only through a validation whose throw its own wrapper catches and logs, so
+// the limiter is still built and still mounted. Rejected here instead: a window this long is never
+// what the caller meant, and a config error at construction is the one form of this that cannot be
+// missed.
+export const MAX_RATE_LIMIT_WINDOW_MS = 2 ** 31 - 1;
+
 // Config-driven limiters (registerRateLimit, revokeRateLimit) already pass through resolveConfig's
 // zod schema (z.number().int().positive()), which rules out every case rejected below. A consumer
 // calling this exported factory directly has no such schema in front of them, so it can't be
 // allowed to silently misbehave: a non-finite or non-positive windowMs (0, negative, NaN, Infinity)
-// would make every window already-expired the instant it's created (and Infinity would put that
-// same value straight into the `setInterval` express-rate-limit's MemoryStore uses to sweep), and a
-// limit that isn't a non-negative integer would either allow unlimited requests (negative) or not
-// do what its value claims. express-rate-limit validates none of these itself.
+// would make every window already-expired the instant it's created, and a limit that isn't a
+// non-negative integer would either allow unlimited requests (negative) or not do what its value
+// claims. express-rate-limit validates none of these itself, and the one overlapping check it does
+// have (the setInterval ceiling above) it only logs.
 function assertValidRateLimiterOptions(options: RateLimiterOptions): void {
   if (!Number.isFinite(options.windowMs) || options.windowMs <= 0) {
     throw new Error("createRateLimiter: windowMs must be a positive, finite number of milliseconds");
+  }
+  if (options.windowMs > MAX_RATE_LIMIT_WINDOW_MS) {
+    throw new Error(
+      `createRateLimiter: windowMs must be at most ${MAX_RATE_LIMIT_WINDOW_MS} ms (about 24.9 days) -- a longer window silently stops limiting`
+    );
   }
   if (!Number.isInteger(options.limit) || options.limit < 0) {
     throw new Error("createRateLimiter: limit must be a non-negative integer");
