@@ -3,6 +3,24 @@
   "version": "0.1.0",
   "description": "Scaffold an MCP server for a Shopify app, with OAuth login already wired",
   "license": "MIT",
+  "author": "Md Maruf Ahmed <maruffamd@gmail.com> (https://github.com/mrmarufpro)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrmarufpro/shopify-mcp-oauth.git",
+    "directory": "packages/create-shopify-mcp"
+  },
+  "homepage": "https://github.com/mrmarufpro/shopify-mcp-oauth#readme",
+  "bugs": "https://github.com/mrmarufpro/shopify-mcp-oauth/issues",
+  "keywords": [
+    "shopify",
+    "mcp",
+    "model-context-protocol",
+    "scaffold",
+    "generator",
+    "create-app",
+    "starter",
+    "template"
+  ],
   "type": "module",
   "engines": {
     "node": ">=20"

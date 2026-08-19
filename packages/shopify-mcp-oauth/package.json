@@ -3,6 +3,27 @@
   "version": "0.1.0",
   "description": "OAuth 2.1 authorization + resource server for a Shopify app's MCP endpoint",
   "license": "MIT",
+  "author": "Md Maruf Ahmed <maruffamd@gmail.com> (https://github.com/mrmarufpro)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrmarufpro/shopify-mcp-oauth.git",
+    "directory": "packages/shopify-mcp-oauth"
+  },
+  "homepage": "https://github.com/mrmarufpro/shopify-mcp-oauth#readme",
+  "bugs": "https://github.com/mrmarufpro/shopify-mcp-oauth/issues",
+  "keywords": [
+    "shopify",
+    "mcp",
+    "model-context-protocol",
+    "oauth",
+    "oauth2",
+    "oauth2.1",
+    "pkce",
+    "express",
+    "authorization-server",
+    "resource-server"
+  ],
+  "sideEffects": false,
   "type": "module",
   "engines": {
     "node": ">=20"

@@ -252,6 +252,34 @@ pnpm typecheck
 pnpm lint
 ```
 
+## Releasing
+
+Releases run on [Changesets](https://github.com/changesets/changesets). Publishing happens in CI over
+npm trusted publishing (OIDC), so there is no npm token in repository secrets, and every release
+published by the workflow carries a provenance attestation. `0.1.0` of each package is the exception —
+npm's trusted publishing can only attach to a package that already exists on the registry, so the
+first release of each package was published by hand, before there was anything to attach to.
+
+**One-time repository setting:** Settings → Actions → General → Workflow permissions must have "Allow
+GitHub Actions to create and approve pull requests" checked. It is off by default in many orgs, and
+without it step 2 below fails with "GitHub Actions is not permitted to create or approve pull
+requests."
+
+1. A pull request that changes either package includes a changeset — run `pnpm changeset`, pick the
+   packages and the bump, and commit the generated file. Details in
+   [`.changeset/README.md`](.changeset/README.md).
+2. Merging to `main` runs `.github/workflows/release.yml`. With changesets pending, it opens or
+   updates a **Version Packages** pull request holding the version bumps and CHANGELOG entries.
+3. Merging that pull request runs the workflow again. This time it builds, publishes to npm, pushes
+   git tags, and creates GitHub releases.
+
+The two packages version independently — a fix in the CLI does not bump the library.
+
+`packages/create-shopify-mcp/templates/` is generated, not source: it is gitignored, and the CLI's
+`prepack` hook regenerates it from `examples/basic-server` before every publish, pinning
+`shopify-mcp-oauth` at the version being released. `scripts/check-template-pin.mjs` asserts that in
+CI. Edit `examples/basic-server`, never the template.
+
 ## License
 
 MIT.
