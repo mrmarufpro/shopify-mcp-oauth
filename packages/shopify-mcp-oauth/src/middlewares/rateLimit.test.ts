@@ -1,7 +1,15 @@
-import express, { type Request, type RequestHandler, type Response } from "express";
+import express from "express";
+import type { Store } from "express-rate-limit";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
+import type { Logger } from "../types";
 import { createRateLimiter, type RateLimiterOptions } from "./rateLimit";
+
+// express-rate-limit reports misconfigurations it detects in the surrounding app (an unset or
+// over-permissive `trust proxy`, most of them) through the logger it was given. Several tests below
+// provoke exactly those conditions on purpose, so they hand it somewhere quiet to report them --
+// otherwise every run prints warnings about deliberate test setup.
+const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 
 // `downstream` stands in for the protected route handler this middleware guards. Every blocked-
 // request test passes its own spy and asserts it was never called -- a 429 response that still
@@ -78,10 +86,10 @@ describe("createRateLimiter", () => {
   });
 
   it("snapshots limit at construction, ignoring later mutation of the options object", async () => {
-    // keyFor and maxEntries are already snapshotted into locals at construction; limit must be
-    // too. Reading it live off `options` on every request would let a consumer mutating this same
-    // object later -- accidentally or otherwise -- raise the limit and unblock an already-blocked
-    // caller mid-window.
+    // express-rate-limit accepts `limit` as either a number or a per-request function, so reading
+    // it live off `options` would be a one-character change away. It must not be: a consumer
+    // mutating this same object later -- accidentally or otherwise -- would raise the limit and
+    // unblock an already-blocked caller mid-window.
     const options: RateLimiterOptions = { limit: 1, windowMs: 60_000 };
     const app = express();
     app.post("/register", createRateLimiter(options), (_req, res) => res.status(201).json({ ok: true }));
@@ -170,7 +178,7 @@ describe("createRateLimiter", () => {
     function buildDefaultKeyApp(limit: number, trustProxy: boolean) {
       const app = express();
       if (trustProxy) app.set("trust proxy", true);
-      app.post("/register", createRateLimiter({ limit, windowMs: 60_000 }), (_req, res) =>
+      app.post("/register", createRateLimiter({ limit, windowMs: 60_000, logger: silentLogger }), (_req, res) =>
         res.status(201).json({ ok: true })
       );
       return app;
@@ -199,137 +207,6 @@ describe("createRateLimiter", () => {
       expect((await request(app).post("/register").set("X-Forwarded-For", "203.0.113.10")).status).toBe(201);
       const collapsedOntoSameBucket = await request(app).post("/register").set("X-Forwarded-For", "203.0.113.20");
       expect(collapsedOntoSameBucket.status).toBe(429);
-    });
-  });
-
-  describe("bounded memory", () => {
-    it("evicts the oldest tracked key once maxEntries is reached, so memory stays bounded under many distinct keys", async () => {
-      const LIMIT = 1;
-      const MAX_ENTRIES = 3;
-      const EVICTED_CALLER = "evicted-caller";
-      const FILLER_CALLERS = ["filler-1", "filler-2", "filler-3"];
-      const app = express();
-      app.post(
-        "/register",
-        createRateLimiter({
-          limit: LIMIT,
-          windowMs: 60_000,
-          maxEntries: MAX_ENTRIES,
-          keyFor: (req) => String(req.headers["x-test-key"]),
-        }),
-        (_req, res) => res.status(201).json({ ok: true })
-      );
-
-      // Consume EVICTED_CALLER's one allowed request; absent eviction it would stay blocked for
-      // the full 60-second window.
-      expect((await request(app).post("/register").set("x-test-key", EVICTED_CALLER)).status).toBe(201);
-      expect((await request(app).post("/register").set("x-test-key", EVICTED_CALLER)).status).toBe(429);
-
-      // Three more distinct callers push the tracked-key count past MAX_ENTRIES, which must evict
-      // EVICTED_CALLER -- the oldest tracked entry -- to keep the map bounded.
-      for (const fillerCaller of FILLER_CALLERS) {
-        expect((await request(app).post("/register").set("x-test-key", fillerCaller)).status).toBe(201);
-      }
-
-      // If eviction were removed, EVICTED_CALLER's original window (limit already spent, far from
-      // its 60-second reset) would still be tracked and this would stay 429. With eviction, the
-      // entry was dropped, so EVICTED_CALLER is treated as a fresh caller.
-      const evictedCallerTreatedAsFresh = await request(app).post("/register").set("x-test-key", EVICTED_CALLER);
-      expect(evictedCallerTreatedAsFresh.status).toBe(201);
-    });
-
-    it("does not evict a live, just-refreshed key in place of a genuinely stale one", async () => {
-      // `Map#set` on an existing key updates it in place without moving its iteration position --
-      // so refreshing a lapsed key that's still in the map (not deleting it first) would let
-      // whichever key was seen first stay parked at the head forever, no matter how recently it
-      // was actually refreshed. Eviction reads head position as "oldest", so that pinned key
-      // becomes a wrongful eviction target the moment the cap is hit, while a truly stale key
-      // sitting behind it is spared just because it happens to occupy a later slot.
-      const LIMIT = 1;
-      const MAX_ENTRIES = 3;
-      const WINDOW_MS = 300;
-      const FIRST_CALLER = "first-caller";
-      const SECOND_CALLER = "second-caller";
-      const THIRD_CALLER = "third-caller";
-      const FOURTH_CALLER = "fourth-caller";
-      const app = express();
-      app.post(
-        "/register",
-        createRateLimiter({
-          limit: LIMIT,
-          windowMs: WINDOW_MS,
-          maxEntries: MAX_ENTRIES,
-          keyFor: (req) => String(req.headers["x-test-key"]),
-        }),
-        (_req, res) => res.status(201).json({ ok: true })
-      );
-
-      // FIRST_CALLER is the very first key ever tracked -- exactly the one a position-based bug
-      // would pin at the head.
-      expect((await request(app).post("/register").set("x-test-key", FIRST_CALLER)).status).toBe(201);
-      expect((await request(app).post("/register").set("x-test-key", SECOND_CALLER)).status).toBe(201);
-
-      // Let both windows lapse, then refresh FIRST_CALLER while it's still tracked-but-expired.
-      // SECOND_CALLER is left untouched from here on, so it stays genuinely stale.
-      await new Promise((resolve) => setTimeout(resolve, WINDOW_MS + 50));
-      expect((await request(app).post("/register").set("x-test-key", FIRST_CALLER)).status).toBe(201);
-
-      // THIRD_CALLER (new key) brings the map to MAX_ENTRIES; FOURTH_CALLER (new key) then pushes
-      // past it, forcing an eviction. The only correct victim is SECOND_CALLER -- long expired and
-      // never revisited -- not FIRST_CALLER, which was just refreshed and is still live.
-      expect((await request(app).post("/register").set("x-test-key", THIRD_CALLER)).status).toBe(201);
-      expect((await request(app).post("/register").set("x-test-key", FOURTH_CALLER)).status).toBe(201);
-
-      // FIRST_CALLER's refreshed window is nowhere near elapsed -- it must still be blocked. If it
-      // were wrongly evicted instead of SECOND_CALLER, this would read 201.
-      const firstCallerStillBlocked = await request(app).post("/register").set("x-test-key", FIRST_CALLER);
-      expect(firstCallerStillBlocked.status).toBe(429);
-    });
-  });
-
-  describe("shipping defaults", () => {
-    // Task 20 wires `createRateLimiter({ limit, windowMs })` only -- `maxEntries` has no field in
-    // the config schema a consumer can override, so this default is the actual production
-    // configuration, not just a mechanism demonstrated at a shrunk-for-testability value. Driving
-    // the real default (10,000) via supertest would mean thousands of real HTTP round trips;
-    // calling the returned handler directly with minimal req/res stubs exercises the exact same
-    // code path at the speed of a plain function call, which is what makes asserting the real
-    // default value practical here.
-    function invokeDirectly(handler: RequestHandler, key: string): { allowed: boolean } {
-      let allowed = false;
-      const req = { headers: { "x-test-key": key } } as unknown as Request;
-      const res = {
-        setHeader: () => {},
-        status: () => ({ json: () => undefined }),
-      } as unknown as Response;
-      handler(req, res, () => {
-        allowed = true;
-      });
-      return { allowed };
-    }
-
-    it("defaults maxEntries to 10,000, evicting only once more than that many distinct keys are tracked", () => {
-      const DEFAULT_MAX_ENTRIES = 10_000;
-      const LIVE_CALLER = "live-caller";
-      const limiter = createRateLimiter({
-        limit: 1,
-        windowMs: 60_000,
-        keyFor: (req) => String(req.headers["x-test-key"]),
-      });
-
-      // Spend LIVE_CALLER's one allowed request; it stays live for the next 60 seconds absent eviction.
-      expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(true);
-
-      // Fill up to (but not past) the default cap with other distinct keys -- LIVE_CALLER must survive.
-      for (let fillerIndex = 0; fillerIndex < DEFAULT_MAX_ENTRIES - 1; fillerIndex++) {
-        invokeDirectly(limiter, `filler-caller-${fillerIndex}`);
-      }
-      expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(false);
-
-      // One more distinct key pushes the tracked-key count past the default cap, which must evict
-      // LIVE_CALLER (the oldest tracked entry).
-      invokeDirectly(limiter, "one-key-too-many");
-      expect(invokeDirectly(limiter, LIVE_CALLER).allowed).toBe(true);
     });
   });
 
@@ -365,14 +242,6 @@ describe("createRateLimiter", () => {
       expect(() => createRateLimiter({ limit: NaN, windowMs: 60_000 })).toThrow(/limit/);
     });
 
-    it("throws when maxEntries is zero", () => {
-      expect(() => createRateLimiter({ limit: 1, windowMs: 60_000, maxEntries: 0 })).toThrow(/maxEntries/);
-    });
-
-    it("throws when maxEntries is not an integer", () => {
-      expect(() => createRateLimiter({ limit: 1, windowMs: 60_000, maxEntries: 2.5 })).toThrow(/maxEntries/);
-    });
-
     it("accepts limit: 0 as a valid (if unusual) input rather than rejecting it", () => {
       expect(() => createRateLimiter({ limit: 0, windowMs: 60_000 })).not.toThrow();
     });
@@ -395,6 +264,107 @@ describe("createRateLimiter", () => {
       await request(app).post("/register");
       const second = await request(app).post("/register");
       expect(second.status).toBe(429);
+    });
+  });
+
+  describe("IPv6 callers", () => {
+    // An IPv6 client is routinely handed a whole /64 (often more) by its ISP, every address of
+    // which it can source traffic from at will. Keying on the raw address would let one caller walk
+    // through them and start a fresh quota on each, which is a bypass, not an edge case -- so the
+    // key is the /56 the addresses share, not the address itself.
+    const FIRST_ADDRESS_IN_SUBNET = "2001:db8:abcd:0100::1";
+    const SECOND_ADDRESS_IN_SUBNET = "2001:db8:abcd:0155::9";
+    const ADDRESS_IN_A_DIFFERENT_SUBNET = "2001:db8:abcd:0200::1";
+
+    function buildIpv6App(limit: number) {
+      const app = express();
+      // Required for req.ip to read X-Forwarded-For at all; see the trust proxy block above.
+      app.set("trust proxy", true);
+      app.post("/register", createRateLimiter({ limit, windowMs: 60_000, logger: silentLogger }), (_req, res) =>
+        res.status(201).json({ ok: true })
+      );
+      return app;
+    }
+
+    it("counts two addresses from one ISP-assigned subnet against the same limit", async () => {
+      const LIMIT = 1;
+      const app = buildIpv6App(LIMIT);
+
+      expect((await request(app).post("/register").set("X-Forwarded-For", FIRST_ADDRESS_IN_SUBNET)).status).toBe(201);
+
+      const rotatedToAnotherAddressOfTheSameSubnet = await request(app)
+        .post("/register")
+        .set("X-Forwarded-For", SECOND_ADDRESS_IN_SUBNET);
+      expect(rotatedToAnotherAddressOfTheSameSubnet.status).toBe(429);
+    });
+
+    it("still keys genuinely different subnets apart", async () => {
+      // The masking above is only correct if it stops at /56. A mask wide enough to merge unrelated
+      // subnets would pass the test above while rate-limiting strangers against each other.
+      const LIMIT = 1;
+      const app = buildIpv6App(LIMIT);
+
+      expect((await request(app).post("/register").set("X-Forwarded-For", FIRST_ADDRESS_IN_SUBNET)).status).toBe(201);
+
+      const unrelatedCaller = await request(app)
+        .post("/register")
+        .set("X-Forwarded-For", ADDRESS_IN_A_DIFFERENT_SUBNET);
+      expect(unrelatedCaller.status).toBe(201);
+    });
+  });
+
+  describe("supplied store", () => {
+    // Reports every caller as far over any limit. Nothing the in-process default store does can
+    // produce this on a first request, so a 429 here can only mean the supplied store was the one
+    // consulted -- which is what makes a shared (e.g. Redis-backed) limit possible at all.
+    const alwaysOverLimitStore: Store = {
+      async increment() {
+        return { totalHits: 999, resetTime: new Date(Date.now() + 60_000) };
+      },
+      async decrement() {},
+      async resetKey() {},
+    };
+
+    it("counts through the supplied store rather than its own process memory", async () => {
+      const GENEROUS_LIMIT = 5;
+      const app = buildApp({ limit: GENEROUS_LIMIT, windowMs: 60_000, store: alwaysOverLimitStore });
+
+      const blockedOnTheVeryFirstRequest = await request(app).post("/register");
+
+      expect(blockedOnTheVeryFirstRequest.status).toBe(429);
+      expect(blockedOnTheVeryFirstRequest.body.error).toBe("too_many_requests");
+    });
+  });
+
+  describe("logger", () => {
+    it("reports express-rate-limit's own misconfiguration findings through the configured logger", async () => {
+      // `trust proxy: true` trusts an X-Forwarded-For header from anyone, so any caller can hand
+      // themselves a fresh key per request. express-rate-limit detects that; this asserts the
+      // finding reaches the consumer's logger rather than bypassing it to the console.
+      const errorLog = vi.fn();
+      const app = express();
+      app.set("trust proxy", true);
+      app.post(
+        "/register",
+        createRateLimiter({
+          limit: 1,
+          windowMs: 60_000,
+          logger: { info: () => {}, warn: () => {}, error: errorLog },
+        }),
+        (_req, res) => res.status(201).json({ ok: true })
+      );
+
+      await request(app).post("/register").set("X-Forwarded-For", "203.0.113.10");
+
+      expect(errorLog).toHaveBeenCalled();
+      // This package's Logger takes (msg, meta); express-rate-limit's takes (error, message). The
+      // adapter has to swap them, and a straight pass-through would put an Error object where the
+      // message goes -- which every logger that formats its first argument as a string would then
+      // render as "[object Object]".
+      const [message, meta] = errorLog.mock.calls[0] ?? [];
+      expect(typeof message).toBe("string");
+      expect(message).not.toHaveLength(0);
+      expect(meta).toBeInstanceOf(Error);
     });
   });
 });

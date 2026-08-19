@@ -1,31 +1,48 @@
 import type { Request, RequestHandler } from "express";
-
-interface Window {
-  count: number;
-  resetAt: number;
-}
+import { rateLimit, type Store } from "express-rate-limit";
+import type { Logger } from "../types";
 
 export interface RateLimiterOptions {
   limit: number;
   windowMs: number;
+  /**
+   * Overrides how a caller is identified. Left unset, express-rate-limit's own default is used --
+   * `req.ip`, with IPv6 addresses collapsed onto their /56 subnet (see the note on IPv6 below).
+   *
+   * Pass this function unwrapped rather than closing over it: express-rate-limit inspects a custom
+   * key generator's source for a bare `req.ip` reference and warns when it finds one without
+   * `ipKeyGenerator` around it, which is exactly the IPv6 foot-gun described below. Wrapping it in
+   * an adapter here would hide the reference and silently defeat that check.
+   */
   keyFor?: (req: Request) => string;
   /**
-   * Hard cap on distinct keys tracked at once. Bounds worst-case memory: once the map is full,
-   * inserting a never-seen key evicts the single oldest tracked key rather than growing further.
-   * Default 10,000.
+   * An express-rate-limit `Store`. Left unset, its in-process `MemoryStore` is used, which is why
+   * the limit is per instance: on a multi-instance deployment the effective limit multiplies by
+   * the instance count. Supply a shared store (`rate-limit-redis`, for example) to make the limit
+   * hold across instances.
+   *
+   * Use a separate store instance per limiter, or give each a distinct key prefix -- express-rate-limit
+   * warns when one store object is handed to more than one limiter, because the two endpoints'
+   * counts would otherwise land in the same buckets and share a single limit.
    */
-  maxEntries?: number;
+  store?: Store;
+  /** Where express-rate-limit's own misconfiguration warnings go. Defaults to the console. */
+  logger?: Logger;
 }
 
-const DEFAULT_MAX_ENTRIES = 10_000;
+// The body every blocked request gets. Deliberately the same `error` / `error_description` shape
+// the rest of this package's failures use (see errors.ts), not express-rate-limit's default plain
+// text: a client that parses one endpoint's errors should not have to special-case this one.
+const RATE_LIMITED_BODY = { error: "too_many_requests", error_description: "rate limit exceeded" };
 
 // Config-driven limiters (registerRateLimit, revokeRateLimit) already pass through resolveConfig's
 // zod schema (z.number().int().positive()), which rules out every case rejected below. A consumer
 // calling this exported factory directly has no such schema in front of them, so it can't be
 // allowed to silently misbehave: a non-finite or non-positive windowMs (0, negative, NaN, Infinity)
 // would make every window already-expired the instant it's created (and Infinity would put that
-// same value straight into a Retry-After header), and a limit that isn't a non-negative integer
-// would either allow unlimited requests (negative) or not do what its value claims.
+// same value straight into the `setInterval` express-rate-limit's MemoryStore uses to sweep), and a
+// limit that isn't a non-negative integer would either allow unlimited requests (negative) or not
+// do what its value claims. express-rate-limit validates none of these itself.
 function assertValidRateLimiterOptions(options: RateLimiterOptions): void {
   if (!Number.isFinite(options.windowMs) || options.windowMs <= 0) {
     throw new Error("createRateLimiter: windowMs must be a positive, finite number of milliseconds");
@@ -33,118 +50,69 @@ function assertValidRateLimiterOptions(options: RateLimiterOptions): void {
   if (!Number.isInteger(options.limit) || options.limit < 0) {
     throw new Error("createRateLimiter: limit must be a non-negative integer");
   }
-  if (options.maxEntries !== undefined && (!Number.isInteger(options.maxEntries) || options.maxEntries <= 0)) {
-    throw new Error("createRateLimiter: maxEntries must be a positive integer");
-  }
 }
 
-// req.ip only names the real caller when the app has configured Express's `trust proxy` setting
-// to match its actual deployment (see https://expressjs.com/en/guide/behind-proxies.html) --
-// something this package cannot do on the consumer's behalf, since it only ever receives a
-// sub-router, never the top-level `app`. Left unconfigured behind a load balancer or reverse
-// proxy, req.ip resolves to the proxy's own address for every request, so this default key
-// collapses all callers onto one shared bucket: the limit then applies globally (one slow
-// caller can exhaust it for everyone) instead of per caller. A consumer whose default `req.ip`
-// isn't trustworthy or granular enough should configure `trust proxy` correctly and, if that
-// still isn't sufficient for their topology, supply their own `keyFor`.
-function defaultKey(req: Request): string {
-  return req.ip ?? req.socket.remoteAddress ?? "unknown";
+// express-rate-limit's logger takes (error, message); this package's Logger takes (msg, meta).
+// Adapted rather than passed through so its warnings land in the consumer's configured logger
+// instead of bypassing it to the console -- these are diagnostics about the consumer's own
+// deployment (an unset or over-permissive `trust proxy`, a store shared between two limiters), so
+// they belong wherever the rest of this package's warnings already go.
+function asExpressRateLimitLogger(logger: Logger): {
+  warn: (error: unknown, message?: string) => void;
+  error: (error: unknown, message?: string) => void;
+} {
+  const forward =
+    (write: (msg: string, meta?: unknown) => void) =>
+    (error: unknown, message?: string): void => {
+      write(message ?? (error instanceof Error ? error.message : String(error)), error);
+    };
+  return { warn: forward(logger.warn.bind(logger)), error: forward(logger.error.bind(logger)) };
 }
 
-// Fixed-window counter held in process memory, deliberately not backed by the shared CacheStore:
-// CacheStore's contract (get/set/del/getdel) has no atomic increment, so a cache-backed counter
-// built from get-then-set would race under concurrent requests for the same key -- two callers
-// could both read the same count and both write back the same incremented value, silently
-// undercounting and letting more requests through than the configured limit. That failure mode is
-// worse than the one being traded away: on a multi-instance deployment the effective limit simply
-// multiplies by the instance count, which is an acceptable, well-understood shape for a spam
-// brake and is documented as such on `registerRateLimit`.
+/**
+ * A fixed-window request limiter, backed by express-rate-limit.
+ *
+ * Thin on purpose: everything below is either an option express-rate-limit's defaults get wrong
+ * for this package (the 429 body shape, the header drafts) or a guard it does not perform at all
+ * (input validation above). The counting, the store abstraction, and the IPv6 subnet masking are
+ * express-rate-limit's -- the last of which is why this is no longer hand-rolled. A per-IP limiter
+ * keyed on a raw IPv6 address is trivially bypassed by rotating through the addresses of an
+ * ISP-assigned subnet, which every IPv6 client has to itself; the default key generator collapses
+ * them onto a /56 first.
+ *
+ * Note the `trust proxy` caveat that comes with any IP-keyed limiter: `req.ip` only names the real
+ * caller when the app has configured Express's `trust proxy` setting to match its actual
+ * deployment (https://expressjs.com/en/guide/behind-proxies.html) -- something this package cannot
+ * do on the consumer's behalf, since it only ever receives a sub-router, never the top-level `app`.
+ * Left unconfigured behind a load balancer, `req.ip` resolves to the proxy's own address for every
+ * request and the limit applies globally instead of per caller. express-rate-limit detects both
+ * halves of that mistake (unset, and the equally wrong `trust proxy: true`) and warns through
+ * `logger` above.
+ */
 export function createRateLimiter(options: RateLimiterOptions): RequestHandler {
   assertValidRateLimiterOptions(options);
-  const windows = new Map<string, Window>();
-  const keyFor = options.keyFor ?? defaultKey;
-  const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
-  // Snapshotted once, like keyFor/maxEntries above -- not read live off `options` on every
-  // request. The ordering argument below depends on windowMs staying constant for this limiter's
-  // whole lifetime; reading it live would let a caller who mutates `options.windowMs` after
-  // construction break that out from under the eviction logic.
-  const windowMs = options.windowMs;
-  const limit = options.limit;
 
-  return (req, res, next) => {
-    const key = keyFor(req);
-    const now = Date.now();
-
-    const stored = windows.get(key);
-    let current = stored && stored.resetAt > now ? stored : undefined;
-
-    if (!current) {
-      // A lapsed key that's still in the map is being refreshed, not newly added. `Map#set` on a
-      // key that already exists updates its value in place *without* moving it in iteration order
-      // -- deleting first forces the re-`set` below to re-append it at the tail. Skipping this
-      // would let whichever key happened to be seen first squat on the head slot forever: eviction
-      // below reads position as a proxy for staleness, so a head-pinned-but-just-refreshed key
-      // would become BOTH a wrongful eviction target (it's live, not stale) AND a shield for
-      // genuinely stale keys sitting behind it (which never surface to the front to be reclaimed).
-      const isNewKey = stored === undefined;
-      if (!isNewKey) windows.delete(key);
-
-      // Memory bound (unconditional, holds regardless of which key gets evicted or in what
-      // order): every `windows.set` below is preceded by a net entry-count delta of exactly +1
-      // (a new key, only when below the cap) or 0 (a new key evicted-then-inserted at the cap, or
-      // a refresh deleted-then-reinserted just above) -- so `size <= maxEntries` holds after every
-      // call. That's also why this check doesn't need an `isNewKey` guard: whenever this is a
-      // refresh, the delete above has already brought size below the cap (size was <= maxEntries
-      // beforehand, by this same induction), so the check below is always false for a refresh
-      // regardless -- adding `isNewKey &&` here would be an always-false condition, unreachable
-      // dead weight in the same shape as the `Math.max` floor removed from Retry-After.
-      //
-      // Victim selection (conditional on two premises, separate from the bound above): given that
-      // (1) windowMs is snapshotted once above rather than re-read from a possibly-mutated
-      // `options`, and (2) Date.now() doesn't step backwards, Map iteration order stays ascending
-      // by `resetAt` -- a refresh always deletes-then-reinserts (above), so whichever key was last
-      // touched longest ago also expires soonest. That's what makes the eviction below remove the
-      // most-expired entry first, not just *some* entry.
-      //
-      // Deliberately no background sweep: it can't lower the bound above (already unconditional),
-      // and under the two premises it can't select a different victim than eviction below already
-      // does either -- so it would have no observable effect on responses, on which key gets
-      // evicted, or on the memory bound. Its only possible contribution -- reclaiming memory
-      // slightly earlier than the cap would on its own -- can't be told apart from a silently
-      // broken sweep (never runs; or its own throttling gets dropped, degrading into an
-      // O(n)-per-request scan) by any test. A once-shipped version had exactly that: it
-      // mutation-tested clean everywhere else, but nothing could tell a working sweep from a
-      // silently broken one. (If a premise above is ever violated -- e.g. a backward system-clock
-      // step -- eviction can pick the wrong victim for a while; that's bounded and self-heals as
-      // more requests arrive, and a sweep wouldn't have been immune to the same violation either.)
-      if (windows.size >= maxEntries) {
-        const oldestKey = windows.keys().next().value;
-        if (oldestKey !== undefined) windows.delete(oldestKey);
-      }
-      // count starts at 0, not 1: a fresh window still has to pass the same `count >= limit` check
-      // below before its first request is allowed through. Starting at 1 (and returning next()
-      // immediately, skipping that check) would let exactly one request through per window no
-      // matter what `limit` says -- correct for every limit >= 1, but silently wrong for `limit: 0`
-      // ("block every request"), which would then let the first one through anyway.
-      current = { count: 0, resetAt: now + windowMs };
-      windows.set(key, current);
-    }
-
-    if (current.count >= limit) {
-      // No floor needed: current.resetAt - now is strictly positive either way `current` got
-      // here. If it's the window just created/refreshed above, resetAt = now + windowMs with
-      // this SAME now, and windowMs > 0 is guaranteed by assertValidRateLimiterOptions -- so
-      // resetAt - now = windowMs > 0. Otherwise `current` is the existing, unexpired window read
-      // from the map above, where stored.resetAt > now already held, again using this same now.
-      // Either way, ceiling a strictly positive number of milliseconds to whole seconds always
-      // lands on at least 1 (true for any positive value, not because milliseconds happen to be
-      // integers).
-      res.setHeader("Retry-After", Math.ceil((current.resetAt - now) / 1000));
-      res.status(429).json({ error: "too_many_requests", error_description: "rate limit exceeded" });
-      return;
-    }
-
-    current.count += 1;
-    next();
-  };
+  return rateLimit({
+    windowMs: options.windowMs,
+    limit: options.limit,
+    // Only override the key generator when the caller actually supplied one. Passing an adapter
+    // unconditionally would replace express-rate-limit's default -- and with it the IPv6 subnet
+    // masking and the `trust proxy` checks that default performs.
+    ...(options.keyFor ? { keyGenerator: options.keyFor } : {}),
+    ...(options.store ? { store: options.store } : {}),
+    ...(options.logger ? { logger: asExpressRateLimitLogger(options.logger) } : {}),
+    message: RATE_LIMITED_BODY,
+    // `Retry-After` is emitted on a blocked response whenever either header family is on, so this
+    // pair keeps it while dropping the deprecated `X-RateLimit-*` headers (legacy) in favour of the
+    // standardized `RateLimit` / `RateLimit-Policy` ones. draft-7 rather than draft-8 because its
+    // `limit=..., remaining=..., reset=...` form is the one clients in the wild actually parse.
+    legacyHeaders: false,
+    standardHeaders: "draft-7",
+    // WRN_ERL_MAX_ZERO only exists to flag callers who wrote `limit: 0` expecting v6's "disable the
+    // limiter" meaning. Here `limit: 0` means what express-rate-limit v7+ made it mean -- block
+    // every request -- and disabling a limiter is done by not configuring one at all (see
+    // registerRateLimit / revokeRateLimit in config.ts), so the warning would only ever be noise.
+    // Every other validation stays on: they diagnose real misconfigurations in the consumer's app.
+    validate: { limit: false },
+  });
 }

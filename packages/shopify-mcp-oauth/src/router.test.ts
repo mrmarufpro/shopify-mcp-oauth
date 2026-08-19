@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "./adapters/memoryStorage";
-import { resolveConfig } from "./config";
+import { RECOMMENDED_RATE_LIMIT, resolveConfig } from "./config";
 import { errorHandler as oauthErrorHandler } from "./middlewares/errorHandler";
 import type { BuildRouterOptions } from "./router";
 import { signOuterState } from "./services/stateJwt";
@@ -524,6 +524,64 @@ describe("terminal error handler", () => {
     lastLayer?.handle(new Error("synthetic error for direct invocation"), {}, fakeRes, () => {});
 
     expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mounts no rate limiter unless one is configured", () => {
+  // The limiter is opt-in (see registerRateLimit / revokeRateLimit in config.ts). These pin the
+  // half of that contract a type can't: not "the resolved config says null" but "no 429 comes back
+  // and no limiter layer sits in the stack", which is what a consumer actually observes.
+  const MORE_REQUESTS_THAN_THE_RECOMMENDED_LIMIT_ALLOWS = RECOMMENDED_RATE_LIMIT.limit + 1;
+
+  function buildUnlimitedApp() {
+    const oauth = createShopifyMcpOAuth(buildBaseConfig());
+    const app = express();
+    app.use(express.json());
+    app.use(oauth.router);
+    return app;
+  }
+
+  it("leaves /register unlimited", async () => {
+    const app = buildUnlimitedApp();
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < MORE_REQUESTS_THAN_THE_RECOMMENDED_LIMIT_ALLOWS; attempt++) {
+      const response = await request(app)
+        .post("/register")
+        .send({ redirect_uris: [REDIRECT_URI] });
+      statuses.push(response.status);
+    }
+    expect(statuses.every((status) => status === 201)).toBe(true);
+  });
+
+  it("leaves /revoke unlimited", async () => {
+    const app = buildUnlimitedApp();
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < MORE_REQUESTS_THAN_THE_RECOMMENDED_LIMIT_ALLOWS; attempt++) {
+      const response = await request(app)
+        .post("/revoke")
+        .send({ token: `guess-${attempt}` });
+      statuses.push(response.status);
+    }
+    expect(statuses.every((status) => status === 200)).toBe(true);
+  });
+
+  it("mounts one fewer layer on /register than a configured limit does", () => {
+    // The status assertions above stay green if a limiter is mounted with an enormous limit, or
+    // with a `skip` that always returns true -- both would still be a limiter the consumer never
+    // asked for, still counting, still holding memory. Comparing the route's layer count against
+    // the same route built with a limit is what pins "not mounted at all".
+    function countRegisterLayers(config: ShopifyMcpOAuthConfig): number {
+      const oauth = createShopifyMcpOAuth(config);
+      const stack = (oauth.router as unknown as { stack: Array<{ route?: { path: string; stack: unknown[] } }> }).stack;
+      const registerRoute = stack.find((layer) => layer.route?.path === "/register")?.route;
+      if (!registerRoute) throw new Error("no /register route found on the router");
+      return registerRoute.stack.length;
+    }
+
+    const withoutLimiter = countRegisterLayers(buildBaseConfig());
+    const withLimiter = countRegisterLayers(buildBaseConfig({ registerRateLimit: RECOMMENDED_RATE_LIMIT }));
+
+    expect(withLimiter - withoutLimiter).toBe(1);
   });
 });
 

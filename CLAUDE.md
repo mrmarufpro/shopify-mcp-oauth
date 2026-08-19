@@ -140,8 +140,12 @@ The Shopify access token is exchanged as proof of shop control and then **discar
 - **Tokens are stored as SHA-256 hashes**; cache keys are the code's hash, not the code.
 - PKCE `plain` is rejected at every layer. `/token`'s `redirect_uri` check is exact — the loopback
   port flexibility (RFC 8252) belongs only in `/authorize`'s registered-URI match.
-- Rate limiters are process-local by design; the CIMD fetch cap is a global concurrency limiter, not
-  a per-IP one.
+- **The `/register` and `/revoke` rate limiters are opt-in and off by default** (`registerRateLimit` /
+  `revokeRateLimit`; omitted or `false` resolves to `null`, and `null` means no layer is mounted at
+  all). Omitting warns at construction, `false` does not — that difference is the only reason `false`
+  is accepted. Counting is express-rate-limit's, so a shared `store` is a config field and per-process
+  counting is the default, not a law. The CIMD fetch cap is a different thing entirely: a global
+  concurrency limiter, not a per-IP one.
 
 ## Testing conventions
 

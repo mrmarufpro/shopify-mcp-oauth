@@ -1,12 +1,31 @@
+import type { Store } from "express-rate-limit";
 import { z } from "zod";
 import { memoryCache } from "./adapters/memoryCache";
 import { createConcurrencyLimiter, type ConcurrencyLimiter } from "./services/concurrencyLimiter";
 import type { CacheStore, Logger, OAuthStorage, ShopNotFoundHandler } from "./types";
 
+/** How many requests one caller may make to a rate-limited endpoint per window. */
+export interface RateLimitSetting {
+  limit: number;
+  windowMs: number;
+  /**
+   * An express-rate-limit `Store`. Left unset, counting happens in this process's memory, so the
+   * effective limit multiplies by the instance count on a multi-instance deployment. Supply a
+   * shared store (`rate-limit-redis`, for example) to make one limit hold across all of them.
+   *
+   * Give `registerRateLimit` and `revokeRateLimit` separate store instances (or distinct key
+   * prefixes): one store object shared between two limiters puts both endpoints' counts in the
+   * same buckets, which express-rate-limit warns about.
+   */
+  store?: Store;
+}
+
 const DEFAULT_ACCESS_TTL_SECONDS = 3600;
 const DEFAULT_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30;
-const DEFAULT_REGISTER_RATE_LIMIT = { limit: 20, windowMs: 60 * 60 * 1000 };
-const DEFAULT_REVOKE_RATE_LIMIT = { limit: 20, windowMs: 60 * 60 * 1000 };
+// Not applied automatically -- rate limiting is opt-in (see RateLimitSetting). Exported so the
+// recommended starting point is a value a consumer can pass rather than a number they have to copy
+// out of the README, and so the README and the code cannot drift apart on what "recommended" means.
+export const RECOMMENDED_RATE_LIMIT: RateLimitSetting = { limit: 20, windowMs: 60 * 60 * 1000 };
 // An unauthenticated caller can drive /authorize with an unlimited number of distinct CIMD
 // client_id URLs (see services/cimd.ts), each holding an outbound HTTPS connection open for up to
 // TIMEOUT_MS (3s) with no bound on how many run at once — real resource exhaustion on the first
@@ -35,14 +54,20 @@ export interface ShopifyMcpOAuthConfig {
   tokenTtl?: { access?: number; refresh?: number };
   openaiAppsChallengeToken?: string | null;
   /**
-   * Caps requests to the unauthenticated `/register` endpoint. Counted in process memory, not in
-   * `cache` above — on a multi-instance deployment the effective limit multiplies by the instance
-   * count. That is an acceptable, well-understood shape for a spam brake; see rateLimit.ts for why
-   * a cache-backed counter isn't a safe substitute.
+   * Caps requests to the unauthenticated `/register` endpoint. **Off unless you set it.**
+   *
+   * Omit it (or pass `false`) and `/register` is unlimited: an anonymous caller can create client
+   * records in `storage` as fast as they can send requests. Omitting it warns at construction;
+   * `false` is the same behaviour said out loud, and stays quiet. `RECOMMENDED_RATE_LIMIT` is a
+   * sane starting point.
+   *
+   * Counted in process memory unless you supply a shared store, so on a multi-instance deployment
+   * the effective limit multiplies by the instance count — see `RateLimiterOptions.store` in
+   * middlewares/rateLimit.ts.
    */
-  registerRateLimit?: { limit: number; windowMs: number };
+  registerRateLimit?: RateLimitSetting | false;
   /**
-   * Caps requests to the unauthenticated `/revoke` endpoint. Same process-local shape as
+   * Caps requests to the unauthenticated `/revoke` endpoint. **Off unless you set it**, exactly as
    * `registerRateLimit` above (see its own doc comment) — its own field rather than sharing
    * registerRateLimit because the two endpoints see different legitimate call volume and must be
    * tunable independently. RFC 7009 requires `/revoke` to answer 200 whether or not the submitted
@@ -50,7 +75,7 @@ export interface ShopifyMcpOAuthConfig {
    * response never reveals that either way) — only against unlimited free work (two hash +
    * storage lookups per request) from an unauthenticated caller.
    */
-  revokeRateLimit?: { limit: number; windowMs: number };
+  revokeRateLimit?: RateLimitSetting | false;
   /**
    * Caps how many CIMD client_id documents (see services/cimd.ts) this process fetches over the
    * network at once, across every /authorize request combined — not per caller, and not a
@@ -74,8 +99,10 @@ export interface ResolvedConfig {
   onShopNotFound: ShopNotFoundHandler | null;
   tokenTtl: { access: number; refresh: number };
   openaiAppsChallengeToken: string | null;
-  registerRateLimit: { limit: number; windowMs: number };
-  revokeRateLimit: { limit: number; windowMs: number };
+  /** `null` when no limiter should be mounted on the endpoint at all. */
+  registerRateLimit: RateLimitSetting | null;
+  /** `null` when no limiter should be mounted on the endpoint at all. */
+  revokeRateLimit: RateLimitSetting | null;
   /** The resolved (defaulted or explicit) cap `cimdFetchLimiter` below was actually built from. */
   cimdFetchConcurrency: number;
   cimdFetchLimiter: ConcurrencyLimiter;
@@ -87,8 +114,24 @@ const CACHE_FALLBACK_WARNING =
   "shopify-mcp-oauth: no cache supplied, falling back to an in-memory cache. This cache is single-process, so " +
   "authorization codes written by one instance are invisible to the others and login will fail intermittently " +
   "across multiple instances — supply a shared cache such as redisCache in production. (The /register and " +
-  "/revoke rate limiters are separate from this cache and always process-local — see registerRateLimit and " +
-  "revokeRateLimit.)";
+  "/revoke rate limiters do not use this cache at all — they are opt-in and carry their own store; see " +
+  "registerRateLimit and revokeRateLimit.)";
+
+// Rate limiting is opt-in, so the out-of-the-box deployment leaves two unauthenticated endpoints
+// uncapped -- /register in particular writes a client record to `storage` on every accepted call.
+// That is a deliberate default (a limiter this package mounts unasked is one the consumer cannot
+// see in their own code, and its process-local counting surprises multi-instance deployments), but
+// it is not one a consumer should discover from an incident. Warned rather than defaulted-on for
+// the same reason CACHE_FALLBACK_WARNING exists: name the risk, leave the choice.
+//
+// Passing `false` silences this while resolving identically. That distinction is the whole point of
+// accepting `false` at all -- omitting the field reads as "never thought about it", `false` reads
+// as "considered, declined", and only the first is worth a warning on every boot.
+const RATE_LIMIT_DISABLED_WARNING_PREFIX = "shopify-mcp-oauth: no rate limit configured for ";
+const RATE_LIMIT_DISABLED_WARNING_SUFFIX =
+  ". Unauthenticated and uncapped, that can be driven as fast as an anonymous caller can send requests " +
+  "(/register writes a client record to storage on each accepted call). Set the field named above to " +
+  "RECOMMENDED_RATE_LIMIT to cap it, or to false to accept this deliberately and silence this warning.";
 
 // A prefix regex only checks the string starts with a scheme; new URL() also catches a missing
 // hostname, a query string, or a fragment, none of which are valid in the resource identifier
@@ -122,6 +165,10 @@ function validateHost(value: string, ctx: z.RefinementCtx): void {
   }
 }
 
+const rateLimitSettingSchema = z
+  .union([z.literal(false), z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() })])
+  .optional();
+
 const configSchema = z.object({
   host: z.string().min(1, "host is required").superRefine(validateHost),
   shopify: z.object({
@@ -134,8 +181,8 @@ const configSchema = z.object({
     .object({ access: z.number().int().positive().optional(), refresh: z.number().int().positive().optional() })
     .optional(),
   openaiAppsChallengeToken: z.string().min(1).nullish(),
-  registerRateLimit: z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() }).optional(),
-  revokeRateLimit: z.object({ limit: z.number().int().positive(), windowMs: z.number().int().positive() }).optional(),
+  registerRateLimit: rateLimitSettingSchema,
+  revokeRateLimit: rateLimitSettingSchema,
   cimdFetchConcurrency: z.number().int().positive().optional(),
 });
 
@@ -174,6 +221,17 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
 
   if (!input.cache) logger.warn(CACHE_FALLBACK_WARNING);
 
+  // Only an omitted field warns; `false` is the acknowledged opt-out. Collected into one warning
+  // rather than one per field so a consumer who left both unset gets a single line naming both.
+  const unlimitedEndpoints: string[] = [];
+  if (input.registerRateLimit === undefined) unlimitedEndpoints.push("/register (registerRateLimit)");
+  if (input.revokeRateLimit === undefined) unlimitedEndpoints.push("/revoke (revokeRateLimit)");
+  if (unlimitedEndpoints.length > 0) {
+    logger.warn(
+      RATE_LIMIT_DISABLED_WARNING_PREFIX + unlimitedEndpoints.join(" and ") + RATE_LIMIT_DISABLED_WARNING_SUFFIX
+    );
+  }
+
   const cimdFetchConcurrency = parsed.data.cimdFetchConcurrency ?? DEFAULT_CIMD_FETCH_CONCURRENCY;
 
   return {
@@ -189,8 +247,11 @@ export function resolveConfig(input: ShopifyMcpOAuthConfig): ResolvedConfig {
       refresh: parsed.data.tokenTtl?.refresh ?? DEFAULT_REFRESH_TTL_SECONDS,
     },
     openaiAppsChallengeToken: parsed.data.openaiAppsChallengeToken ?? null,
-    registerRateLimit: parsed.data.registerRateLimit ?? DEFAULT_REGISTER_RATE_LIMIT,
-    revokeRateLimit: parsed.data.revokeRateLimit ?? DEFAULT_REVOKE_RATE_LIMIT,
+    // Read off `input`, not `parsed.data`: zod validated the numbers, but its object schema strips
+    // `store` (a class instance the schema deliberately does not model, the same treatment
+    // `storage` and `cache` get above).
+    registerRateLimit: input.registerRateLimit || null,
+    revokeRateLimit: input.revokeRateLimit || null,
     cimdFetchConcurrency,
     cimdFetchLimiter: createConcurrencyLimiter(cimdFetchConcurrency),
     logger,

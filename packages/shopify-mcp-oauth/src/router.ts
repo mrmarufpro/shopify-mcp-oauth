@@ -38,6 +38,17 @@ const parseFormBody = express.urlencoded({ extended: false });
 export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions = {}): Router {
   const router = Router();
 
+  // Spread into the route below rather than branched around it: rate limiting is opt-in (see
+  // registerRateLimit / revokeRateLimit in config.ts), and an empty array mounts no layer at all --
+  // not a pass-through middleware that still costs a function call and still shows up in the
+  // router's stack, which router.test.ts inspects positionally.
+  const registerLimiter = config.registerRateLimit
+    ? [createRateLimiter({ ...config.registerRateLimit, logger: config.logger })]
+    : [];
+  const revokeLimiter = config.revokeRateLimit
+    ? [createRateLimiter({ ...config.revokeRateLimit, logger: config.logger })]
+    : [];
+
   const authorizationServer = authorizationServerMetadataController(config);
   const protectedResource = protectedResourceMetadataController(config);
 
@@ -54,13 +65,7 @@ export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions 
     router.get("/.well-known/openai-apps-challenge", openaiAppsChallengeController(config.openaiAppsChallengeToken));
   }
 
-  router.post(
-    "/register",
-    createRateLimiter({ limit: config.registerRateLimit.limit, windowMs: config.registerRateLimit.windowMs }),
-    parseJsonBody,
-    parseFormBody,
-    registerController(config)
-  );
+  router.post("/register", ...registerLimiter, parseJsonBody, parseFormBody, registerController(config));
 
   router.get("/authorize", authorizeController(config, { allowPrivateCimdHosts: options.allowPrivateCimdHosts }));
   // The HMAC guard runs first: it must reject a forged callback before shopifyCallbackController
@@ -77,13 +82,7 @@ export function buildRouter(config: ResolvedConfig, options: BuildRouterOptions 
   // storage lookups per request), the same shape /register's limiter guards against. Its own
   // config field (revokeRateLimit), not registerRateLimit: the two endpoints see very different
   // legitimate call volume and must be tunable independently.
-  router.post(
-    "/revoke",
-    createRateLimiter({ limit: config.revokeRateLimit.limit, windowMs: config.revokeRateLimit.windowMs }),
-    parseJsonBody,
-    parseFormBody,
-    revokeController(config)
-  );
+  router.post("/revoke", ...revokeLimiter, parseJsonBody, parseFormBody, revokeController(config));
 
   // Defense in depth for anything that throws synchronously *inside* this router's own stack --
   // a middleware mounted above (requireShopifyHmac, createRateLimiter) or a future controller that
