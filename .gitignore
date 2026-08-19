@@ -13,3 +13,8 @@ packages/create-shopify-mcp/templates/
 # Superpowers-generated design docs: specs and implementation plans written during development.
 # Useful locally, but they are working notes rather than published documentation.
 docs/superpowers/
+
+# Git worktrees created by Claude Code for isolated feature work. Each is a full
+# checkout of this repo (hundreds of MB together) with its own .git pointer file,
+# so a `git add .` would try to commit the repo into itself.
+.claude/worktrees/
