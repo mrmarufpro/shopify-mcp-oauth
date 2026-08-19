@@ -17,22 +17,67 @@ pnpm --filter shopify-mcp-oauth test                       # one package's suite
 pnpm --filter shopify-mcp-oauth test src/router.test.ts    # one file
 pnpm --filter shopify-mcp-oauth test -t "rejects plain"    # one test by name
 pnpm --filter create-shopify-mcp test
+CREATE_SHOPIFY_MCP_E2E=1 pnpm --filter create-shopify-mcp test   # also scaffolds against real GitHub
 ```
 
 ## Layout
 
-Two packages plus an example. The non-obvious part: `examples/basic-server` is the three-file demo
-**and** the source the scaffolder's template is generated from. `docs/` is prettier-ignored.
+Two packages plus an example. The non-obvious part: `examples/basic-server` is the three-file demo,
+**and** the source the scaffolder's template is generated from, **and** a directory the published CLI
+downloads from GitHub at runtime for `--example basic-server`. `docs/` is prettier-ignored.
 
 ### The template is generated, never edited
 
 `packages/create-shopify-mcp/templates/` is **gitignored and produced by
-`scripts/sync-template.mjs`**, which copies `examples/basic-server`, rewrites the
-`shopify-mcp-oauth` dependency from `workspace:*` to `^<version>`, and writes `gitignore` (undotted;
-npm strips `.gitignore` from tarballs, the CLI re-dots it on copy). To change what a scaffolded
-project contains, edit `examples/basic-server` and run `pnpm sync:template`. Never hand-edit
-`templates/default`. `scaffold.integration.test.ts` runs the sync itself before asserting, and CI
-fails if the synced manifest still carries a `workspace:` specifier.
+`scripts/sync-template.mjs`**, which copies `examples/basic-server` minus build output and lockfiles,
+then renames its committed `.gitignore` to `gitignore` (undotted; npm strips `.gitignore` from a
+published tarball, so the CLI re-dots it on copy). There is no dependency-rewriting step any more:
+the example pins `"shopify-mcp-oauth": "latest"` directly, which is already a specifier a scaffolded
+project can install, and `linkWorkspacePackages: true` in `pnpm-workspace.yaml` is what still
+resolves it to the local package inside this repository. To change what a scaffolded project
+contains, edit `examples/basic-server` and run `pnpm sync:template`. Never hand-edit
+`templates/default`. `scaffold.integration.test.ts` runs the sync itself before asserting, CI fails
+if the synced manifest still carries a `workspace:` specifier, and `rewritePackageJson` throws on one
+at scaffold time — so a `workspace:` protocol that escapes into an example is reported as that
+example's fault rather than surfacing to a user as an opaque pnpm resolution error.
+
+## create-shopify-mcp architecture
+
+`run.ts` orchestrates; every other module does one thing (`args`, `example`, `download`, `copy`,
+`packageJson`, `target`, `git`, `nextSteps`, `retry`).
+
+With no `--example` — and with `--example default`, a reserved spelling — the CLI copies its bundled
+template and **never touches the network**. `--example <name>` downloads `examples/<name>` from this
+repository; `--example <github-url>` (optionally with `--example-path`) downloads any directory of
+any public repository.
+
+- **Ref resolution** (`example.ts`): a bare name resolves to the **newest GitHub release**, falling
+  back to `main` only on a 404 from `/releases/latest`. That 404 check is deliberately narrow — any
+  non-200 used to fall back, which silently defeated release-pinning exactly when an unauthenticated
+  caller hit GitHub's 60-request-per-hour ceiling and got a 403.
+- **Existence check before anything is created** (`download.ts`): `exampleExists` HEADs the contents
+  API for the example's `package.json`, which is why a typo is reported by name and leaves no
+  directory behind. It is also why every example must ship a `package.json`.
+- **Extraction** streams `codeload.github.com/<owner>/<repo>/tar.gz/<ref>` through `tar.x` with a
+  subpath `filter` and a computed `strip`. The archive root is read off the first entry rather than
+  reconstructed from owner/repo/ref, so a renamed repository still extracts. `tar`'s `filter` sees
+  the **pre-strip** path.
+- **Failure cleanup** (`run.ts`) removes the target directory **only when the CLI created it**.
+  Existence is recorded before `prepareTarget`, because `prepareTarget` deliberately accepts a
+  directory holding nothing but `.git` (or editor/OS droppings) — an unconditional `rm` there would
+  delete a user's repository.
+- **`tar` belongs in `dependencies`, not `devDependencies`.** tsup externalises whatever is listed in
+  `dependencies`; demoting it leaves the published CLI unable to resolve its own extractor at
+  runtime.
+
+All network access goes through an injected `deps.fetch`, so every test except the env-gated
+`e2e.network.test.ts` runs offline.
+
+`examples/README.md` is the authoring contract for anything added under `examples/`: a downloaded
+example has to stand on its own once unpacked elsewhere (its own `.gitignore` and `README.md`, since
+the repository root's do not travel with a subpath download), and **cutting a GitHub release is what
+keeps `--example` coherent** — publishing `shopify-mcp-oauth` to npm without tagging leaves the CLI
+on the `main` fallback, handing out examples that expect an unpublished API.
 
 ## shopify-mcp-oauth architecture
 
