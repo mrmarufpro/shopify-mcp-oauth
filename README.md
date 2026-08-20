@@ -133,23 +133,22 @@ seen your server finds out where to log in (RFC 9728).
 
 ## Configuration
 
-| Field                          | Required | Default                            | Notes                                                                                                               |
-| ------------------------------ | -------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `host`                         | yes      | —                                  | Public origin, HTTPS in production, no trailing slash. Every issued URL derives from this.                          |
-| `shopify.apiKey` / `apiSecret` | yes      | —                                  | Your Shopify app's credentials — the same app the merchant installed.                                               |
-| `shopify.scopes`               | yes      | —                                  | Comma-separated. Must match the installed app's scopes or Shopify re-prompts.                                       |
-| `stateSecret`                  | yes      | —                                  | HS256 signing key for the state JWT. At least 32 characters.                                                        |
-| `storage`                      | yes      | —                                  | An `OAuthStorage`. See [docs/storage-adapters.md](docs/storage-adapters.md).                                        |
-| `cache`                        | no       | `memoryCache()`                    | Holds authorization codes and fetched client metadata documents.                                                    |
-| `onShopNotFound`               | no       | `null`                             | Last-chance shop resolution when the install gate misses. See [The install gate](#the-install-gate).                |
-| `cimdFetchConcurrency`         | no       | `10`                               | Caps concurrent fetches of client-metadata documents; requests beyond the cap queue for a free slot.                |
-| `tokenTtl.access`              | no       | `3600`                             | Seconds.                                                                                                            |
-| `tokenTtl.refresh`             | no       | `2592000`                          | Seconds — 30 days.                                                                                                  |
-| `openaiAppsChallengeToken`     | no       | `null`                             | Only needed to list the server as a ChatGPT app. The route is omitted when null.                                    |
-| `registerRateLimit`            | no       | `{ limit: 20, windowMs: 3600000 }` | Dynamic client registration is unauthenticated by definition.                                                       |
-| `revokeRateLimit`              | no       | `{ limit: 20, windowMs: 3600000 }` | `/revoke` is also unauthenticated by design (RFC 7009) — its own field, tuned independently of `registerRateLimit`. |
-| `logger`                       | no       | `console`                          | Anything with `info` / `warn` / `error`.                                                                            |
-| `fetchImpl`                    | no       | the global `fetch`                 | Test seam: the package uses this for Shopify's own token exchange and for fetching client-metadata documents.       |
+| Field                          | Required | Default            | Notes                                                                                                         |
+| ------------------------------ | -------- | ------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `host`                         | yes      | —                  | Public origin, HTTPS in production, no trailing slash. Every issued URL derives from this.                    |
+| `shopify.apiKey` / `apiSecret` | yes      | —                  | Your Shopify app's credentials — the same app the merchant installed.                                         |
+| `shopify.scopes`               | yes      | —                  | Comma-separated. Must match the installed app's scopes or Shopify re-prompts.                                 |
+| `stateSecret`                  | yes      | —                  | HS256 signing key for the state JWT. At least 32 characters.                                                  |
+| `storage`                      | yes      | —                  | An `OAuthStorage`. See [docs/storage-adapters.md](docs/storage-adapters.md).                                  |
+| `cache`                        | no       | `memoryCache()`    | Holds authorization codes and fetched client metadata documents.                                              |
+| `onShopNotFound`               | no       | `null`             | Last-chance shop resolution when the install gate misses. See [The install gate](#the-install-gate).          |
+| `cimdFetchConcurrency`         | no       | `10`               | Caps concurrent fetches of client-metadata documents; requests beyond the cap queue for a free slot.          |
+| `tokenTtl.access`              | no       | `3600`             | Seconds.                                                                                                      |
+| `tokenTtl.refresh`             | no       | `2592000`          | Seconds — 30 days.                                                                                            |
+| `openaiAppsChallengeToken`     | no       | `null`             | Only needed to list the server as a ChatGPT app. The route is omitted when null.                              |
+| `rateLimit`                    | no       | off                | Opt-in cap on the unauthenticated endpoints (`/register`, `/revoke`). See [Rate limiting](#rate-limiting).    |
+| `logger`                       | no       | `console`          | Anything with `info` / `warn` / `error`.                                                                      |
+| `fetchImpl`                    | no       | the global `fetch` | Test seam: the package uses this for Shopify's own token exchange and for fetching client-metadata documents. |
 
 Configuration is validated when you construct it. A missing or malformed value throws immediately,
 naming the field — never at the first request.
@@ -238,9 +237,78 @@ Other decisions worth knowing:
   addresses, no redirects followed, a size cap, and a hard timeout.
 - Refresh rotates: redeeming a refresh token revokes it and issues a new pair.
 - `/revoke` answers 200 whether or not the submitted token existed, per RFC 7009, so it cannot be
-  used to probe which tokens exist. A rate limiter sits in front of the endpoint (`revokeRateLimit`
-  above) and can answer 429 under heavy call volume from one caller — that carries no information
-  about any particular token's validity, so it doesn't reopen the oracle RFC 7009 guards against.
+  used to probe which tokens exist. A configured rate limiter (`rateLimit`, see below) can
+  answer 429 under heavy call volume from one caller — that carries no information about any
+  particular token's validity, so it doesn't reopen the oracle RFC 7009 guards against.
+
+### Rate limiting
+
+`/register` and `/revoke` are unauthenticated, and **neither is rate limited unless you say so**.
+Leaving them uncapped means an anonymous caller can drive them as fast as they can send requests —
+and `/register` writes a client record to your `storage` on every accepted call. Turn it on:
+
+```ts
+import { RECOMMENDED_RATE_LIMIT } from "shopify-mcp-oauth";
+
+mountShopifyMcpOAuth(
+  app,
+  {
+    // ...
+    rateLimit: RECOMMENDED_RATE_LIMIT, // { limit: 20, windowMs: 3_600_000 }
+  },
+  registerProtectedRoutes
+);
+```
+
+One setting, one limiter, **one shared budget**: `limit` is what a caller may spend across those
+endpoints _combined_ per window, not per endpoint. Both are things a legitimate client touches a
+handful of times over its whole lifetime — once at registration, once at logout — so a single
+budget is the honest shape for them, and it means a caller can't get two windows' worth of free
+work by alternating between the two.
+
+Leaving the field unset logs a warning at construction. If uncapped is what you want — you rate
+limit at the edge, say, or in your own middleware — set it to `false` and the warning stops;
+`false` and omitting it behave identically otherwise.
+
+Counting is [express-rate-limit](https://github.com/express-rate-limit/express-rate-limit)'s. Two
+consequences worth knowing:
+
+- **The limit is per process** unless you supply a store, so on a multi-instance deployment the
+  effective limit multiplies by the instance count. Pass a shared store to fix that:
+
+  ```ts
+  import { RedisStore } from "rate-limit-redis";
+  import { createClient } from "redis";
+
+  const redis = createClient({ url: process.env.REDIS_URL });
+  await redis.connect();
+  const sendCommand = (...args: string[]) => redis.sendCommand(args);
+
+  mountShopifyMcpOAuth(
+    app,
+    {
+      // ...
+      rateLimit: { ...RECOMMENDED_RATE_LIMIT, store: new RedisStore({ sendCommand, prefix: "rl:oauth:" }) },
+    },
+    registerProtectedRoutes
+  );
+  ```
+
+  Spread `RECOMMENDED_RATE_LIMIT` rather than mutating it — it is frozen, and `resolveConfig` keeps
+  whichever object you pass by reference. Give this store to nothing else: one store object handed
+  to a second limiter puts both limiters' counts in the same buckets, which express-rate-limit warns
+  about. A value that isn't a `Store` (a Redis client rather than the store wrapping it, most often)
+  is rejected at construction naming the field.
+
+- **Callers are keyed by `req.ip`**, which only names the real caller when your app's Express
+  [`trust proxy`](https://expressjs.com/en/guide/behind-proxies.html) setting matches your actual
+  deployment — this package receives a sub-router, never your `app`, so it cannot set that for you.
+  Misconfigure it and every caller shares one bucket. If `req.ip` is the wrong identity for your
+  topology altogether — a tenant header from your API gateway, an authenticated account id — set
+  `keyFor` on the setting instead of abandoning the field. Both wrong settings (unset behind a proxy, and
+  the equally wrong `trust proxy: true`) are detected and reported through your `logger`. IPv6
+  callers are keyed by their /56 subnet, not the individual address, so rotating through an
+  ISP-assigned subnet doesn't buy a fresh quota.
 
 ## Development
 
