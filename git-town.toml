@@ -2,7 +2,7 @@
 
 # See https://www.git-town.com/configuration-file for details
 
-interactive = false
+interactive = true
 
 [branches]
 main = "main"
