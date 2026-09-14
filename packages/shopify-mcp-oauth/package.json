@@ -52,12 +52,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "express-rate-limit": "^8.6.2",
     "jsonwebtoken": "^9.0.2"
   },
   "peerDependencies": {
     "express": ">=5",
-    "zod": ">=3.23",
-    "vitest": ">=2.0"
+    "vitest": ">=2.0",
+    "zod": ">=3.23"
   },
   "peerDependenciesMeta": {
     "vitest": {
@@ -68,9 +69,9 @@
     "@types/express": "^5.0.0",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.0.0",
+    "@types/supertest": "^6.0.2",
     "express": "^5.0.0",
     "supertest": "^7.0.0",
-    "@types/supertest": "^6.0.2",
     "tsup": "^8.3.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0",

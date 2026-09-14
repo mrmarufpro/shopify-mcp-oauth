@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { memoryCache } from "./adapters/memoryCache";
 import { memoryStorage } from "./adapters/memoryStorage";
-import { resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
+import { RECOMMENDED_RATE_LIMIT, resolveConfig, type ShopifyMcpOAuthConfig } from "./config";
 
 const HOST = "https://mcp.example.com";
 const STATE_SECRET = "test-state-secret-at-least-32-bytes-long";
@@ -42,29 +42,76 @@ describe("resolveConfig", () => {
     expect(resolveConfig(buildConfig({ tokenTtl: { access: 900 } })).tokenTtl.access).toBe(900);
   });
 
-  it("defaults the register rate limit to 20 per hour", () => {
-    expect(resolveConfig(buildConfig()).registerRateLimit).toEqual({ limit: 20, windowMs: 3_600_000 });
+  // Rate limiting is opt-in. `null` is the signal buildRouter reads to mount no limiter layer at
+  // all, so it has to stay distinguishable from a setting -- resolving an omitted field to some
+  // default object instead would silently re-arm both endpoints for every consumer.
+  it("leaves the rate limit off when it is not configured", () => {
+    expect(resolveConfig(buildConfig()).rateLimit).toBeNull();
   });
 
-  it("defaults the revoke rate limit to 20 per hour", () => {
-    expect(resolveConfig(buildConfig()).revokeRateLimit).toEqual({ limit: 20, windowMs: 3_600_000 });
+  it("resolves an explicit false to the same null as omitting the field", () => {
+    expect(resolveConfig(buildConfig({ rateLimit: false })).rateLimit).toBeNull();
   });
 
-  it("keeps an explicit revoke rate limit instead of the default", () => {
-    const revokeRateLimit = { limit: 5, windowMs: 30_000 };
-    expect(resolveConfig(buildConfig({ revokeRateLimit })).revokeRateLimit).toEqual(revokeRateLimit);
+  it("publishes a recommended setting consumers can opt in with", () => {
+    // The README points consumers at this constant rather than at a pair of numbers, so it is the
+    // one place the recommendation lives.
+    expect(RECOMMENDED_RATE_LIMIT).toEqual({ limit: 20, windowMs: 3_600_000 });
+    expect(resolveConfig(buildConfig({ rateLimit: RECOMMENDED_RATE_LIMIT })).rateLimit).toEqual(RECOMMENDED_RATE_LIMIT);
   });
 
-  it("keeps registerRateLimit and revokeRateLimit independently tunable", () => {
-    const resolved = resolveConfig(
-      buildConfig({ registerRateLimit: { limit: 1, windowMs: 1000 }, revokeRateLimit: { limit: 2, windowMs: 2000 } })
+  it("keeps an explicit rate limit", () => {
+    const fiveRequestsPerThirtySeconds = { limit: 5, windowMs: 30_000 };
+    expect(resolveConfig(buildConfig({ rateLimit: fiveRequestsPerThirtySeconds })).rateLimit).toEqual(
+      fiveRequestsPerThirtySeconds
     );
-    expect(resolved.registerRateLimit).toEqual({ limit: 1, windowMs: 1000 });
-    expect(resolved.revokeRateLimit).toEqual({ limit: 2, windowMs: 2000 });
   });
 
-  // A default nothing pins is exactly how rateLimit.ts's own maxEntries default nearly shipped
-  // unbounded — this is that lesson applied here, not a hypothetical.
+  it("rejects a rate-limit window too long for setInterval, naming the field", () => {
+    // The factory rejects this too, but only once buildRouter reaches it -- and then the message
+    // names createRateLimiter rather than the config field the consumer actually wrote.
+    expect(() => resolveConfig(buildConfig({ rateLimit: { limit: 20, windowMs: 2 ** 31 } }))).toThrow(/rateLimit/);
+  });
+
+  it("rejects a store that does not implement the express-rate-limit Store interface", () => {
+    // zod strips `store` rather than rejecting it, so without an explicit check this reaches
+    // express-rate-limit and throws "An invalid store was passed", naming no config field at all.
+    const aRedisClientRatherThanAStore = { connect: () => {}, sendCommand: () => {} };
+    expect(() =>
+      resolveConfig(
+        buildConfig({ rateLimit: { limit: 20, windowMs: 60_000, store: aRedisClientRatherThanAStore as never } })
+      )
+    ).toThrow(/rateLimit\.store/);
+  });
+
+  it("freezes the recommended setting so one mutation cannot re-tune every limiter built from it", () => {
+    // resolveConfig stores whichever object it is handed, by reference. Mutating this shared
+    // constant would otherwise reach every handle constructed afterwards in the same process.
+    expect(Object.isFrozen(RECOMMENDED_RATE_LIMIT)).toBe(true);
+  });
+
+  it("carries a supplied keyFor through to the resolved setting", () => {
+    const keyByTenantHeader = (req: { headers: Record<string, string> }) => req.headers["x-tenant"]!;
+    const resolved = resolveConfig(
+      buildConfig({ rateLimit: { limit: 1, windowMs: 1000, keyFor: keyByTenantHeader as never } })
+    );
+    expect(resolved.rateLimit?.keyFor).toBe(keyByTenantHeader);
+  });
+
+  it("carries a supplied store through to the resolved setting", () => {
+    // zod strips unknown keys, so resolving from the parsed copy rather than the raw input would
+    // drop this silently -- and a dropped store means each instance quietly counts on its own.
+    const sharedStore = {
+      increment: async () => ({ totalHits: 1, resetTime: new Date() }),
+      decrement: async () => {},
+      resetKey: async () => {},
+    };
+    const resolved = resolveConfig(buildConfig({ rateLimit: { limit: 1, windowMs: 1000, store: sharedStore } }));
+    expect(resolved.rateLimit?.store).toBe(sharedStore);
+  });
+
+  // Unlike the rate limit above, this cap is not opt-in — every deployment gets it, so the number
+  // has to be pinned here rather than left to whatever resolveConfig happens to fill in.
   it("defaults the CIMD fetch concurrency cap to 10", () => {
     expect(resolveConfig(buildConfig()).cimdFetchConcurrency).toBe(10);
   });
@@ -174,29 +221,68 @@ describe("resolveConfig", () => {
 
   it("warns when no cache is supplied", () => {
     const warn = vi.fn();
-    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() } }));
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, rateLimit: false }));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("single-process"));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("redisCache"));
   });
 
-  it("does not claim the fallback cache holds rate-limit counters -- those are process-local, not cached", () => {
-    // The /register rate limiter (rateLimit.ts) never touches `cache` at all -- it's an
-    // in-process Map, independent of whichever CacheStore resolveConfig picks. An earlier
-    // version of this warning said otherwise; this pins the correction.
+  it("does not claim the fallback cache holds rate-limit counters -- the limiter carries its own store", () => {
+    // The rate limiter (rateLimit.ts) never touches `cache` at all -- counting is
+    // express-rate-limit's, in its own store, independent of whichever CacheStore resolveConfig
+    // picks. An earlier version of this warning said otherwise; this pins the correction.
     const warn = vi.fn();
-    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() } }));
+    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, rateLimit: false }));
     expect(warn).toHaveBeenCalledTimes(1);
     const warningMessage = warn.mock.calls[0]![0];
     expect(warningMessage).not.toContain("rate-limit counters");
-    expect(warningMessage).toContain("registerRateLimit");
-    expect(warningMessage).toContain("revokeRateLimit");
+    expect(warningMessage).toContain("rateLimit");
   });
 
   it("does not warn when a cache is supplied", () => {
     const warn = vi.fn();
-    resolveConfig(buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, cache: memoryCache() }));
+    resolveConfig(
+      buildConfig({
+        logger: { info: vi.fn(), warn, error: vi.fn() },
+        cache: memoryCache(),
+        rateLimit: false,
+      })
+    );
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  describe("the opt-in rate limit warning", () => {
+    function resolveWithWarnSpy(overrides: Partial<ShopifyMcpOAuthConfig>) {
+      const warn = vi.fn();
+      resolveConfig(
+        buildConfig({ logger: { info: vi.fn(), warn, error: vi.fn() }, cache: memoryCache(), ...overrides })
+      );
+      return warn;
+    }
+
+    it("names the field and both endpoints it would cover when no rate limit is configured", () => {
+      // The out-of-the-box deployment leaves two unauthenticated endpoints uncapped. That is the
+      // documented default, but a consumer should meet it in their logs at boot rather than in an
+      // incident, so this is the one thing resolveConfig says about it.
+      const warn = resolveWithWarnSpy({});
+      expect(warn).toHaveBeenCalledTimes(1);
+      const warningMessage = warn.mock.calls[0]![0] as string;
+      expect(warningMessage).toContain("rateLimit");
+      expect(warningMessage).toContain("/register");
+      expect(warningMessage).toContain("/revoke");
+    });
+
+    it("stays quiet once a limit is configured", () => {
+      expect(resolveWithWarnSpy({ rateLimit: RECOMMENDED_RATE_LIMIT })).not.toHaveBeenCalled();
+    });
+
+    it("stays quiet when the limiter is explicitly declined with false", () => {
+      // `false` and omission resolve identically; only the warning tells them apart. That is the
+      // whole reason `false` is accepted -- an omitted field reads as "never considered", `false`
+      // reads as "considered, declined", and re-warning about the latter on every boot trains
+      // consumers to ignore the warning that matters.
+      expect(resolveWithWarnSpy({ rateLimit: false })).not.toHaveBeenCalled();
+    });
   });
 });
 

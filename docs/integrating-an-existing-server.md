@@ -142,14 +142,18 @@ as above.
 
 ```ts
 import express from "express";
-import { mountShopifyMcpOAuth } from "shopify-mcp-oauth";
+import { mountShopifyMcpOAuth, RECOMMENDED_RATE_LIMIT } from "shopify-mcp-oauth";
 
 const app = express();
 app.use(express.json()); // for YOUR routes; the OAuth router parses its own
 
-mountShopifyMcpOAuth(app, { host, shopify, stateSecret, storage, cache }, (oauth) => {
-  app.post("/mcp", oauth.requireAuth, myExistingMcpHandler);
-});
+mountShopifyMcpOAuth(
+  app,
+  { host, shopify, stateSecret, storage, cache, rateLimit: RECOMMENDED_RATE_LIMIT },
+  (oauth) => {
+    app.post("/mcp", oauth.requireAuth, myExistingMcpHandler);
+  }
+);
 ```
 
 That's the whole wiring. The helper mounts the OAuth router, then your routes, then the package's
@@ -158,6 +162,11 @@ Express only looks for an error handler at the stack level where the error was t
 malformed-JSON `SyntaxError` from your own body-parser never reaches a handler mounted inside a
 router. Miss it and Express's default handler answers an HTML stack trace on an unauthenticated
 endpoint.
+
+`rateLimit` is the one field worth setting deliberately here: the package's `/register` and
+`/revoke` endpoints are unauthenticated, and they are uncapped unless you ask for a limit. Omitting
+the field logs a warning at construction; if you already rate limit at the edge, pass `false` to say
+so and silence it. See [Rate limiting](../README.md#rate-limiting).
 
 The one rule the helper can't enforce: **routes added to `app` after this call sit below the error
 handler.** Register them inside the callback.

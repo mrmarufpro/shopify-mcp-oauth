@@ -103,9 +103,18 @@ export {
   type ShopifySessionLike,
   type ShopifySessionStorageLike,
 } from "./adapters/shopifySessionStorage";
-export { resolveConfig, type ResolvedConfig, type ShopifyMcpOAuthConfig } from "./config";
+export {
+  RECOMMENDED_RATE_LIMIT,
+  resolveConfig,
+  type RateLimitSetting,
+  type ResolvedConfig,
+  type ShopifyMcpOAuthConfig,
+} from "./config";
 export { OAuthError } from "./errors";
 export { createRateLimiter, type RateLimiterOptions } from "./middlewares/rateLimit";
+// Re-exported so a consumer configuring `RateLimitSetting.store` (or building a limiter by hand)
+// can type their store without adding express-rate-limit to their own dependencies just for it.
+export type { Store as RateLimitStore } from "express-rate-limit";
 export type { BuildRouterOptions } from "./router";
 export type {
   CacheStore,

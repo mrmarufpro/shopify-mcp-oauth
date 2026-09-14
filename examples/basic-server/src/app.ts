@@ -1,6 +1,6 @@
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express, { type Express } from "express";
-import { allowAnyShop, memoryStorage, mountShopifyMcpOAuth } from "shopify-mcp-oauth";
+import { allowAnyShop, memoryStorage, mountShopifyMcpOAuth, RECOMMENDED_RATE_LIMIT } from "shopify-mcp-oauth";
 import { buildMcpServer } from "./tools";
 
 export interface AppOptions {
@@ -34,6 +34,10 @@ export function createApp(options: AppOptions): Express {
         // is refused — see the README.
         findShopByDomain: allowAnyShop(),
       },
+      // /register and /revoke are unauthenticated and uncapped unless you ask for a limit, so ask
+      // for one. One budget covers both. Counted in this process; pass a `store` to share the
+      // count across instances.
+      rateLimit: RECOMMENDED_RATE_LIMIT,
     },
     (oauth) => {
       app.post("/mcp", oauth.requireAuth, async (req, res) => {

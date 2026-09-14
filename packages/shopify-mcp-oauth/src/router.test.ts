@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { memoryStorage } from "./adapters/memoryStorage";
-import { resolveConfig } from "./config";
+import { RECOMMENDED_RATE_LIMIT, resolveConfig } from "./config";
 import { errorHandler as oauthErrorHandler } from "./middlewares/errorHandler";
 import type { BuildRouterOptions } from "./router";
 import { signOuterState } from "./services/stateJwt";
@@ -527,106 +527,144 @@ describe("terminal error handler", () => {
   });
 });
 
-describe("mounts a rate limiter on /register", () => {
-  // Mirrors the /revoke block below exactly. The brief already wired createRateLimiter onto
-  // /register; nothing in this file had actually driven it past its own configured limit through
-  // the fully-wired app before this test existed -- unmounting it left the full suite green.
-  it("answers 429 once the configured register rate limit is exceeded", async () => {
-    const oauth = createShopifyMcpOAuth(buildBaseConfig({ registerRateLimit: { limit: 1, windowMs: 60_000 } }));
-    const app = express();
-    app.use(express.json());
-    app.use(oauth.router);
+// The routes one `rateLimit` setting covers. Named once here so a route added to (or dropped from)
+// the limiter in router.ts has exactly one place to be reflected, and both the "unlimited by
+// default" and "capped when configured" blocks below stay in step with it.
+const RATE_LIMITED_ROUTES = [
+  {
+    path: "/register",
+    allowedStatus: 201,
+    send: (agent: request.Test) => agent.send({ redirect_uris: [REDIRECT_URI] }),
+  },
+  {
+    path: "/revoke",
+    allowedStatus: 200,
+    send: (agent: request.Test) => agent.send({ token: "any-token" }),
+  },
+] as const;
 
-    const first = await request(app)
-      .post("/register")
-      .send({ redirect_uris: [REDIRECT_URI] });
-    const second = await request(app)
-      .post("/register")
-      .send({ redirect_uris: [REDIRECT_URI] });
+function buildAppWith(overrides: Partial<ShopifyMcpOAuthConfig> = {}) {
+  const oauth = createShopifyMcpOAuth(buildBaseConfig(overrides));
+  const app = express();
+  app.use(express.json());
+  app.use(oauth.router);
+  return app;
+}
 
-    expect(first.status).toBe(201);
-    expect(second.status).toBe(429);
-    expect(second.body.error).toBe("too_many_requests");
-    expect(second.headers["retry-after"]).toBeDefined();
+describe("mounts no rate limiter unless one is configured", () => {
+  // The limiter is opt-in (see `rateLimit` in config.ts). These pin the half of that contract a
+  // type can't: not "the resolved config says null" but "no 429 comes back and no limiter layer
+  // sits in the stack", which is what a consumer actually observes.
+  const MORE_REQUESTS_THAN_THE_RECOMMENDED_LIMIT_ALLOWS = RECOMMENDED_RATE_LIMIT.limit + 1;
+
+  it.each(RATE_LIMITED_ROUTES)("leaves $path unlimited", async ({ path, allowedStatus, send }) => {
+    const app = buildAppWith();
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < MORE_REQUESTS_THAN_THE_RECOMMENDED_LIMIT_ALLOWS; attempt++) {
+      statuses.push((await send(request(app).post(path))).status);
+    }
+    expect(statuses.every((status) => status === allowedStatus)).toBe(true);
   });
+
+  it.each(RATE_LIMITED_ROUTES)("mounts one fewer layer on $path than a configured limit does", ({ path }) => {
+    // The status assertions above stay green if a limiter is mounted with an enormous limit, or
+    // with a `skip` that always returns true -- both would still be a limiter the consumer never
+    // asked for, still counting, still holding memory. Comparing the route's layer count against
+    // the same route built with a limit is what pins "not mounted at all".
+    function countRouteLayers(config: ShopifyMcpOAuthConfig): number {
+      const oauth = createShopifyMcpOAuth(config);
+      const stack = (oauth.router as unknown as { stack: Array<{ route?: { path: string; stack: unknown[] } }> }).stack;
+      const route = stack.find((layer) => layer.route?.path === path)?.route;
+      if (!route) throw new Error(`no ${path} route found on the router`);
+      return route.stack.length;
+    }
+
+    const withoutLimiter = countRouteLayers(buildBaseConfig());
+    const withLimiter = countRouteLayers(buildBaseConfig({ rateLimit: RECOMMENDED_RATE_LIMIT }));
+
+    expect(withLimiter - withoutLimiter).toBe(1);
+  });
+});
+
+describe("mounts the configured rate limiter on every unauthenticated endpoint", () => {
+  // Nothing in this file had actually driven a limiter past its configured limit through the
+  // fully-wired app before these existed -- unmounting createRateLimiter left the full suite green.
+  it.each(RATE_LIMITED_ROUTES)(
+    "answers 429 on $path once the configured limit is exceeded",
+    async ({ path, allowedStatus, send }) => {
+      const app = buildAppWith({ rateLimit: { limit: 1, windowMs: 60_000 } });
+
+      const first = await send(request(app).post(path));
+      const second = await send(request(app).post(path));
+
+      expect(first.status).toBe(allowedStatus);
+      expect(second.status).toBe(429);
+      expect(second.body.error).toBe("too_many_requests");
+      expect(second.headers["retry-after"]).toBeDefined();
+    }
+  );
 
   // The test above uses limit: 1 and only checks Retry-After is present -- any windowMs at all
   // satisfies that, so it can't tell the configured window from a wrong (e.g. hardcoded) one.
   // Retry-After is the one response value that actually carries windowMs, so a distinct,
   // non-default window here is what makes a wrong pass-through observable.
-  it("threads the configured registerRateLimit.windowMs into the limiter, not just the limit", async () => {
-    const CONFIGURED_WINDOW_MS = 120_000;
-    const oauth = createShopifyMcpOAuth(
-      buildBaseConfig({ registerRateLimit: { limit: 1, windowMs: CONFIGURED_WINDOW_MS } })
-    );
-    const app = express();
-    app.use(express.json());
-    app.use(oauth.router);
+  it.each(RATE_LIMITED_ROUTES)(
+    "threads the configured windowMs into $path's limiter, not just the limit",
+    async ({ path, send }) => {
+      const CONFIGURED_WINDOW_MS = 120_000;
+      const app = buildAppWith({ rateLimit: { limit: 1, windowMs: CONFIGURED_WINDOW_MS } });
 
-    await request(app)
-      .post("/register")
-      .send({ redirect_uris: [REDIRECT_URI] });
-    const blocked = await request(app)
-      .post("/register")
-      .send({ redirect_uris: [REDIRECT_URI] });
+      await send(request(app).post(path));
+      const blocked = await send(request(app).post(path));
 
-    expect(blocked.status).toBe(429);
-    expect(blocked.headers["retry-after"]).toBe(String(CONFIGURED_WINDOW_MS / 1000));
-  });
-});
+      expect(blocked.status).toBe(429);
+      expect(blocked.headers["retry-after"]).toBe(String(CONFIGURED_WINDOW_MS / 1000));
+    }
+  );
 
-describe("mounts a rate limiter on /revoke", () => {
-  it("answers 429 once the configured revoke rate limit is exceeded", async () => {
-    const oauth = createShopifyMcpOAuth(buildBaseConfig({ revokeRateLimit: { limit: 1, windowMs: 60_000 } }));
-    const app = express();
-    app.use(express.json());
-    app.use(oauth.router);
+  // The point of a single config field: one limiter instance covers every route, so a caller gets
+  // one budget across them rather than one per endpoint. Building a limiter per route from the same
+  // setting would leave this green at 201 -- and would silently hand every caller 2x the configured
+  // limit. This is the test that tells those two wirings apart.
+  it("spends one shared budget across the endpoints rather than one per endpoint", async () => {
+    const app = buildAppWith({ rateLimit: { limit: 1, windowMs: 60_000 } });
 
-    const first = await request(app).post("/revoke").send({ token: "first-guess" });
-    const second = await request(app).post("/revoke").send({ token: "second-guess" });
-
-    expect(first.status).toBe(200);
-    expect(second.status).toBe(429);
-    expect(second.body.error).toBe("too_many_requests");
-    expect(second.headers["retry-after"]).toBeDefined();
-  });
-
-  // Same gap as /register's windowMs test above, mirrored onto /revoke.
-  it("threads the configured revokeRateLimit.windowMs into the limiter, not just the limit", async () => {
-    const CONFIGURED_WINDOW_MS = 120_000;
-    const oauth = createShopifyMcpOAuth(
-      buildBaseConfig({ revokeRateLimit: { limit: 1, windowMs: CONFIGURED_WINDOW_MS } })
-    );
-    const app = express();
-    app.use(express.json());
-    app.use(oauth.router);
-
-    await request(app).post("/revoke").send({ token: "first-guess" });
-    const blocked = await request(app).post("/revoke").send({ token: "second-guess" });
-
-    expect(blocked.status).toBe(429);
-    expect(blocked.headers["retry-after"]).toBe(String(CONFIGURED_WINDOW_MS / 1000));
-  });
-
-  it("keeps the revoke and register rate limits independent of one another", async () => {
-    const oauth = createShopifyMcpOAuth(
-      buildBaseConfig({
-        revokeRateLimit: { limit: 1, windowMs: 60_000 },
-        registerRateLimit: { limit: 5, windowMs: 60_000 },
-      })
-    );
-    const app = express();
-    app.use(express.json());
-    app.use(oauth.router);
-
-    await request(app).post("/revoke").send({ token: "spends-the-one-revoke-slot" });
-    const blockedRevoke = await request(app).post("/revoke").send({ token: "another-guess" });
-    const stillAllowedRegister = await request(app)
+    const theOneAllowedCall = await request(app).post("/revoke").send({ token: "spends-the-only-slot" });
+    const registerIsNowBlockedToo = await request(app)
       .post("/register")
       .send({ redirect_uris: [REDIRECT_URI] });
 
-    expect(blockedRevoke.status).toBe(429);
-    expect(stillAllowedRegister.status).toBe(201);
+    expect(theOneAllowedCall.status).toBe(200);
+    expect(registerIsNowBlockedToo.status).toBe(429);
+  });
+
+  it("keys callers by a configured keyFor rather than by IP", async () => {
+    // router.ts spreads the whole RateLimitSetting into createRateLimiter, so this is what proves
+    // the spread actually carries the identity function -- threading only limit and windowMs would
+    // leave every caller sharing one IP-keyed bucket while the config claimed otherwise.
+    const FIRST_TENANT = "tenant-one";
+    const SECOND_TENANT = "tenant-two";
+    const app = buildAppWith({
+      rateLimit: { limit: 1, windowMs: 60_000, keyFor: (req) => String(req.headers["x-tenant"]) },
+    });
+
+    const firstTenantsOneAllowedCall = await request(app)
+      .post("/revoke")
+      .set("x-tenant", FIRST_TENANT)
+      .send({ token: "first" });
+    // Same IP as the call above -- only the tenant differs, so an IP-keyed limiter would block it.
+    const secondTenantIsUnaffected = await request(app)
+      .post("/revoke")
+      .set("x-tenant", SECOND_TENANT)
+      .send({ token: "second" });
+    const firstTenantIsNowBlocked = await request(app)
+      .post("/revoke")
+      .set("x-tenant", FIRST_TENANT)
+      .send({ token: "third" });
+
+    expect(firstTenantsOneAllowedCall.status).toBe(200);
+    expect(secondTenantIsUnaffected.status).toBe(200);
+    expect(firstTenantIsNowBlocked.status).toBe(429);
   });
 });
 
